@@ -1,0 +1,4 @@
+case_name,success,route_found,route_num_edges,realized_num_steps,chosen_leaf_sequence,transition_points,path_length,runtime_sec,message
+left_goal_prefers_left_bridge,True,True,2,3,line_family[-1.0] -> left_bridge[1.05] -> line_family[1.0],"(-1.2202, -1.0) ; (-1.2202, 1.0)",4.897586251295015,0.0790156000002753,Successfully realized leaf route.
+right_goal_prefers_right_bridge,True,True,2,3,line_family[-1.0] -> right_bridge[1.05] -> line_family[1.0],"(1.2202, -1.0) ; (1.2202, 1.0)",4.897586251295015,0.07827259999976377,Successfully realized leaf route.
+center_goal_can_choose_either,True,True,2,3,line_family[-1.0] -> left_bridge[1.05] -> line_family[1.0],"(-0.5798, -1.0) ; (-0.5798, 1.0)",3.8072738275517293,0.07622629999968922,Successfully realized leaf route.
