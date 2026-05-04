@@ -10,9 +10,17 @@ evidence graph, and the displayed path remains the end-effector trajectory in
 world coordinates.
 """
 
+from pathlib import Path
+import sys
+
 import numpy as np
 
-import example_66_multimodal_graph_search as ex66
+ROOT = Path(__file__).resolve().parents[1]
+EXAMPLES_DIR = ROOT / "examples"
+if str(EXAMPLES_DIR) not in sys.path:
+    sys.path.insert(0, str(EXAMPLES_DIR))
+
+from . import parallel_evidence_planner as ex66
 from collision_utilities import configuration_in_collision, default_example_66_obstacles
 from jointspace_planner_utils import (
     detect_transitions_jointspace,
@@ -22,7 +30,7 @@ from jointspace_planner_utils import (
     inverse_kinematics_start,
     joint_path_to_task_path,
 )
-from robot_constraint_manifolds import RobotPlaneManifold, RobotSphereManifold
+from manifolds.robot import RobotPlaneManifold, RobotSphereManifold
 
 
 def _task_point(robot, q: np.ndarray) -> np.ndarray:
