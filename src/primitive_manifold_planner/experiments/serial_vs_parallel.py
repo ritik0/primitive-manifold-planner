@@ -3,23 +3,15 @@ from __future__ import annotations
 import argparse
 import csv
 import random
-import sys
 import time
-from pathlib import Path
 
 import numpy as np
 from ompl import util as ou
 
-ROOT = Path(__file__).resolve().parents[3]
-EXAMPLES = ROOT / "examples"
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-if str(EXAMPLES) not in sys.path:
-    sys.path.insert(0, str(EXAMPLES))
-
-import multimodal_graph_search as ex66
-from collision_utilities import default_example_66_obstacles
-from three_dof_robot_pyvista_demo import SpatialRobot3DOF
+from primitive_manifold_planner.examplesupport.collision_utilities import default_example_66_obstacles
+from primitive_manifold_planner.examplesupport.example66_scene import build_example66_scene
+from primitive_manifold_planner.examplesupport.spatial_robot import SpatialRobot3DOF
+from primitive_manifold_planner.thesis import parallel_evidence_planner as ex66
 
 
 def fixed_robot() -> SpatialRobot3DOF:
@@ -41,7 +33,7 @@ def configure_seed(seed: int) -> None:
 
 def run_once(seed: int, serial_mode: bool) -> dict[str, object]:
     configure_seed(seed)
-    families, start_q, goal_q, _plane_half_u, _plane_half_v = ex66.build_scene()
+    families, start_q, goal_q, _plane_half_u, _plane_half_v = build_example66_scene()
     robot = fixed_robot()
     obstacles = default_example_66_obstacles()
     t0 = time.perf_counter()

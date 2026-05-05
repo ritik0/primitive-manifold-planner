@@ -5,10 +5,21 @@ from dataclasses import dataclass
 import matplotlib.pyplot as plt
 import numpy as np
 
-import multimodal_graph_search as base
-
 from primitive_manifold_planner.families.standard import MaskedFamily, PlaneFamily, SphereFamily
+from primitive_manifold_planner.examplesupport.intrinsic_multimodal_helpers import build_segment_polydata, sphere_point
+from primitive_manifold_planner.thesis import parallel_evidence_planner as base
 from primitive_manifold_planner.visualization import add_manifold, add_points, pyvista_available
+from primitive_manifold_planner.visualization.display import (
+    draw_edge_segments,
+    plane_patch_corners,
+    plot_manifold,
+    plot_plane_patch,
+)
+
+try:
+    import pyvista as pv
+except Exception:
+    pv = None
 
 
 @dataclass(frozen=True)
@@ -110,11 +121,11 @@ def build_stress_scene(variant: str = "strong") -> StressScene:
     )
 
     if variant_name == "mild":
-        start_q = base.sphere_point(left_support.center, 1.05, azimuth_deg=12.0, elevation_deg=-78.0)
-        goal_q = base.sphere_point(right_support.center, 1.05, azimuth_deg=-10.0, elevation_deg=74.0)
+        start_q = sphere_point(left_support.center, 1.05, azimuth_deg=12.0, elevation_deg=-78.0)
+        goal_q = sphere_point(right_support.center, 1.05, azimuth_deg=-10.0, elevation_deg=74.0)
     else:
-        start_q = base.sphere_point(left_support.center, 1.05, azimuth_deg=22.0, elevation_deg=-76.0)
-        goal_q = base.sphere_point(right_support.center, 1.05, azimuth_deg=-18.0, elevation_deg=71.0)
+        start_q = sphere_point(left_support.center, 1.05, azimuth_deg=22.0, elevation_deg=-76.0)
+        goal_q = sphere_point(right_support.center, 1.05, azimuth_deg=-18.0, elevation_deg=71.0)
 
     return StressScene(
         families=[left_support, transfer_plane, right_support],
@@ -145,8 +156,8 @@ def show_stress_route(scene: StressScene, result: base.FixedPlaneRoute) -> None:
     plane_manifold = plane_family.manifold(float(plane_family.sample_lambdas()[0]))
     right_manifold = right_family.manifold(float(right_family.sample_lambdas()[0]))
 
-    if pyvista_available() and base.pv is not None:
-        plotter = base.pv.Plotter(window_size=(1320, 840))
+    if pyvista_available() and pv is not None:
+        plotter = pv.Plotter(window_size=(1320, 840))
         plotter.add_text(
             f"Example 67: fixed-manifold stress test ({scene.variant}) with parallel manifold evidence",
             font_size=12,
@@ -173,9 +184,9 @@ def show_stress_route(scene: StressScene, result: base.FixedPlaneRoute) -> None:
             if actor is not None:
                 actor_groups["Manifolds"].append(actor)
 
-        plane_corners = base.plane_patch_corners(plane_manifold, half_u=scene.plane_half_u, half_v=scene.plane_half_v)
+        plane_corners = plane_patch_corners(plane_manifold, half_u=scene.plane_half_u, half_v=scene.plane_half_v)
         plane_faces = np.hstack([[4, 0, 1, 2, 3]])
-        plane_patch = base.pv.PolyData(plane_corners, faces=plane_faces)
+        plane_patch = pv.PolyData(plane_corners, faces=plane_faces)
         plane_actor = plotter.add_mesh(
             plane_patch,
             color=manifold_colors.get(plane_family.name, "#999999"),
@@ -195,7 +206,7 @@ def show_stress_route(scene: StressScene, result: base.FixedPlaneRoute) -> None:
                 rect.v_min,
                 rect.v_max,
             )
-            blocked_patch = base.pv.PolyData(blocked_corners, faces=plane_faces)
+            blocked_patch = pv.PolyData(blocked_corners, faces=plane_faces)
             actor = plotter.add_mesh(
                 blocked_patch,
                 color="#ef5350",
@@ -209,7 +220,7 @@ def show_stress_route(scene: StressScene, result: base.FixedPlaneRoute) -> None:
 
         for stage in base.STAGES:
             stage_edges = result.stage_evidence_edges.get(stage, [])
-            poly = base.build_segment_polydata(stage_edges)
+            poly = build_segment_polydata(stage_edges)
             if poly is not None:
                 actor = plotter.add_mesh(
                     poly,
@@ -272,12 +283,12 @@ def show_stress_route(scene: StressScene, result: base.FixedPlaneRoute) -> None:
                     actor_groups["Committed"].append(actor)
 
         if len(result.raw_path) >= 2:
-            raw_polyline = base.pv.lines_from_points(np.asarray(result.raw_path, dtype=float))
+            raw_polyline = pv.lines_from_points(np.asarray(result.raw_path, dtype=float))
             actor = plotter.add_mesh(raw_polyline, color="#90a4ae", line_width=3.0, opacity=0.8, label="certified route")
             if actor is not None:
                 actor_groups["Committed"].append(actor)
         if len(result.path) >= 2:
-            display_polyline = base.pv.lines_from_points(np.asarray(result.path, dtype=float))
+            display_polyline = pv.lines_from_points(np.asarray(result.path, dtype=float))
             actor = plotter.add_mesh(display_polyline, color="#1565c0", line_width=7.0, label="display route")
             if actor is not None:
                 actor_groups["Committed"].append(actor)
@@ -315,8 +326,8 @@ def show_stress_route(scene: StressScene, result: base.FixedPlaneRoute) -> None:
     fig = plt.figure(figsize=(11.5, 8.5))
     ax = fig.add_subplot(111, projection="3d")
 
-    base.plot_manifold(ax, left_manifold, color=manifold_colors[left_family.name], alpha=0.10)
-    base.plot_plane_patch(
+    plot_manifold(ax, left_manifold, color=manifold_colors[left_family.name], alpha=0.10)
+    plot_plane_patch(
         ax,
         plane_manifold,
         half_u=scene.plane_half_u,
@@ -324,7 +335,7 @@ def show_stress_route(scene: StressScene, result: base.FixedPlaneRoute) -> None:
         color=manifold_colors[plane_family.name],
         alpha=0.13,
     )
-    base.plot_manifold(ax, right_manifold, color=manifold_colors[right_family.name], alpha=0.10)
+    plot_manifold(ax, right_manifold, color=manifold_colors[right_family.name], alpha=0.10)
 
     for rect in scene.blocked_rectangles:
         corners = rectangle_corners_on_plane(
@@ -340,7 +351,7 @@ def show_stress_route(scene: StressScene, result: base.FixedPlaneRoute) -> None:
         ax.plot_surface(xs, ys, zs, color="#ef5350", alpha=0.28, linewidth=0.0, shade=False)
 
     for stage in base.STAGES:
-        base.draw_edge_segments(ax, result.stage_evidence_edges.get(stage, []), color=colors[stage], alpha=0.33, linewidth=1.8 if stage == base.PLANE_STAGE else 1.5)
+        draw_edge_segments(ax, result.stage_evidence_edges.get(stage, []), color=colors[stage], alpha=0.33, linewidth=1.8 if stage == base.PLANE_STAGE else 1.5)
 
     for stage, color in [
         (base.LEFT_STAGE, "#fb8c00"),

@@ -33,6 +33,10 @@ The parallel evidence planner maintains one evidence graph per active stage or l
 
 The joint-space helper module adapts the same planner interface to robot configurations by scoring and validating motion in task space while preserving joint-space feasibility.
 
+`examples/multimodal_graph_search.py` is the reference task-space fixed-sequence multimodal evidence planner.
+
+`examples/three_dof_robot_pyvista_demo.py` is a robot add-on by default: it runs the same task-space planner, then resamples and tracks the selected task-space path with a simple 3DOF robot. Its `--jointspace-planning` flag explicitly switches to the robot-aware joint-space constrained planner.
+
 ## Continuous Transfer
 
 The continuous-transfer workflow keeps lambda-specific leaves locked once selected. This prevents physically invalid leaf jumping while still allowing parallel cross-family evidence accumulation and top-k certified route extraction.

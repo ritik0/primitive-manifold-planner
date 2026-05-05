@@ -10,19 +10,11 @@ evidence graph, and the displayed path remains the end-effector trajectory in
 world coordinates.
 """
 
-from pathlib import Path
-import sys
-
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[3]
-EXAMPLES_DIR = ROOT / "examples"
-if str(EXAMPLES_DIR) not in sys.path:
-    sys.path.insert(0, str(EXAMPLES_DIR))
-
 from . import parallel_evidence_planner as ex66
-from collision_utilities import configuration_in_collision, default_example_66_obstacles
-from jointspace_planner_utils import (
+from primitive_manifold_planner.examplesupport.collision_utilities import configuration_in_collision, default_example_66_obstacles
+from primitive_manifold_planner.examplesupport.jointspace_planner_utils import (
     detect_transitions_jointspace,
     end_effector_point,
     explore_joint_manifold,

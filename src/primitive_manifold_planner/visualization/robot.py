@@ -1,20 +1,13 @@
 from __future__ import annotations
 
-from pathlib import Path
-import sys
 import time
 from typing import Any
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[3]
-EXAMPLES_DIR = ROOT / "examples"
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-if str(EXAMPLES_DIR) not in sys.path:
-    sys.path.insert(0, str(EXAMPLES_DIR))
-
-import multimodal_graph_search as ex66
+from primitive_manifold_planner.thesis import parallel_evidence_planner as ex66
+from primitive_manifold_planner.examplesupport.intrinsic_multimodal_helpers import build_segment_polydata
+from primitive_manifold_planner.visualization.display import plane_patch_corners
 from primitive_manifold_planner.visualization import add_manifold, add_points, pyvista_available
 
 try:
@@ -178,7 +171,7 @@ def show_pyvista_robot_demo(
         if actor is not None:
             actor_groups["Manifolds"].append(actor)
 
-    plane_corners = ex66.plane_patch_corners(plane_manifold, half_u=plane_half_u, half_v=plane_half_v)
+    plane_corners = plane_patch_corners(plane_manifold, half_u=plane_half_u, half_v=plane_half_v)
     plane_faces = np.hstack([[4, 0, 1, 2, 3]])
     plane_patch = pv.PolyData(plane_corners, faces=plane_faces)
     plane_actor = plotter.add_mesh(
@@ -208,7 +201,7 @@ def show_pyvista_robot_demo(
 
     for stage in ex66.STAGES:
         stage_edges = result.stage_evidence_edges.get(stage, [])
-        poly = ex66.build_segment_polydata(stage_edges)
+        poly = build_segment_polydata(stage_edges)
         if poly is not None:
             actor = plotter.add_mesh(
                 poly,

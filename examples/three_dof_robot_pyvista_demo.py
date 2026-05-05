@@ -14,9 +14,9 @@ import math
 import numpy as np
 from ompl import util as ou
 
-import multimodal_graph_search as ex66
-from collision_utilities import default_example_66_obstacles
-
+from primitive_manifold_planner.examplesupport.collision_utilities import default_example_66_obstacles
+from primitive_manifold_planner.examplesupport.example66_scene import build_example66_scene
+from primitive_manifold_planner.thesis import parallel_evidence_planner as ex66
 from primitive_manifold_planner.visualization import pyvista_available
 from primitive_manifold_planner.visualization.robot import show_pyvista_robot_demo
 
@@ -76,7 +76,8 @@ class RobotExecutionResult:
     max_tracking_error: float
     mean_tracking_error: float
     animation_enabled: bool
-    exact_planner_path_used: bool
+    planner_path_resampled_for_robot: bool
+    planner_joint_path_used_directly: bool
 
 
 def wrap_angles(joint_angles: np.ndarray) -> np.ndarray:
@@ -189,10 +190,26 @@ def resample_polyline(path: np.ndarray, num_points: int) -> np.ndarray:
 def build_robot_execution(
     result: ex66.FixedPlaneRoute,
     robot: SpatialRobot3DOF,
+    use_planner_joint_path: bool = False,
 ) -> RobotExecutionResult | None:
+    planned_joint_path = np.asarray(getattr(result, "joint_path", np.zeros((0, 3), dtype=float)), dtype=float)
+    if use_planner_joint_path and len(planned_joint_path) >= 2:
+        ee_points = np.asarray([robot.forward_kinematics_3d(theta)[-1] for theta in planned_joint_path], dtype=float)
+        return RobotExecutionResult(
+            target_task_points_3d=np.asarray(ee_points, dtype=float),
+            joint_path=np.asarray(planned_joint_path, dtype=float),
+            end_effector_points_3d=np.asarray(ee_points, dtype=float),
+            ik_success_count=int(len(planned_joint_path)),
+            ik_failure_count=0,
+            max_tracking_error=0.0,
+            mean_tracking_error=0.0,
+            animation_enabled=bool(len(planned_joint_path) >= 2),
+            planner_path_resampled_for_robot=False,
+            planner_joint_path_used_directly=True,
+        )
+
     route = np.asarray(result.path if len(result.path) >= 2 else result.raw_path, dtype=float)
     if len(route) < 2:
-        planned_joint_path = np.asarray(getattr(result, "joint_path", np.zeros((0, 3), dtype=float)), dtype=float)
         if len(planned_joint_path) < 2:
             return None
         ee_points = np.asarray([robot.forward_kinematics_3d(theta)[-1] for theta in planned_joint_path], dtype=float)
@@ -205,7 +222,8 @@ def build_robot_execution(
             max_tracking_error=0.0,
             mean_tracking_error=0.0,
             animation_enabled=bool(len(planned_joint_path) >= 2),
-            exact_planner_path_used=True,
+            planner_path_resampled_for_robot=False,
+            planner_joint_path_used_directly=True,
         )
 
     waypoint_count = int(np.clip(max(80, len(route) // 6), 80, 120))
@@ -259,7 +277,8 @@ def build_robot_execution(
         max_tracking_error=float(max(tracking_errors) if tracking_errors else 0.0),
         mean_tracking_error=float(np.mean(tracking_errors) if tracking_errors else 0.0),
         animation_enabled=bool(len(joint_solutions) >= 2),
-        exact_planner_path_used=True,
+        planner_path_resampled_for_robot=True,
+        planner_joint_path_used_directly=False,
     )
 
 
@@ -294,6 +313,12 @@ def main():
     parser.add_argument("--seed", type=int, default=41)
     parser.add_argument("--max-rounds", type=int, default=None)
     parser.add_argument("--fast", action="store_true")
+    parser.add_argument("--serial", action="store_true")
+    parser.add_argument(
+        "--jointspace-planning",
+        action="store_true",
+        help="Plan directly in robot joint space instead of tracking the task-space route after planning.",
+    )
     parser.add_argument("--no-viz", action="store_true")
     args = parser.parse_args()
 
@@ -303,33 +328,68 @@ def main():
 
     configure_example_66_budgets(args)
 
-    families, start_q, goal_q, plane_half_u, plane_half_v = ex66.build_scene()
+    families, start_q, goal_q, plane_half_u, plane_half_v = build_example66_scene()
     obstacles = default_example_66_obstacles()
     robot = SpatialRobot3DOF(
         link_lengths=np.asarray([1.35, 1.05, 0.75], dtype=float),
         base_world=np.asarray([0.0, -1.25, 0.10], dtype=float),
     )
-    result = ex66.plan_fixed_manifold_multimodal_route(
-        families=families,
-        start_q=start_q,
-        goal_q=goal_q,
-        robot=robot,
-        obstacles=obstacles,
-    )
+    if args.jointspace_planning:
+        result = ex66.plan_fixed_manifold_multimodal_route(
+            families=families,
+            start_q=start_q,
+            goal_q=goal_q,
+            robot=robot,
+            serial_mode=args.serial,
+            obstacles=obstacles,
+        )
+    else:
+        result = ex66.plan_fixed_manifold_multimodal_route(
+            families=families,
+            start_q=start_q,
+            goal_q=goal_q,
+            serial_mode=args.serial,
+        )
 
     route = np.asarray(result.path if len(result.path) >= 2 else result.raw_path, dtype=float)
-    robot_execution = build_robot_execution(result, robot) if result.success else None
+    robot_execution = (
+        build_robot_execution(result, robot, use_planner_joint_path=bool(args.jointspace_planning))
+        if result.success
+        else None
+    )
 
     print("\nExample 66.1: 3DOF PyVista robot tracing selected multimodal path")
+    print(
+        "planner_mode = "
+        + ("robot_jointspace_planning" if args.jointspace_planning else "task_space_path_tracking")
+    )
     print(f"planner_success = {result.success}")
     print(f"planner_message = {result.message}")
+    print(f"total_rounds = {result.total_rounds}")
+    print(f"candidate_evaluations = {result.candidate_evaluations}")
+    print(f"left_evidence_nodes = {result.left_evidence_nodes}")
+    print(f"plane_evidence_nodes = {result.plane_evidence_nodes}")
+    print(f"right_evidence_nodes = {result.right_evidence_nodes}")
+    print(f"transition_hypotheses_left_plane = {result.transition_hypotheses_left_plane}")
+    print(f"transition_hypotheses_plane_right = {result.transition_hypotheses_plane_right}")
+    print(f"first_solution_round = {result.first_solution_round}")
+    print(f"best_solution_round = {result.best_solution_round}")
+    print(f"route_cost_raw = {result.route_cost_raw:.4f}")
+    print(f"route_cost_display = {result.route_cost_display:.4f}")
     print(f"route_points = {len(route)}")
     print(f"robot_waypoints = {0 if robot_execution is None else len(robot_execution.joint_path)}")
     print(f"ik_success_count = {0 if robot_execution is None else robot_execution.ik_success_count}")
     print(f"ik_failure_count = {0 if robot_execution is None else robot_execution.ik_failure_count}")
     print(f"max_tracking_error = {0.0 if robot_execution is None else robot_execution.max_tracking_error:.4f}")
     print(f"mean_tracking_error = {0.0 if robot_execution is None else robot_execution.mean_tracking_error:.4f}")
-    print(f"exact_planner_path_used = {False if robot_execution is None else robot_execution.exact_planner_path_used}")
+    print(
+        "planner_path_resampled_for_robot = "
+        + str(False if robot_execution is None else robot_execution.planner_path_resampled_for_robot)
+    )
+    print(
+        "planner_joint_path_used_directly = "
+        + str(False if robot_execution is None else robot_execution.planner_joint_path_used_directly)
+    )
     print(f"obstacle_count = {len(result.obstacles)}")
     print("replay_key = r")
     print(

@@ -9,22 +9,14 @@ and visualization remain in the example scripts.
 
 from dataclasses import dataclass, field
 import heapq
-from pathlib import Path
-import sys
-
 import numpy as np
-
-ROOT = Path(__file__).resolve().parents[3]
-EXAMPLES_DIR = ROOT / "examples"
-if str(EXAMPLES_DIR) not in sys.path:
-    sys.path.insert(0, str(EXAMPLES_DIR))
 
 from primitive_manifold_planner.manifolds.geometric import MaskedManifold, PlaneManifold, SphereManifold
 from primitive_manifold_planner.manifolds.robot import RobotPlaneManifold, RobotSphereManifold
 from primitive_manifold_planner.families.standard import MaskedFamily, PlaneFamily, SphereFamily
 from primitive_manifold_planner.projection import project_newton
 
-from intrinsic_multimodal_scene import (
+from primitive_manifold_planner.examplesupport.intrinsic_multimodal_helpers import (
     concatenate_paths,
     deduplicate_points,
     explored_points_from_edges,
@@ -40,7 +32,7 @@ from intrinsic_multimodal_scene import (
     solve_exact_segment_on_manifold,
     sphere_point,
 )
-from jointspace_planner_utils import (
+from primitive_manifold_planner.examplesupport.jointspace_planner_utils import (
     detect_transitions_jointspace,
     end_effector_point,
     explore_joint_manifold,

@@ -37,9 +37,9 @@ If the package is installed into your active Python environment, the same comman
 
 ## Key Examples
 
-`examples/multimodal_graph_search.py` runs the fixed left-sphere / plane / right-sphere parallel-evidence planner.
+`examples/multimodal_graph_search.py` runs the task-space fixed-sequence multimodal evidence planner for the left-sphere / plane / right-sphere scene.
 
-`examples/three_dof_robot_pyvista_demo.py` runs the same route-planning workflow with a simple 3DOF robot and PyVista visualization.
+`examples/three_dof_robot_pyvista_demo.py` defaults to the same task-space planner as `multimodal_graph_search.py`, then resamples the selected path for 3DOF robot IK tracking and PyVista visualization. Use `--jointspace-planning` to opt into the robot-aware joint-space constrained multimodal planner.
 
 `examples/multimodal_graph_search_stress_test.py` runs a harder blocked-plane stress scene using the same planner interface.
 
