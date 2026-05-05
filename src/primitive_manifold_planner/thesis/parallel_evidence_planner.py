@@ -14,13 +14,13 @@ import sys
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[3]
 EXAMPLES_DIR = ROOT / "examples"
 if str(EXAMPLES_DIR) not in sys.path:
     sys.path.insert(0, str(EXAMPLES_DIR))
 
-from manifolds.geometric import MaskedManifold, PlaneManifold, SphereManifold
-from manifolds.robot import RobotPlaneManifold, RobotSphereManifold
+from primitive_manifold_planner.manifolds.geometric import MaskedManifold, PlaneManifold, SphereManifold
+from primitive_manifold_planner.manifolds.robot import RobotPlaneManifold, RobotSphereManifold
 from primitive_manifold_planner.families.standard import MaskedFamily, PlaneFamily, SphereFamily
 from primitive_manifold_planner.projection import project_newton
 

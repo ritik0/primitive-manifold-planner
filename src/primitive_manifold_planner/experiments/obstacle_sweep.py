@@ -24,7 +24,7 @@ def run_obstacle_sweep(
     stop_after_first_solution: bool = False,
     extra_rounds_after_first_solution: int | None = None,
 ) -> list[dict[str, object]]:
-    script_path = Path(__file__).resolve().parents[1] / "examples" / "continuous_transfer_family.py"
+    script_path = Path(__file__).resolve().parents[3] / "examples" / "continuous_transfer_family.py"
     rows: list[dict[str, object]] = []
     for obstacle_profile in DEFAULT_OBSTACLE_SWEEP:
         command = [

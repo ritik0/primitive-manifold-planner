@@ -17,7 +17,7 @@ from primitive_manifold_planner.projection import project_newton
 
 from .config import LAMBDA_SOURCE_TOL
 
-import multimodal_graph_search as ex66
+from primitive_manifold_planner.thesis import parallel_evidence_planner as ex66
 
 
 def _deduplicate_points(points: list[np.ndarray], tol: float = 1e-9) -> np.ndarray:

@@ -6,15 +6,15 @@ import sys
 import matplotlib.pyplot as plt
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[3]
 EXAMPLES_DIR = ROOT / "examples"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 if str(EXAMPLES_DIR) not in sys.path:
     sys.path.insert(0, str(EXAMPLES_DIR))
 
-from manifolds.geometric import PlaneManifold, SphereManifold
-from planner.parallel_evidence_planner import (
+from primitive_manifold_planner.manifolds.geometric import PlaneManifold, SphereManifold
+from primitive_manifold_planner.thesis.parallel_evidence_planner import (
     LEFT_STAGE,
     PLANE_STAGE,
     RIGHT_STAGE,

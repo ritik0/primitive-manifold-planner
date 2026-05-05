@@ -17,7 +17,7 @@ import numpy as np
 from ompl import util as ou
 
 import multimodal_graph_search as base
-from scenes.stress_scene import build_stress_scene, print_route_summary, show_stress_route
+from primitive_manifold_planner.scenes.stress_scene import build_stress_scene, print_route_summary, show_stress_route
 
 
 def main():

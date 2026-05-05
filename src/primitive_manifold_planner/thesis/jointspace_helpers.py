@@ -15,7 +15,7 @@ import sys
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[3]
 EXAMPLES_DIR = ROOT / "examples"
 if str(EXAMPLES_DIR) not in sys.path:
     sys.path.insert(0, str(EXAMPLES_DIR))
@@ -30,7 +30,7 @@ from jointspace_planner_utils import (
     inverse_kinematics_start,
     joint_path_to_task_path,
 )
-from manifolds.robot import RobotPlaneManifold, RobotSphereManifold
+from primitive_manifold_planner.manifolds.robot import RobotPlaneManifold, RobotSphereManifold
 
 
 def _task_point(robot, q: np.ndarray) -> np.ndarray:

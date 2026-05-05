@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[3]
 EXAMPLES_DIR = ROOT / "examples"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))

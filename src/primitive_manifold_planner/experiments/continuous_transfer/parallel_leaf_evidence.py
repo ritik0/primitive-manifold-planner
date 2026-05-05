@@ -36,7 +36,7 @@ from .seed_utils import keep_diverse_exit_seeds, keep_diverse_stage_seeds
 from .strict_validation import report_strict_validation_failures, validate_transition_edge
 from .support import refine_intersection_on_both_manifolds
 
-import multimodal_graph_search as ex66
+from primitive_manifold_planner.thesis import parallel_evidence_planner as ex66
 
 
 LEFT_STAGE = "left"

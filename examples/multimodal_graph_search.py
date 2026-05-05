@@ -16,9 +16,9 @@ if str(ROOT) not in sys.path:
 from primitive_manifold_planner.families.standard import MaskedFamily, PlaneFamily, SphereFamily
 
 from intrinsic_multimodal_scene import build_segment_polydata
-from planner import parallel_evidence_planner as planner_core
-from planner.parallel_evidence_planner import *  # noqa: F401,F403
-from visualization.display import (
+from primitive_manifold_planner.thesis import parallel_evidence_planner as planner_core
+from primitive_manifold_planner.thesis.parallel_evidence_planner import *  # noqa: F401,F403
+from primitive_manifold_planner.visualization.display import (
     draw_edge_segments,
     plane_patch_corners,
     plot_manifold,

@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from experiments.serial_vs_parallel import main
+from primitive_manifold_planner.experiments.serial_vs_parallel import main
 
 
 if __name__ == "__main__":

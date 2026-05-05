@@ -18,7 +18,7 @@ import multimodal_graph_search as ex66
 from collision_utilities import default_example_66_obstacles
 
 from primitive_manifold_planner.visualization import pyvista_available
-from visualization.robot import show_pyvista_robot_demo
+from primitive_manifold_planner.visualization.robot import show_pyvista_robot_demo
 
 try:
     import pyvista as pv

@@ -18,7 +18,7 @@ if str(ROOT) not in sys.path:
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from experiments.obstacle_sweep import print_obstacle_sweep_table, run_obstacle_sweep
+from primitive_manifold_planner.experiments.obstacle_sweep import print_obstacle_sweep_table, run_obstacle_sweep
 from primitive_manifold_planner.experiments.continuous_transfer import (  # noqa: E402
     default_example_65_scene_description,
     obstacle_profile_comparison_row,

@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 from ompl import util as ou
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[3]
 EXAMPLES = ROOT / "examples"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))

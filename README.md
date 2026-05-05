@@ -1,165 +1,58 @@
 # Primitive Manifold Planner
 
-A research-oriented Python framework for planning on and between primitive implicitly defined manifolds.
+A Python research codebase for a robotics master's thesis on multimodal constrained trajectory planning.
 
-## Goal
+The project studies how a planner can accumulate evidence on several constraint manifolds in parallel, detect valid transition regions, and then extract a certified route across a sequence of modes. The examples start with interpretable geometric constraints such as spheres and planes, then extend the same ideas toward robot joint-space planning and continuous transfer families.
 
-This project studies motion planning on constraint manifolds in the simplest possible setting.
+## Repository Layout
 
-Instead of starting with robot kinematics, the framework focuses on primitive geometric manifolds such as circles, spheres, planes, and cylinders. The main objective is to develop and compare general methods for:
+`examples/` contains runnable entry-point scripts. These files are intentionally thin: they parse command-line arguments, build a scene, call package code, and optionally visualize the result.
 
-1. Planning on a single smooth manifold
-2. Planning across multiple manifolds
-3. Finding and using manifold intersections as transitions
-4. Extending the setup to parameterized manifold families (leaf families / foliations)
+`src/primitive_manifold_planner/manifolds/` defines reusable constraint manifolds: primitive geometric manifolds, masks/bounds, and robot task-space constraint manifolds.
 
-The project is intentionally designed to stay as general and minimal as possible before introducing robot-specific structure.
+`src/primitive_manifold_planner/thesis/` contains the thesis-focused Example 66-style planner code: parallel evidence stores, transition hypotheses, route extraction, and joint-space helpers.
 
----
+`src/primitive_manifold_planner/scenes/` contains reusable scene builders for harder benchmark environments, including the multimodal stress-test scene.
 
-## Motivation
+`src/primitive_manifold_planner/visualization/` contains Matplotlib and PyVista display helpers for planner graphs, task-space routes, and robot demos.
 
-Many constrained motion planning problems can be understood as motion in lower-dimensional spaces embedded in a higher-dimensional ambient space.
+`src/primitive_manifold_planner/experiments/` contains reusable experiment runners and the continuous-transfer planning modules used by Example 65-style workflows.
 
-Examples:
-- A point constrained to a circle in 2D
-- A point constrained to a sphere in 3D
-- Motion restricted to a plane
-- Switching from one manifold to another through their intersection
+`tests/` contains regression tests for manifolds, projection, transitions, planners, and visualization helpers.
 
-This project builds the mathematical and algorithmic foundations for such problems first, using primitive examples, before applying similar ideas to robotic systems.
+`notes/` contains thesis notes, method roadmaps, validation checklists, and architecture documentation.
 
----
+## Main Workflows
 
-## Project Roadmap
+Use the repository virtual environment when available:
 
-The project is developed in the following order:
+```powershell
+.\.venv\Scripts\python.exe examples\multimodal_graph_search.py --fast --no-viz
+.\.venv\Scripts\python.exe examples\multimodal_graph_search_stress_test.py --help
+.\.venv\Scripts\python.exe examples\three_dof_robot_pyvista_demo.py --help
+.\.venv\Scripts\python.exe examples\continuous_transfer_family.py --help
+```
 
-### Stage 1 — Single Smooth Manifold
-Examples:
-- circle in 2D
-- sphere in 3D
-- plane in 3D
-- cylinder in 3D
+If the package is installed into your active Python environment, the same commands can be run with `python` instead of the explicit venv path.
 
-Goal:
-- define manifolds implicitly
-- project points onto them
-- plan local and global paths constrained to one manifold
+## Key Examples
 
-### Stage 2 — Multiple Manifolds
-Examples:
-- sphere + plane
-- sphere + cylinder
-- two spheres
+`examples/multimodal_graph_search.py` runs the fixed left-sphere / plane / right-sphere parallel-evidence planner.
 
-Goal:
-- detect whether intersections exist
-- compute transition samples
-- plan across manifold switches
+`examples/three_dof_robot_pyvista_demo.py` runs the same route-planning workflow with a simple 3DOF robot and PyVista visualization.
 
-### Stage 3 — Transition-Based Planning
-Goal:
-- build a graph of manifolds
-- connect manifolds through valid transition regions
-- perform graph search over manifold sequences
-- solve continuous path segments inside each manifold
+`examples/multimodal_graph_search_stress_test.py` runs a harder blocked-plane stress scene using the same planner interface.
 
-### Stage 4 — Parameterized Leaf Families
-Examples:
-- concentric circles
-- parallel planes
-- variable-radius spheres
+`examples/continuous_transfer_family.py` runs the continuous-transfer family planner with lambda-locked leaves and optional top-k route reporting.
 
-Goal:
-- represent a family of manifolds indexed by a parameter lambda
-- study planning on one leaf versus planning across multiple leaves
+## Development Checks
 
-### Stage 5 — Toward Foliation-Inspired Planning
-Goal:
-- understand how a planner can reason over families of manifolds
-- compare discrete leaf selection with continuous augmented-state formulations
+```powershell
+.\.venv\Scripts\python.exe -m pytest
+```
 
----
+Some visualization and robot demos require optional dependencies such as OMPL, PyVista, scipy, or trimesh. Missing optional dependencies should be treated as environment issues, not planner-logic failures.
 
-## Core Mathematical View
+## More Context
 
-A manifold is represented implicitly using equality constraints:
-
-M = { x in R^n : h(x) = 0 }
-
-Optionally, valid regions may also include inequality constraints:
-
-M = { x in R^n : h(x) = 0, g(x) <= 0 }
-
-For a family of manifolds:
-
-M_lambda = { x in R^n : h(x, lambda) = 0, g(x, lambda) <= 0 }
-
-The framework focuses on the following primitives:
-
-- residual evaluation
-- Jacobian evaluation
-- projection to the manifold
-- tangent-space computation
-- constrained local planning
-- transition detection between manifolds
-
----
-
-## Design Principles
-
-- Keep geometry primitive and interpretable
-- Separate mathematical definitions from planning algorithms
-- Avoid robot-specific assumptions
-- Use small, testable modules
-- Prefer explicit understanding over premature complexity
-
----
-
-## Planned Algorithms
-
-The framework will support and compare:
-
-- projection-based manifold adherence
-- local constrained interpolation
-- constrained RRT-style planning
-- intersection-based transition search
-- graph search over manifolds
-- later: tangent-space / atlas-based local planning
-
-For the current thesis-oriented method direction and validation priorities, see:
-
-- [notes/05_thesis_method_roadmap.md](C:/dev/mmp/primitive-manifold-planner/notes/05_thesis_method_roadmap.md)
-
----
-
-## Initial Dependencies
-
-- numpy
-- scipy
-- matplotlib
-
-Optional later:
-- networkx
-- pytest
-- plotly or pyvista
-
----
-
-## First Milestone
-
-Implement a single-manifold pipeline for a circle and a sphere:
-- implicit residual
-- Jacobian
-- projection
-- constrained local step
-- simple visualization
-
----
-
-## Long-Term Direction
-
-After validating all methods on primitive manifolds, the same architecture can later be reused for more structured constrained planning problems, including robotic systems.
-
-The emphasis, however, is on getting the geometric and algorithmic foundations correct first.
+See [notes/05_thesis_method_roadmap.md](notes/05_thesis_method_roadmap.md), [notes/06_thesis_validation_checklist.md](notes/06_thesis_validation_checklist.md), and [notes/07_codebase_architecture.md](notes/07_codebase_architecture.md) for the thesis method direction and streamlined code workflow.
