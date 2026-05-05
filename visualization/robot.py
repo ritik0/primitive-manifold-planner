@@ -14,7 +14,7 @@ if str(ROOT) not in sys.path:
 if str(EXAMPLES_DIR) not in sys.path:
     sys.path.insert(0, str(EXAMPLES_DIR))
 
-import example_66_multimodal_graph_search as ex66
+import multimodal_graph_search as ex66
 from primitive_manifold_planner.visualization import add_manifold, add_points, pyvista_available
 
 try:
@@ -476,4 +476,3 @@ __all__ = [
     "update_actor_mesh",
     "update_robot_actor_bundle",
 ]
-

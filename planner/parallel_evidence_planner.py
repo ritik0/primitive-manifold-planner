@@ -24,7 +24,7 @@ from manifolds.robot import RobotPlaneManifold, RobotSphereManifold
 from primitive_manifold_planner.families.standard import MaskedFamily, PlaneFamily, SphereFamily
 from primitive_manifold_planner.projection import project_newton
 
-from example_64_intrinsic_multimodal_scene import (
+from intrinsic_multimodal_scene import (
     concatenate_paths,
     deduplicate_points,
     explored_points_from_edges,

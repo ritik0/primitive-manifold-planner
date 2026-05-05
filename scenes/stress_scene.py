@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import matplotlib.pyplot as plt
 import numpy as np
 
-import example_66_multimodal_graph_search as base
+import multimodal_graph_search as base
 
 from primitive_manifold_planner.families.standard import MaskedFamily, PlaneFamily, SphereFamily
 from primitive_manifold_planner.visualization import add_manifold, add_points, pyvista_available

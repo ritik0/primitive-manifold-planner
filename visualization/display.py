@@ -28,7 +28,7 @@ from planner.parallel_evidence_planner import (
 )
 from primitive_manifold_planner.visualization import add_manifold, add_points, pyvista_available
 
-from example_64_intrinsic_multimodal_scene import build_segment_polydata
+from intrinsic_multimodal_scene import build_segment_polydata
 
 try:
     import pyvista as pv
@@ -572,4 +572,3 @@ __all__ = [
     "show_route",
     "show_unknown_sequence_route",
 ]
-

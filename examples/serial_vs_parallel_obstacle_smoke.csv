@@ -1,3 +1,0 @@
-seed,mode,serial_mode,success,planning_time_s,total_rounds,candidate_evaluations,route_cost,left_evidence_nodes,plane_evidence_nodes,right_evidence_nodes,saturated_before_solution,stagnation_stage,message,obstacle_count
-41,parallel,False,True,46.98253200005274,24,201,14.238903517292508,47,95,78,False,,Parallel stage evidence accumulated enough certified sequential structure to extract a fixed left-plane-right robot joint-space route.,2
-42,serial,True,False,4.729691499960609,24,41,0.0,17,20,19,True,left,"Robot joint-space serial exploration accumulated evidence across the fixed left / plane / right manifolds, but no certified sequential route was extracted before exploration saturated.",2

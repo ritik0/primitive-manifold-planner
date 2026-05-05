@@ -117,6 +117,7 @@ class AdaptiveTransitionSeedPolicy:
         self.component_anchor_fn = component_anchor_fn
         self.config = config if config is not None else TransitionSeedPolicyConfig()
         self.rng = rng if rng is not None else np.random.default_rng(0)
+        self.last_base_seed_count: int = 0
 
     def _project_to_leaf(self, leaf, x0: np.ndarray) -> Optional[np.ndarray]:
         proj = self.project_newton(
@@ -152,10 +153,14 @@ class AdaptiveTransitionSeedPolicy:
         seeds: List[np.ndarray] = []
 
         if self.base_seed_points_fn is not None:
-            seeds.extend(
+            base_seeds = [
                 np.asarray(s, dtype=float).copy()
                 for s in self.base_seed_points_fn(source_family, source_lam, target_family, target_lam)
-            )
+            ]
+            self.last_base_seed_count = len(base_seeds)
+            seeds.extend(base_seeds)
+        else:
+            self.last_base_seed_count = 0
 
         anchors: List[np.ndarray] = []
 
@@ -313,6 +318,7 @@ class TransitionGenerator:
                 goal_point=goal_point,
             )
         )
+        base_seed_count = int(getattr(self.seed_policy, "last_base_seed_count", len(seeds)))
         raw_result = find_leaf_transition(
             source_family=source_family,
             source_lam=source_lam,
@@ -383,7 +389,8 @@ class TransitionGenerator:
 
         entry = {
             "raw_result": raw_result,
-            "seed_count": len(seeds),
+            "seed_count": base_seed_count,
+            "expanded_seed_count": len(seeds),
         }
         self._pair_cache[key] = entry
         self.cache_misses += 1
@@ -419,6 +426,7 @@ class TransitionGenerator:
                 "generator": "exact_cached_transition_generator",
                 "from_cache": from_cache,
                 "seed_count": int(entry["seed_count"]),
+                "expanded_seed_count": int(entry.get("expanded_seed_count", entry["seed_count"])),
                 "raw_candidate_index": int(raw_idx),
             }
             base_score = score_transition_candidate(

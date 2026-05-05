@@ -51,7 +51,7 @@ def default_example_65_scene_description(obstacle_profile: str = "none") -> dict
 
     profile_name = "none" if obstacle_profile is None else str(obstacle_profile)
     return {
-        "scene_name": "example_65_continuous_transfer_family",
+        "scene_name": "continuous_transfer_family",
         "left_support": {
             "family": "sphere",
             "name": "left_support_3d",

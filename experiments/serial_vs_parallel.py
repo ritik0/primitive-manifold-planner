@@ -17,9 +17,9 @@ if str(ROOT) not in sys.path:
 if str(EXAMPLES) not in sys.path:
     sys.path.insert(0, str(EXAMPLES))
 
-import example_66_multimodal_graph_search as ex66
+import multimodal_graph_search as ex66
 from collision_utilities import default_example_66_obstacles
-from example_66_1_three_dof_robot_pyvista import SpatialRobot3DOF
+from three_dof_robot_pyvista_demo import SpatialRobot3DOF
 
 
 def fixed_robot() -> SpatialRobot3DOF:

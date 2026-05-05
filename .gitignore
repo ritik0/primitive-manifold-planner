@@ -1,5 +1,7 @@
 # Python
 __pycache__/
+*.pyc
+*.pyc.*
 *.py[cod]
 *.pyo
 *.pyd
@@ -16,8 +18,25 @@ dist/
 
 # Testing / coverage
 .pytest_cache/
+.mypy_cache/
 .coverage
 htmlcov/
+
+# Generated outputs
+outputs/
+runs/
+thesis_runs/
+
+# Archives
+*.zip
+*.7z
+*.rar
+
+# Generated benchmark data / plots
+*.csv
+*.png
+*.jpg
+*.jpeg
 
 # IDE
 .vscode/

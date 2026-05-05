@@ -16,7 +16,7 @@ import argparse
 import numpy as np
 from ompl import util as ou
 
-import example_66_multimodal_graph_search as base
+import multimodal_graph_search as base
 from scenes.stress_scene import build_stress_scene, print_route_summary, show_stress_route
 
 

@@ -14,7 +14,7 @@ import math
 import numpy as np
 from ompl import util as ou
 
-import example_66_multimodal_graph_search as ex66
+import multimodal_graph_search as ex66
 from collision_utilities import default_example_66_obstacles
 
 from primitive_manifold_planner.visualization import pyvista_available
