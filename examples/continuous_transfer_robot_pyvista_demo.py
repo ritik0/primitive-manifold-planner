@@ -73,6 +73,68 @@ def _print_key_value_block(title: str, values: dict[str, object]) -> None:
         print(f"{key.ljust(width)} : {value}")
 
 
+def plan_continuous_transfer_jointspace_robot(*, scene_description, seed: int, joint_max_step: float, **planner_kwargs):
+    """Scaffold for Phase 2 direct joint-space continuous-family planning.
+
+    The task-space mode in this file is complete: the foliation planner selects
+    entry/exit/lambda structure, locally replans the final task route, and the
+    robot tracks only that route by IK. The future joint-space mode should not
+    reuse that IK layer as planning. It should mirror the fixed-manifold robot
+    planner, but with a leaf-managed transfer family:
+
+    - state: q = [theta0, theta1, theta2]
+    - task point: FK(q)
+    - left leaf: RobotSphereManifold(FK(q) on the left support sphere)
+    - right leaf: RobotSphereManifold(FK(q) on the right support sphere)
+    - transfer leaf: RobotPlaneLeafManifold / RobotFamilyLeafManifold
+
+    RobotPlaneLeafManifold design notes:
+    - stores a locked lambda value and a reference to the continuous transfer
+      family;
+    - residual(q) evaluates the active plane-leaf constraint at FK(q);
+    - within_bounds(q) checks the family patch/obstacle mask at FK(q);
+    - project(q) remains permissive enough for exploration, like the existing
+      RobotConstraintBase.project();
+    - project_local(q) may preserve IK branch for final selected-transition
+      realization;
+    - infer_lambda(q) delegates to family.infer_lambda(FK(q)) and candidate
+      lambdas are managed by a robot leaf-store manager.
+
+    Final execution rule for the future implementation:
+    the evidence graph discovers candidate lambdas and transitions only. After
+    selecting entry/exit/lambda, the executable robot route must be locally
+    replanned as start_q -> entry_q on the left robot sphere, entry_q -> exit_q
+    on the selected robot family leaf, and exit_q -> goal_q on the right robot
+    sphere. The displayed route must be FK(result.dense_joint_path), and robot
+    animation must use that exact dense_joint_path.
+    """
+
+    _print_key_value_block(
+        "Continuous-Transfer Joint-Space Scaffold",
+        {
+            "planning_mode": "jointspace_constrained_continuous_transfer",
+            "implementation_status": "pending_phase_2b",
+            "taskspace_mode_status": "complete_selected_transition_replan_plus_ik_tracking",
+            "state_space": "robot_joint_angles_q=[theta0, theta1, theta2]",
+            "task_map": "FK(q)",
+            "left_constraint": "FK(q) on left support sphere",
+            "family_constraint": "FK(q) on selected/inferred transfer family leaf lambda",
+            "right_constraint": "FK(q) on right support sphere",
+            "lambda_policy": "infer from FK(q), then manage locked robot family leaf stores",
+            "execution_rule": "selected-transition local replan in joint space, never raw graph execution",
+            "display_rule": "route_source = FK(result.dense_joint_path)",
+            "seed": int(seed),
+            "joint_max_step": float(joint_max_step),
+            "planner_kwargs_received": sorted(str(key) for key in planner_kwargs.keys()),
+            "next_step": "implement RobotPlaneLeafManifold and robot leaf evidence manager",
+        },
+    )
+    raise NotImplementedError(
+        "Direct joint-space continuous-transfer planning is scaffolded for Phase 2B. "
+        "Use --taskspace-planning for the working Phase 1 robot execution demo."
+    )
+
+
 def show_continuous_transfer_robot_demo(
     *,
     scene,
@@ -304,10 +366,21 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.jointspace_planning:
-        raise SystemExit(
-            "Joint-space continuous-family planning is Phase 2. "
-            "Use --taskspace-planning for the current robot execution-layer demo."
-        )
+        scene_description = default_example_65_scene_description(obstacle_profile=args.obstacle_profile)
+        try:
+            plan_continuous_transfer_jointspace_robot(
+                scene_description=scene_description,
+                seed=int(args.seed),
+                joint_max_step=float(args.joint_max_step),
+                max_ambient_probes=args.max_probes,
+                continue_after_first_solution=not args.stop_after_first_solution,
+                max_extra_rounds_after_first_solution=args.extra_rounds_after_first_solution,
+                top_k_assignments=args.top_k,
+                top_k_paths=args.top_k_paths,
+                obstacle_profile=args.obstacle_profile,
+            )
+        except NotImplementedError as exc:
+            raise SystemExit(str(exc)) from exc
 
     np.random.seed(int(args.seed))
     ou.RNG.setSeed(int(args.seed))
