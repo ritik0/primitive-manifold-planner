@@ -31,6 +31,7 @@ from primitive_manifold_planner.examplesupport.intrinsic_multimodal_helpers impo
 from primitive_manifold_planner.examplesupport.jointspace_planner_utils import (
     end_effector_point,
     explore_joint_manifold,
+    generate_joint_proposals,
     inverse_kinematics_start,
     joint_path_to_task_path,
     joint_step_statistics,
@@ -145,6 +146,149 @@ class JointspaceRouteRealization:
     collision_free: bool
     message: str
     segment_messages: dict[str, str]
+
+
+@dataclass
+class RobotFamilyLeafStore:
+    lambda_value: float
+    manifold: RobotPlaneLeafManifold
+    nodes: list[np.ndarray]
+    edges: list[tuple[int, int]]
+    frontier_ids: list[int]
+
+    def add_node(self, q: np.ndarray, dedup_tol: float = 1.0e-4) -> int:
+        q_arr = np.asarray(q, dtype=float).reshape(3)
+        for idx, existing in enumerate(self.nodes):
+            if float(np.linalg.norm(wrap_joint_angles(q_arr - existing))) <= float(dedup_tol):
+                return int(idx)
+        self.nodes.append(q_arr)
+        node_id = len(self.nodes) - 1
+        self.frontier_ids.append(node_id)
+        self.frontier_ids = self.frontier_ids[-72:]
+        return int(node_id)
+
+
+@dataclass
+class RobotStageEvidenceStore:
+    name: str
+    manifold: object
+    nodes: list[np.ndarray]
+    edges: list[tuple[int, int]]
+    frontier_ids: list[int]
+
+    def add_node(self, q: np.ndarray, dedup_tol: float = 1.0e-4) -> int:
+        q_arr = np.asarray(q, dtype=float).reshape(3)
+        for idx, existing in enumerate(self.nodes):
+            if float(np.linalg.norm(wrap_joint_angles(q_arr - existing))) <= float(dedup_tol):
+                return int(idx)
+        self.nodes.append(q_arr)
+        node_id = len(self.nodes) - 1
+        self.frontier_ids.append(node_id)
+        self.frontier_ids = self.frontier_ids[-72:]
+        return int(node_id)
+
+
+@dataclass
+class RobotJointspaceContinuousEvidence:
+    left_store: RobotStageEvidenceStore
+    right_store: RobotStageEvidenceStore
+    family_leaf_stores: dict[float, RobotFamilyLeafStore]
+    counters: dict[str, int]
+
+    def get_or_create_family_store(self, robot, transfer_family, lam: float) -> RobotFamilyLeafStore:
+        key = _lambda_key(float(lam))
+        existing = self.family_leaf_stores.get(key)
+        if existing is not None:
+            return existing
+        manifold = RobotPlaneLeafManifold(
+            robot=robot,
+            transfer_family=transfer_family,
+            lambda_value=float(key),
+            name="full_jointspace_family_leaf",
+        )
+        store = RobotFamilyLeafStore(
+            lambda_value=float(key),
+            manifold=manifold,
+            nodes=[],
+            edges=[],
+            frontier_ids=[],
+        )
+        self.family_leaf_stores[key] = store
+        return store
+
+
+def _lambda_key(lam: float, digits: int = 6) -> float:
+    return round(float(lam), int(digits))
+
+
+def _scene_candidate_lambdas(scene_description: dict[str, object], transfer_family) -> list[float]:
+    transfer_spec = dict(scene_description.get("transfer_family", {})) if isinstance(scene_description, dict) else {}
+    values = transfer_spec.get("plane_offsets", None)
+    if values is None:
+        values = list(transfer_family.sample_lambdas({"count": 10}))
+    result: list[float] = []
+    for value in values:
+        lam = float(value)
+        if transfer_family.lambda_in_range(lam, tol=1.0e-9):
+            result.append(_lambda_key(lam))
+    return sorted(set(result))
+
+
+def candidate_lambdas_for_joint_proposal(
+    q: np.ndarray,
+    robot,
+    transfer_family,
+    active_lambdas: list[float],
+    scene_lambdas: list[float],
+) -> list[float]:
+    ee = end_effector_point(robot, q)
+    candidates: list[float] = []
+    inferred = float(transfer_family.infer_lambda(ee))
+    if transfer_family.lambda_in_range(inferred, tol=5.0e-2):
+        candidates.append(float(np.clip(inferred, transfer_family.lambda_min, transfer_family.lambda_max)))
+    combined = sorted(set(float(v) for v in [*scene_lambdas, *active_lambdas]))
+    if combined:
+        nearest = sorted(combined, key=lambda lam: abs(lam - inferred))[:3]
+        candidates.extend(nearest)
+    candidates.extend(active_lambdas[-4:])
+    deduped: list[float] = []
+    for lam in candidates:
+        clamped = _lambda_key(float(np.clip(lam, transfer_family.lambda_min, transfer_family.lambda_max)))
+        if transfer_family.lambda_in_range(clamped, tol=1.0e-9) and all(abs(clamped - prev) > 1.0e-4 for prev in deduped):
+            deduped.append(clamped)
+    return deduped
+
+
+def _project_joint_to_store(store, q: np.ndarray, counter_prefix: str, counters: dict[str, int]) -> bool:
+    projection = store.manifold.project(q, tol=1.0e-6, max_iters=100)
+    if projection.success and bool(store.manifold.within_bounds(projection.x_projected, tol=2.0e-3)):
+        store.add_node(np.asarray(projection.x_projected, dtype=float))
+        counters[f"projected_to_{counter_prefix}_count"] = int(counters.get(f"projected_to_{counter_prefix}_count", 0)) + 1
+        return True
+    counters[f"{counter_prefix}_projection_failure_count"] = int(counters.get(f"{counter_prefix}_projection_failure_count", 0)) + 1
+    return False
+
+
+def project_joint_proposal_to_supports(
+    q_proposal: np.ndarray,
+    evidence: RobotJointspaceContinuousEvidence,
+    robot,
+    families,
+    scene_lambdas: list[float],
+) -> None:
+    _left_family, transfer_family, _right_family = families
+    counters = evidence.counters
+    q = np.asarray(q_proposal, dtype=float).reshape(3)
+    _project_joint_to_store(evidence.left_store, q, "left", counters)
+    _project_joint_to_store(evidence.right_store, q, "right", counters)
+    active_lambdas = sorted(evidence.family_leaf_stores.keys())
+    candidate_lambdas = candidate_lambdas_for_joint_proposal(q, robot, transfer_family, active_lambdas, scene_lambdas)
+    counters["candidate_lambdas_evaluated"] = int(counters.get("candidate_lambdas_evaluated", 0)) + len(candidate_lambdas)
+    if not candidate_lambdas:
+        counters["family_projection_failure_count"] = int(counters.get("family_projection_failure_count", 0)) + 1
+    for lam in candidate_lambdas:
+        store = evidence.get_or_create_family_store(robot, transfer_family, float(lam))
+        _project_joint_to_store(store, q, "family", counters)
 
 
 def build_robot_manifolds_for_selected_lambda(robot, families, selected_lambda: float) -> dict[str, object]:
@@ -824,6 +968,136 @@ def plan_continuous_transfer_jointspace_robot(*, scene_description, seed: int, j
     return scene, result, robot, robot_execution
 
 
+def plan_full_jointspace_continuous_transfer_evidence_scaffold(
+    *,
+    scene_description,
+    seed: int,
+    joint_max_step: float,
+    max_ambient_probes: int | None,
+    **planner_kwargs,
+):
+    """Phase 3A: project ambient joint proposals onto all robot supports.
+
+    This is deliberately evidence-only. It does not infer transitions, extract
+    routes, or animate anything. The purpose is to prove that q-space proposal
+    projection can populate left/right robot sphere stores and multiple locked
+    robot family leaf stores before Phase 3B transition discovery.
+    """
+
+    np.random.seed(int(seed))
+    ou.RNG.setSeed(int(seed))
+    ou.setLogLevel(ou.LOG_ERROR)
+    scene = build_continuous_transfer_scene(scene_description)
+    rough_route = np.asarray(
+        [
+            scene.start_q,
+            0.5 * (scene.start_q + scene.goal_q),
+            scene.goal_q,
+        ],
+        dtype=float,
+    )
+    robot = choose_robot_for_route(rough_route)
+    families = (scene.left_support, scene.transfer_family, scene.right_support)
+    nominal_lambda = float(scene.transfer_family.nominal_lambda)
+    manifolds = build_robot_manifolds_for_selected_lambda(robot, families, nominal_lambda)
+    evidence = RobotJointspaceContinuousEvidence(
+        left_store=RobotStageEvidenceStore(name="left_robot_sphere", manifold=manifolds[LEFT_STAGE], nodes=[], edges=[], frontier_ids=[]),
+        right_store=RobotStageEvidenceStore(name="right_robot_sphere", manifold=manifolds[RIGHT_STAGE], nodes=[], edges=[], frontier_ids=[]),
+        family_leaf_stores={},
+        counters={},
+    )
+    scene_lambdas = _scene_candidate_lambdas(scene_description, scene.transfer_family)
+
+    q_start = inverse_kinematics_start(robot, scene.start_q, tol=8.0e-2)
+    q_goal = inverse_kinematics_start(robot, scene.goal_q, warm_start=q_start, tol=8.0e-2)
+    if q_start is not None:
+        projected = _project_to_manifold(evidence.left_store.manifold, q_start, local=False)
+        if projected is not None:
+            evidence.left_store.add_node(projected)
+            q_start = projected
+    if q_goal is not None:
+        projected = _project_to_manifold(evidence.right_store.manifold, q_goal, local=False)
+        if projected is not None:
+            evidence.right_store.add_node(projected)
+            q_goal = projected
+
+    proposal_rounds = int(max_ambient_probes if max_ambient_probes is not None else 80)
+    proposal_rounds = max(1, proposal_rounds)
+    proposal_count = 8
+    joint_lower = -np.pi * np.ones(3, dtype=float)
+    joint_upper = np.pi * np.ones(3, dtype=float)
+    start_seed = np.asarray(q_start if q_start is not None else np.zeros(3, dtype=float), dtype=float)
+    goal_seed = np.asarray(q_goal if q_goal is not None else np.asarray([0.0, 0.85, -0.65], dtype=float), dtype=float)
+
+    for round_idx in range(1, proposal_rounds + 1):
+        active_guides = []
+        for store in evidence.family_leaf_stores.values():
+            active_guides.extend(store.nodes[-2:])
+        proposals = generate_joint_proposals(
+            round_idx,
+            start_seed,
+            goal_seed,
+            active_guides,
+            proposal_count=proposal_count,
+            joint_lower=joint_lower,
+            joint_upper=joint_upper,
+        )
+        for proposal in proposals:
+            project_joint_proposal_to_supports(
+                proposal,
+                evidence,
+                robot,
+                families,
+                scene_lambdas,
+            )
+
+    family_nodes = sum(len(store.nodes) for store in evidence.family_leaf_stores.values())
+    active_lambdas = sorted(float(key) for key in evidence.family_leaf_stores.keys())
+    lambda_range = (
+        [round(float(min(active_lambdas)), 6), round(float(max(active_lambdas)), 6)]
+        if active_lambdas
+        else []
+    )
+    evidence_ready = bool(len(evidence.left_store.nodes) > 0 and len(evidence.right_store.nodes) > 0 and family_nodes > 0)
+    _print_key_value_block(
+        "Full Joint-Space Continuous-Transfer Exploration Scaffold",
+        {
+            "full_jointspace_exploration": True,
+            "implementation_phase": "phase_3a_evidence_projection",
+            "planner_success": "evidence_ready" if evidence_ready else False,
+            "left_evidence_nodes": int(len(evidence.left_store.nodes)),
+            "left_evidence_edges": int(len(evidence.left_store.edges)),
+            "right_evidence_nodes": int(len(evidence.right_store.nodes)),
+            "right_evidence_edges": int(len(evidence.right_store.edges)),
+            "family_leaf_store_count": int(len(evidence.family_leaf_stores)),
+            "family_evidence_nodes": int(family_nodes),
+            "family_evidence_edges": int(sum(len(store.edges) for store in evidence.family_leaf_stores.values())),
+            "projected_to_left_count": int(evidence.counters.get("projected_to_left_count", 0)),
+            "projected_to_family_count": int(evidence.counters.get("projected_to_family_count", 0)),
+            "projected_to_right_count": int(evidence.counters.get("projected_to_right_count", 0)),
+            "left_projection_failure_count": int(evidence.counters.get("left_projection_failure_count", 0)),
+            "family_projection_failure_count": int(evidence.counters.get("family_projection_failure_count", 0)),
+            "right_projection_failure_count": int(evidence.counters.get("right_projection_failure_count", 0)),
+            "candidate_lambdas_evaluated": int(evidence.counters.get("candidate_lambdas_evaluated", 0)),
+            "active_family_lambdas": [round(float(v), 6) for v in active_lambdas[:20]],
+            "active_family_lambdas_omitted": max(0, len(active_lambdas) - 20),
+            "lambda_coverage_range": lambda_range,
+            "entry_transitions_found": 0,
+            "exit_transitions_found": 0,
+            "final_route_realization": "pending_phase_3c",
+            "graph_route_used_for_execution": False,
+            "execution_source": "none",
+            "route_source": "none",
+            "display_vs_trace_max_error": "not_applicable",
+            "joint_max_step": float(joint_max_step),
+            "proposal_rounds": int(proposal_rounds),
+            "proposals_per_round": int(proposal_count),
+            "next_step": "phase_3b_transition_discovery",
+        },
+    )
+    return scene, None, robot, None
+
+
 def show_continuous_transfer_robot_demo(
     *,
     scene,
@@ -1039,6 +1313,11 @@ def main() -> None:
     mode.add_argument("--taskspace-planning", action="store_true", help="Run task-space continuous-transfer planning plus IK execution.")
     mode.add_argument("--jointspace-planning", action="store_true", help="Reserved for Phase 2 joint-space continuous-family planning.")
     parser.set_defaults(taskspace_planning=True)
+    parser.add_argument(
+        "--full-jointspace-exploration",
+        action="store_true",
+        help="Opt into Phase 3 robot q-space continuous-family evidence projection scaffold.",
+    )
     parser.add_argument("--seed", type=int, default=41)
     parser.add_argument("--max-probes", type=int, default=None)
     parser.add_argument("--extra-rounds-after-first-solution", type=int, default=DEFAULT_POST_ROUTE_EVIDENCE_ROUNDS)
@@ -1056,17 +1335,30 @@ def main() -> None:
 
     if args.jointspace_planning:
         scene_description = default_example_65_scene_description(obstacle_profile=args.obstacle_profile)
-        scene, result, robot, robot_execution = plan_continuous_transfer_jointspace_robot(
-            scene_description=scene_description,
-            seed=int(args.seed),
-            joint_max_step=float(args.joint_max_step),
-            max_ambient_probes=args.max_probes,
-            continue_after_first_solution=not args.stop_after_first_solution,
-            max_extra_rounds_after_first_solution=args.extra_rounds_after_first_solution,
-            top_k_assignments=args.top_k,
-            top_k_paths=args.top_k_paths,
-            obstacle_profile=args.obstacle_profile,
-        )
+        if args.full_jointspace_exploration:
+            scene, result, robot, robot_execution = plan_full_jointspace_continuous_transfer_evidence_scaffold(
+                scene_description=scene_description,
+                seed=int(args.seed),
+                joint_max_step=float(args.joint_max_step),
+                max_ambient_probes=args.max_probes,
+                continue_after_first_solution=not args.stop_after_first_solution,
+                max_extra_rounds_after_first_solution=args.extra_rounds_after_first_solution,
+                top_k_assignments=args.top_k,
+                top_k_paths=args.top_k_paths,
+                obstacle_profile=args.obstacle_profile,
+            )
+        else:
+            scene, result, robot, robot_execution = plan_continuous_transfer_jointspace_robot(
+                scene_description=scene_description,
+                seed=int(args.seed),
+                joint_max_step=float(args.joint_max_step),
+                max_ambient_probes=args.max_probes,
+                continue_after_first_solution=not args.stop_after_first_solution,
+                max_extra_rounds_after_first_solution=args.extra_rounds_after_first_solution,
+                top_k_assignments=args.top_k,
+                top_k_paths=args.top_k_paths,
+                obstacle_profile=args.obstacle_profile,
+            )
         if not args.no_viz and scene is not None and result is not None and robot is not None:
             show_continuous_transfer_robot_demo(
                 scene=scene,
