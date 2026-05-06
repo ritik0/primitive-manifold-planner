@@ -26,6 +26,7 @@ from primitive_manifold_planner.experiments.continuous_transfer import (  # noqa
     print_continuous_route_summary,
     show_continuous_route,
 )
+from primitive_manifold_planner.experiments.continuous_transfer.config import DEFAULT_POST_ROUTE_EVIDENCE_ROUNDS
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run Example 65 staged continuous-transfer planning.")
@@ -61,7 +62,7 @@ def main() -> None:
     parser.add_argument(
         "--extra-rounds-after-first-solution",
         type=int,
-        default=None,
+        default=DEFAULT_POST_ROUTE_EVIDENCE_ROUNDS,
         help="Optional number of extra family-stage rounds after the first discovered exit.",
     )
     parser.add_argument("--no-viz", action="store_true", help="Skip the PyVista visualization window.")

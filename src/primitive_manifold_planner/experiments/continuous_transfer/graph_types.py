@@ -140,6 +140,32 @@ class ContinuousTransferRoute:
     strict_invalid_points: np.ndarray = field(default_factory=lambda: np.zeros((0, 3), dtype=float))
     top_k_routes: list[ContinuousRouteAlternative] = field(default_factory=list)
     leaf_store_counts: dict[str, int] = field(default_factory=dict)
+    ambient_probe_rounds: int = 0
+    continue_after_first_solution: bool = True
+    max_extra_rounds_after_first_solution: int | None = None
+    post_solution_rounds_completed: int = 0
+    left_evidence_nodes: int = 0
+    left_evidence_edges: int = 0
+    family_leaf_store_count: int = 0
+    family_evidence_nodes: int = 0
+    family_evidence_edges: int = 0
+    right_evidence_nodes: int = 0
+    right_evidence_edges: int = 0
+    route_candidates_evaluated: int = 0
+    final_route_realization: str = "graph_route_display_geometry"
+    graph_route_used_for_execution: bool = True
+    selected_lambda_values: list[float] = field(default_factory=list)
+    selected_lambda_range: str = "none"
+    strict_validation_success: bool = False
+    selected_entry_point: np.ndarray | None = None
+    selected_exit_point: np.ndarray | None = None
+    selected_lambda_for_realization: float | None = None
+    local_replan_left_success: bool = False
+    local_replan_family_success: bool = False
+    local_replan_right_success: bool = False
+    local_replan_strict_validation_success: bool = False
+    local_replan_path_points: int = 0
+    local_replan_message: str = ""
 
 
 @dataclass

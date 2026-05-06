@@ -31,7 +31,7 @@ from .lambda_utils import (
 from .projection_utils import sphere_radius_from_family
 from .right_stage import build_outer_route_from_family_exit
 from .graph_paths import k_shortest_simple_paths_over_graph, shortest_path_over_graph
-from .route_geometry import build_route_geometry_views
+from .route_geometry import build_route_geometry_views, orient_edge_path
 from .parallel_leaf_evidence import ParallelLeafWarmstartResult, run_locked_lambda_parallel_evidence_warmstart
 from .route_semantics import (
     GraphRouteCandidate,
@@ -41,8 +41,18 @@ from .route_semantics import (
     score_route_with_family_preferences,
     summarize_family_route_semantics,
 )
-from .strict_validation import validate_selected_route_strictly
+from .strict_validation import (
+    format_strict_validation_failure,
+    sample_strict_family_leaf_path,
+    sample_strict_sphere_motion_path,
+    validate_family_leaf_motion_edge,
+    validate_left_motion_edge,
+    validate_right_motion_edge,
+    validate_selected_route_strictly,
+    validate_transition_edge,
+)
 from .support import (
+    concatenate_paths,
     deduplicate_points,
     explored_points_from_edges,
     merge_edges,
@@ -221,6 +231,111 @@ def extract_continuous_route_for_leaf_sequence(
         if best is None or float(alternative.total_cost) + 1e-12 < float(best.total_cost):
             best = alternative
     return best
+
+
+def realize_selected_transition_route_continuous_transfer(
+    *,
+    start: np.ndarray,
+    entry_transition: np.ndarray,
+    exit_transition: np.ndarray,
+    goal: np.ndarray,
+    selected_lambda: float,
+    left_manifold,
+    left_center: np.ndarray,
+    left_radius: float,
+    transfer_family,
+    right_manifold,
+    right_center: np.ndarray,
+    right_radius: float,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Rebuild execution/display geometry from selected transitions only.
+
+    The evidence graph selects the transition pair and fixed family leaf. The
+    final non-robot route is then realized as three fresh constrained local
+    motions, mirroring the selected-transition realization used by Example 66.1.
+    """
+    start = np.asarray(start, dtype=float).reshape(3)
+    entry = np.asarray(entry_transition, dtype=float).reshape(3)
+    exit_q = np.asarray(exit_transition, dtype=float).reshape(3)
+    goal = np.asarray(goal, dtype=float).reshape(3)
+    lam = float(selected_lambda)
+    diagnostics: dict[str, object] = {
+        "local_replan_left_success": False,
+        "local_replan_family_success": False,
+        "local_replan_right_success": False,
+        "local_replan_strict_validation_success": False,
+        "local_replan_path_points": 0,
+        "local_replan_message": "",
+    }
+
+    transition_failures: list[str] = []
+    entry_left_ok, entry_left_failures = validate_transition_edge(
+        path=np.asarray([entry], dtype=float),
+        side_manifold=left_manifold,
+        transfer_family=transfer_family,
+        lam=lam,
+        side_center=np.asarray(left_center, dtype=float),
+        side_radius=float(left_radius),
+        side_mode="left",
+    )
+    exit_right_ok, exit_right_failures = validate_transition_edge(
+        path=np.asarray([exit_q], dtype=float),
+        side_manifold=right_manifold,
+        transfer_family=transfer_family,
+        lam=lam,
+        side_center=np.asarray(right_center, dtype=float),
+        side_radius=float(right_radius),
+        side_mode="right",
+    )
+    if not entry_left_ok:
+        transition_failures.extend(format_strict_validation_failure(failure) for failure in entry_left_failures[:2])
+    if not exit_right_ok:
+        transition_failures.extend(format_strict_validation_failure(failure) for failure in exit_right_failures[:2])
+    if len(transition_failures) > 0:
+        diagnostics["local_replan_message"] = "transition validation failed: " + " | ".join(transition_failures)
+        return np.zeros((0, 3), dtype=float), diagnostics
+
+    left_path = sample_strict_sphere_motion_path(left_center, left_radius, start, entry)
+    left_ok, left_failures = validate_left_motion_edge(left_path, left_manifold, left_center, left_radius)
+    diagnostics["local_replan_left_success"] = bool(left_ok)
+    if not left_ok:
+        diagnostics["local_replan_message"] = (
+            "left segment failed: "
+            + " | ".join(format_strict_validation_failure(failure) for failure in left_failures[:3])
+        )
+        return np.zeros((0, 3), dtype=float), diagnostics
+
+    family_path = sample_strict_family_leaf_path(entry, exit_q)
+    family_ok, family_failures = validate_family_leaf_motion_edge(family_path, transfer_family, lam)
+    diagnostics["local_replan_family_success"] = bool(family_ok)
+    if not family_ok:
+        diagnostics["local_replan_message"] = (
+            "family segment failed: "
+            + " | ".join(format_strict_validation_failure(failure) for failure in family_failures[:3])
+        )
+        return np.zeros((0, 3), dtype=float), diagnostics
+
+    right_path = sample_strict_sphere_motion_path(right_center, right_radius, exit_q, goal)
+    right_ok, right_failures = validate_right_motion_edge(right_path, right_manifold, right_center, right_radius)
+    diagnostics["local_replan_right_success"] = bool(right_ok)
+    if not right_ok:
+        diagnostics["local_replan_message"] = (
+            "right segment failed: "
+            + " | ".join(format_strict_validation_failure(failure) for failure in right_failures[:3])
+        )
+        return np.zeros((0, 3), dtype=float), diagnostics
+
+    realized_path = concatenate_paths(left_path, family_path, right_path)
+    if len(realized_path) == 0:
+        diagnostics["local_replan_message"] = "local realization produced an empty path"
+        return np.zeros((0, 3), dtype=float), diagnostics
+    diagnostics["local_replan_path_points"] = int(len(realized_path))
+    diagnostics["local_replan_strict_validation_success"] = True
+    diagnostics["local_replan_message"] = (
+        "selected transition local replan passed strict segment validation: "
+        f"lambda={lam:.6f}, points={len(realized_path)}"
+    )
+    return np.asarray(realized_path, dtype=float), diagnostics
 
 
 def _build_example_65_stage_graph() -> StageGraph:
@@ -433,6 +548,9 @@ def _build_final_continuous_route(
     top_k_assignments: int,
     top_k_paths: int,
     left_round_budget: int,
+    parallel_round_budget: int,
+    continue_after_first_solution: bool,
+    max_extra_rounds_after_first_solution: int | None,
     leaf_store_counts: dict[str, int] | None = None,
 ) -> ContinuousTransferRoute:
     committed_edge_allowed = lambda edge: str(edge.kind) != "family_transverse"
@@ -730,9 +848,82 @@ def _build_final_continuous_route(
             route_lambda_values.extend(float(v) for v in np.asarray(edge.path_lambdas, dtype=float).reshape(-1))
         elif edge.lambda_value is not None:
             route_lambda_values.append(float(edge.lambda_value))
+    selected_lambda_values = _deduplicate_lambda_values(route_lambda_values)
+    selected_lambda_range = (
+        "none"
+        if len(selected_lambda_values) == 0
+        else f"[{min(selected_lambda_values):.6f}, {max(selected_lambda_values):.6f}]"
+    )
     route_lambda_variation_total = 0.0
     if len(route_lambda_values) >= 2:
         route_lambda_variation_total = float(np.sum(np.abs(np.diff(np.asarray(route_lambda_values, dtype=float)))))
+    selected_entry_point: np.ndarray | None = None
+    selected_exit_point: np.ndarray | None = None
+    selected_lambda_for_realization: float | None = None
+    local_replan_diagnostics: dict[str, object] = {
+        "local_replan_left_success": False,
+        "local_replan_family_success": False,
+        "local_replan_right_success": False,
+        "local_replan_strict_validation_success": False,
+        "local_replan_path_points": 0,
+        "local_replan_message": "local replan skipped: no strict graph route selected",
+    }
+    graph_route_used_for_execution = bool(has_graph_route)
+    final_route_realization = (
+        "graph_route_strictly_validated_display_geometry"
+        if has_graph_route and has_certified_geometry and route_is_strict
+        else "no_strictly_validated_graph_route"
+    )
+    if has_graph_route and has_certified_geometry and route_is_strict and len(route_lambda_values) > 0:
+        entry_idx = next(
+            (idx for idx, edge_id in enumerate(best_edge_path) if str(graph.edges[int(edge_id)].kind) == "entry_transition"),
+            None,
+        )
+        exit_idx = next(
+            (idx for idx, edge_id in enumerate(best_edge_path) if str(graph.edges[int(edge_id)].kind) == "exit_transition"),
+            None,
+        )
+        if entry_idx is not None and exit_idx is not None and int(exit_idx) > int(entry_idx):
+            entry_path, _entry_lambdas = orient_edge_path(
+                graph,
+                int(best_edge_path[int(entry_idx)]),
+                int(best_node_path[int(entry_idx)]),
+                int(best_node_path[int(entry_idx) + 1]),
+            )
+            exit_path, _exit_lambdas = orient_edge_path(
+                graph,
+                int(best_edge_path[int(exit_idx)]),
+                int(best_node_path[int(exit_idx)]),
+                int(best_node_path[int(exit_idx) + 1]),
+            )
+            if len(entry_path) > 0 and len(exit_path) > 0:
+                selected_entry_point = np.asarray(entry_path[-1], dtype=float)
+                selected_exit_point = np.asarray(exit_path[-1], dtype=float)
+                selected_lambda_for_realization = float(np.mean(np.asarray(route_lambda_values, dtype=float)))
+                realized_path, local_replan_diagnostics = realize_selected_transition_route_continuous_transfer(
+                    start=np.asarray(start_q, dtype=float),
+                    entry_transition=selected_entry_point,
+                    exit_transition=selected_exit_point,
+                    goal=np.asarray(goal_q, dtype=float),
+                    selected_lambda=float(selected_lambda_for_realization),
+                    left_manifold=left_manifold,
+                    left_center=np.asarray(left_center, dtype=float),
+                    left_radius=float(left_radius),
+                    transfer_family=transfer_family,
+                    right_manifold=right_manifold,
+                    right_center=np.asarray(right_center, dtype=float),
+                    right_radius=float(right_radius),
+                )
+                if bool(local_replan_diagnostics.get("local_replan_strict_validation_success", False)) and len(realized_path) > 0:
+                    certified_path = np.asarray(realized_path, dtype=float)
+                    display_path = np.asarray(realized_path, dtype=float)
+                    graph_route_used_for_execution = False
+                    final_route_realization = "selected_transition_local_replan"
+                else:
+                    final_route_realization = "graph_route_strictly_validated_display_geometry"
+                    graph_route_used_for_execution = True
+        else:
+            local_replan_diagnostics["local_replan_message"] = "local replan skipped: selected route lacks ordered entry/exit transitions"
     route_constant_lambda_edge_count = sum(
         1
         for edge_id in best_edge_path
@@ -827,6 +1018,17 @@ def _build_final_continuous_route(
             tuple(alternative.leaf_sequence),
         ),
     )[: max(1, int(top_k_paths))]
+    left_evidence_nodes = sum(1 for node in graph.nodes if str(node.mode) == "left")
+    family_evidence_nodes = sum(1 for node in graph.nodes if str(node.mode) == "family")
+    right_evidence_nodes = sum(1 for node in graph.nodes if str(node.mode) == "right")
+    left_evidence_edges = sum(1 for edge in graph.edges if str(edge.kind) == "left_motion")
+    family_evidence_edges = sum(1 for edge in graph.edges if str(edge.kind) in {"family_leaf_motion", "family_transverse"})
+    right_evidence_edges = sum(1 for edge in graph.edges if str(edge.kind) == "right_motion")
+    post_solution_rounds_completed = (
+        0
+        if family_result.exit_discovery_round is None
+        else max(0, int(family_result.expansion_rounds) - int(family_result.exit_discovery_round))
+    )
     return ContinuousTransferRoute(
         success=has_graph_route and has_certified_geometry and route_is_strict,
         message=(
@@ -956,6 +1158,32 @@ def _build_final_continuous_route(
         strict_invalid_points=strict_invalid_points,
         top_k_routes=route_alternatives,
         leaf_store_counts=dict(leaf_store_counts or {}),
+        ambient_probe_rounds=int(parallel_round_budget) + int(family_result.expansion_rounds),
+        continue_after_first_solution=bool(continue_after_first_solution),
+        max_extra_rounds_after_first_solution=max_extra_rounds_after_first_solution,
+        post_solution_rounds_completed=int(post_solution_rounds_completed),
+        left_evidence_nodes=int(left_evidence_nodes),
+        left_evidence_edges=int(left_evidence_edges),
+        family_leaf_store_count=int(dict(leaf_store_counts or {}).get("family", 0)),
+        family_evidence_nodes=int(family_evidence_nodes),
+        family_evidence_edges=int(family_evidence_edges),
+        right_evidence_nodes=int(right_evidence_nodes),
+        right_evidence_edges=int(right_evidence_edges),
+        route_candidates_evaluated=int(len(unique_candidates)),
+        final_route_realization=str(final_route_realization),
+        graph_route_used_for_execution=bool(graph_route_used_for_execution),
+        selected_lambda_values=[round(float(value), 6) for value in selected_lambda_values],
+        selected_lambda_range=str(selected_lambda_range),
+        strict_validation_success=bool(route_is_strict and has_graph_route and has_certified_geometry),
+        selected_entry_point=None if selected_entry_point is None else np.asarray(selected_entry_point, dtype=float),
+        selected_exit_point=None if selected_exit_point is None else np.asarray(selected_exit_point, dtype=float),
+        selected_lambda_for_realization=selected_lambda_for_realization,
+        local_replan_left_success=bool(local_replan_diagnostics.get("local_replan_left_success", False)),
+        local_replan_family_success=bool(local_replan_diagnostics.get("local_replan_family_success", False)),
+        local_replan_right_success=bool(local_replan_diagnostics.get("local_replan_right_success", False)),
+        local_replan_strict_validation_success=bool(local_replan_diagnostics.get("local_replan_strict_validation_success", False)),
+        local_replan_path_points=int(local_replan_diagnostics.get("local_replan_path_points", 0)),
+        local_replan_message=str(local_replan_diagnostics.get("local_replan_message", "")),
     )
 
 
@@ -1203,6 +1431,9 @@ def plan_continuous_transfer_route(
             top_k_assignments=top_k_assignments,
             top_k_paths=top_k_paths,
             left_round_budget=left_round_budget_total,
+            parallel_round_budget=int(warmstart.parallel_round_budget),
+            continue_after_first_solution=bool(continue_after_first_solution),
+            max_extra_rounds_after_first_solution=max_extra_rounds_after_first_solution,
             leaf_store_counts=warmstart.leaf_store_counts,
         )
 
@@ -1220,6 +1451,8 @@ def plan_continuous_transfer_route(
     result = shell.run()
     if len(result.leaf_store_counts) == 0 and len(warmstart.leaf_store_counts) > 0:
         result.leaf_store_counts = dict(warmstart.leaf_store_counts)
+    if len(result.leaf_store_counts) > 0:
+        result.family_leaf_store_count = int(result.leaf_store_counts.get("family", result.family_leaf_store_count))
     if result.success or _disable_parallel_leaf_warmstart:
         return result
     fallback_result = plan_continuous_transfer_route(
@@ -1235,6 +1468,10 @@ def plan_continuous_transfer_route(
     )
     if len(fallback_result.leaf_store_counts) == 0 and len(warmstart.leaf_store_counts) > 0:
         fallback_result.leaf_store_counts = dict(warmstart.leaf_store_counts)
+    if len(fallback_result.leaf_store_counts) > 0:
+        fallback_result.family_leaf_store_count = int(
+            fallback_result.leaf_store_counts.get("family", fallback_result.family_leaf_store_count)
+        )
     return fallback_result
 
 
@@ -1244,12 +1481,29 @@ def print_continuous_route_summary(result: ContinuousTransferRoute) -> None:
     fields = [
         ("success", result.success),
         ("message", result.message),
+        ("proposal_projection_supports", "left_sphere, transfer_family_candidate_lambdas, right_sphere"),
+        ("lambda_selection_policy", "proposal-inferred + scene plane_offsets/candidate lambdas + active adaptive lambda regions"),
+        ("route_selection_stage", "after left/family/right evidence accumulation, via fixed-lambda graph route ranking and top-k leaf-sequence extraction"),
+        ("stopping_rule", "family evidence stops on budget/saturation; --stop-after-first-solution disables post-solution continuation"),
         ("scene_profile", result.scene_profile),
         ("family_obstacle_count", result.family_obstacle_count),
         ("family_obstacle_summary", result.family_obstacle_summary),
         ("selected_lambda", None if result.selected_lambda is None else round(float(result.selected_lambda), 6)),
+        ("selected_lambda_values", result.selected_lambda_values),
+        ("selected_lambda_range", result.selected_lambda_range),
+        ("ambient_probe_rounds", result.ambient_probe_rounds),
+        ("continue_after_first_solution", result.continue_after_first_solution),
+        ("max_extra_rounds_after_first_solution", result.max_extra_rounds_after_first_solution),
+        ("post_solution_rounds_completed", result.post_solution_rounds_completed),
         ("total_rounds", result.round_count),
         ("evaluation_events", result.evaluation_count),
+        ("left_evidence_nodes", result.left_evidence_nodes),
+        ("left_evidence_edges", result.left_evidence_edges),
+        ("family_leaf_store_count", result.family_leaf_store_count),
+        ("family_evidence_nodes", result.family_evidence_nodes),
+        ("family_evidence_edges", result.family_evidence_edges),
+        ("right_evidence_nodes", result.right_evidence_nodes),
+        ("right_evidence_edges", result.right_evidence_edges),
         ("entry_seed_count", result.entry_seed_count),
         ("exit_seed_count", result.exit_seed_count),
         ("shared_proposals_processed", result.shared_proposals_processed),
@@ -1261,6 +1515,8 @@ def print_continuous_route_summary(result: ContinuousTransferRoute) -> None:
         ("family_lambda_coverage_after_first_committed_route", result.family_lambda_coverage_after_first_committed_route),
         ("transition_hypotheses_left_family", result.transition_hypotheses_left_family),
         ("transition_hypotheses_family_right", result.transition_hypotheses_family_right),
+        ("entry_transitions_found", result.entry_transition_count),
+        ("exit_transitions_found", result.exit_transition_count),
         ("family_region_updates_per_round", round(float(result.family_region_updates_per_round), 4)),
         ("committed_route_changes_after_first_solution", result.committed_route_changes_after_first_solution),
         ("average_useful_family_regions_per_proposal", round(float(result.average_useful_family_regions_per_proposal), 4)),
@@ -1332,7 +1588,20 @@ def print_continuous_route_summary(result: ContinuousTransferRoute) -> None:
         ("path_points", len(result.path)),
         ("raw_path_points", len(result.raw_path)),
         ("strict_validation_message", result.strict_validation_message),
+        ("strict_validation_success", result.strict_validation_success),
         ("strict_validation_failures", len(result.strict_validation_failures)),
+        ("route_candidates_evaluated", result.route_candidates_evaluated),
+        ("final_route_realization", result.final_route_realization),
+        ("graph_route_used_for_execution", result.graph_route_used_for_execution),
+        ("selected_entry_point", None if result.selected_entry_point is None else np.round(np.asarray(result.selected_entry_point, dtype=float), 6).tolist()),
+        ("selected_exit_point", None if result.selected_exit_point is None else np.round(np.asarray(result.selected_exit_point, dtype=float), 6).tolist()),
+        ("selected_lambda_for_realization", None if result.selected_lambda_for_realization is None else round(float(result.selected_lambda_for_realization), 6)),
+        ("local_replan_left_success", result.local_replan_left_success),
+        ("local_replan_family_success", result.local_replan_family_success),
+        ("local_replan_right_success", result.local_replan_right_success),
+        ("local_replan_strict_validation_success", result.local_replan_strict_validation_success),
+        ("local_replan_path_points", result.local_replan_path_points),
+        ("local_replan_message", result.local_replan_message),
         ("top_k_route_count", len(result.top_k_routes)),
         ("top_k_route_available_count", sum(bool(route.strict_valid) for route in result.top_k_routes)),
         ("leaf_store_counts", result.leaf_store_counts),
