@@ -102,6 +102,50 @@ class _RobotConstraintBase(ImplicitManifold):
         projected.converged = bool(projected.converged and projected.success)
         return projected
 
+    def project_local(
+        self,
+        theta_guess: np.ndarray,
+        tol: float = 1e-8,
+        max_iters: int = 80,
+        regularization: float = 1.0e-2,
+    ) -> ProjectionResult:
+        """Branch-preserving projection for final execution, not exploration."""
+        q0 = np.asarray(theta_guess, dtype=float).reshape(3)
+        q0 = np.clip(q0, self.joint_lower, self.joint_upper)
+
+        if least_squares is not None:
+            reg = float(regularization)
+
+            def objective(q: np.ndarray) -> np.ndarray:
+                return np.concatenate([self.residual(q), reg * (np.asarray(q, dtype=float) - q0)])
+
+            def objective_jacobian(q: np.ndarray) -> np.ndarray:
+                return np.vstack([self.jacobian(q), reg * np.eye(3, dtype=float)])
+
+            result = least_squares(
+                objective,
+                q0,
+                jac=objective_jacobian,
+                bounds=(self.joint_lower, self.joint_upper),
+                max_nfev=max_iters,
+                xtol=tol,
+                ftol=tol,
+                gtol=tol,
+            )
+            q_proj = np.asarray(result.x, dtype=float)
+            residual_norm = float(np.linalg.norm(self.residual(q_proj)))
+            success = bool(result.success and residual_norm <= max(10.0 * tol, 1e-6) and self.within_bounds(q_proj))
+            return ProjectionResult(
+                success=success,
+                x_projected=q_proj,
+                residual_norm=residual_norm,
+                iterations=int(getattr(result, "nfev", max_iters)),
+                converged=success,
+                message=str(getattr(result, "message", "regularized least_squares finished")),
+            )
+
+        return self.project(q0, tol=tol, max_iters=max_iters)
+
 
 class RobotSphereManifold(_RobotConstraintBase):
     def __init__(

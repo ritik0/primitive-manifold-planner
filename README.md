@@ -39,7 +39,20 @@ If the package is installed into your active Python environment, the same comman
 
 `examples/multimodal_graph_search.py` runs the task-space fixed-sequence multimodal evidence planner for the left-sphere / plane / right-sphere scene.
 
-`examples/three_dof_robot_pyvista_demo.py` defaults to the same task-space planner as `multimodal_graph_search.py`, then resamples the selected path for 3DOF robot IK tracking and PyVista visualization. Use `--jointspace-planning` to opt into the robot-aware joint-space constrained multimodal planner.
+`examples/three_dof_robot_pyvista_demo.py` has three explicit Example 66.1 modes. `--taskspace-planning` runs the Example 66 task-space planner and then tracks the selected route with IK. `--jointspace-planning` runs the robot-aware constrained planner in configuration space and only animates a dense joint trajectory when it passes constraint and joint-step certification. `--compare-taskspace-jointspace` runs both modes and ranks them by robot executability.
+
+In the robot demo, planner evidence and robot motion are intentionally separate layers: the visualization can show all explored graph evidence, but the robot animates only the selected final planner route. The default mode continues exploration after the first feasible route unless `--stop-after-first-solution` is explicitly requested.
+
+Joint-space final-route smoothing is opt-in because it performs extra constrained post-processing. Use the baseline command first, then enable bounded smoothing when needed:
+
+```powershell
+.\.venv\Scripts\python.exe examples\three_dof_robot_pyvista_demo.py --jointspace-planning --without-obstacles --max-rounds 30 --joint-max-step 0.12 --no-smooth-final-route --no-viz
+.\.venv\Scripts\python.exe examples\three_dof_robot_pyvista_demo.py --jointspace-planning --without-obstacles --max-rounds 30 --joint-max-step 0.12 --smooth-final-route --smoothing-iters 20 --smoothing-passes 1 --smoothing-time-limit 5 --no-viz
+```
+
+Task-space planning is useful for showing manifold exploration clearly. Joint-space planning is closer to robot deployment because constraints are evaluated through FK(q). Robot feasibility can change route selection: a geometrically short task-space route may be rejected if it cannot be tracked smoothly, while a longer route may be selected if it is executable.
+
+`examples/check_example66_robot_parity.py` is a lightweight smoke check that verifies the default robot demo preserves nontrivial task-space planner evidence, produces a final route, and tracks it without large IK jumps.
 
 `examples/multimodal_graph_search_stress_test.py` runs a harder blocked-plane stress scene using the same planner interface.
 

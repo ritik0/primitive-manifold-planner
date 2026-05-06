@@ -110,6 +110,8 @@ def show_pyvista_robot_demo(
     plane_half_v: float,
     robot,
     robot_execution,
+    show_exploration: bool = True,
+    show_rejected_joint_interpolation: bool = False,
 ) -> bool:
     if pv is None or not pyvista_available():
         print("PyVista is not available; skipping Example 66.1 visualization.")
@@ -145,7 +147,7 @@ def show_pyvista_robot_demo(
         except Exception:
             pass
     plotter.add_text(
-        "Example 66.1: Example 66 with a 3DOF robot following the exact selected path",
+        "Example 66.1: planner evidence plus 3DOF robot tracking only the selected final route",
         font_size=12,
     )
 
@@ -199,6 +201,8 @@ def show_pyvista_robot_demo(
         if actor is not None:
             actor_groups["Obstacles"].append(actor)
 
+    # Planner evidence is rendered for diagnosis. Robot animation below uses
+    # only the selected final route / execution path, never these branches.
     for stage in ex66.STAGES:
         stage_edges = result.stage_evidence_edges.get(stage, [])
         poly = build_segment_polydata(stage_edges)
@@ -240,16 +244,77 @@ def show_pyvista_robot_demo(
         if actor is not None:
             actor_groups["Hypotheses"].append(actor)
 
-    if len(result.raw_path) >= 2:
-        raw_polyline = pv.lines_from_points(np.asarray(result.raw_path, dtype=float))
-        actor = plotter.add_mesh(raw_polyline, color="#90a4ae", line_width=3.0, opacity=0.8, label="certified route")
+    dense_joint_path = np.asarray(getattr(result, "dense_joint_path", np.zeros((0, 3), dtype=float)), dtype=float)
+    dense_execution_certified = bool(getattr(result, "dense_joint_path_execution_certified", False))
+    jointspace_display_route = (
+        np.asarray([robot.forward_kinematics_3d(theta)[-1] for theta in dense_joint_path], dtype=float)
+        if dense_execution_certified and len(dense_joint_path) >= 2
+        else np.zeros((0, 3), dtype=float)
+    )
+
+    if len(jointspace_display_route) >= 2:
+        # In joint-space mode, this FK trace is the source of truth: the
+        # planner-certified dense joint path and the robot execution share it.
+        skeleton = np.asarray(result.path if len(result.path) >= 2 else result.raw_path, dtype=float)
+        if len(skeleton) >= 2:
+            actor = plotter.add_mesh(
+                pv.lines_from_points(skeleton),
+                color="#546e7a",
+                line_width=2.0,
+                opacity=0.28,
+                label="SPARSE/ABSTRACT ROUTE",
+            )
+            if actor is not None:
+                actor_groups["Committed"].append(actor)
+        actor = plotter.add_mesh(
+            pv.lines_from_points(jointspace_display_route),
+            color="#d32f2f",
+            line_width=8.0,
+            label="FINAL EXECUTED ROUTE",
+        )
         if actor is not None:
             actor_groups["Committed"].append(actor)
-    if len(result.path) >= 2:
-        display_polyline = pv.lines_from_points(np.asarray(result.path, dtype=float))
-        actor = plotter.add_mesh(display_polyline, color="#1565c0", line_width=7.0, label="display route")
+    else:
+        if len(result.raw_path) >= 2:
+            raw_polyline = pv.lines_from_points(np.asarray(result.raw_path, dtype=float))
+            actor = plotter.add_mesh(raw_polyline, color="#90a4ae", line_width=3.0, opacity=0.8, label="certified route")
+            if actor is not None:
+                actor_groups["Committed"].append(actor)
+        if len(result.path) >= 2:
+            display_polyline = pv.lines_from_points(np.asarray(result.path, dtype=float))
+            actor = plotter.add_mesh(display_polyline, color="#d32f2f", line_width=8.0, label="FINAL PLANNER ROUTE")
+            if actor is not None:
+                actor_groups["Committed"].append(actor)
+
+    if (
+        bool(show_rejected_joint_interpolation)
+        and
+        robot_execution is not None
+        and not bool(getattr(robot_execution, "execution_success", False))
+        and len(getattr(robot_execution, "end_effector_points_3d", [])) >= 2
+        and str(getattr(robot_execution, "execution_source", "")) in {"disabled", "uncertified_direct_joint_path"}
+    ):
+        rejected_polyline = pv.lines_from_points(np.asarray(robot_execution.end_effector_points_3d, dtype=float))
+        actor = plotter.add_mesh(
+            rejected_polyline,
+            color="#b71c1c",
+            line_width=3.0,
+            opacity=0.22,
+            label="REJECTED UNCERTIFIED JOINT INTERPOLATION",
+        )
         if actor is not None:
-            actor_groups["Committed"].append(actor)
+            actor_groups["EETrace"].append(actor)
+
+    if robot_execution is not None and not bool(getattr(robot_execution, "execution_success", True)):
+        warning_text = "Joint-space execution not certified: robot animation disabled"
+        if str(getattr(robot_execution, "execution_source", "")) == "disabled_joint_step_violation":
+            warning_text = "Joint route satisfies constraints but has discontinuous joint jump; animation disabled"
+        plotter.add_text(
+            warning_text,
+            position=(760, 52),
+            font_size=10,
+            color="#b71c1c",
+        )
 
     actor = add_points(plotter, start_q, color="black", size=16.0, label="start")
     if actor is not None:
@@ -310,7 +375,7 @@ def show_pyvista_robot_demo(
                 pv.Sphere(radius=float(0.75 * robot.ee_radius), center=np.asarray(pts[0], dtype=float)),
                 color="#d81b60",
                 opacity=1.0,
-                label="ee trace",
+                label="ROBOT END-EFFECTOR TRACE",
             )
         else:
             actor = plotter.add_mesh(
@@ -318,7 +383,7 @@ def show_pyvista_robot_demo(
                 color="#d81b60",
                 line_width=5.0,
                 opacity=1.0,
-                label="ee trace",
+                label="ROBOT END-EFFECTOR TRACE",
             )
         if not bool(robot_state.get("trace_visible", True)):
             actor.SetVisibility(False)
@@ -398,9 +463,9 @@ def show_pyvista_robot_demo(
     default_visibility = {
         "Manifolds": True,
         "Obstacles": True,
-        "Evidence": True,
-        "Frontiers": True,
-        "Hypotheses": True,
+        "Evidence": bool(show_exploration),
+        "Frontiers": bool(show_exploration),
+        "Hypotheses": bool(show_exploration),
         "Committed": True,
         "Robot": True,
         "EETrace": True,

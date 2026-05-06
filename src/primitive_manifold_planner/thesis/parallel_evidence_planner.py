@@ -68,6 +68,7 @@ PROGRESS_WINDOW = 10
 SATURATION_WINDOW = 14
 MIN_ROUNDS_BEFORE_SATURATION_CHECK = 24
 MIN_POST_SOLUTION_ROUNDS = 10
+STOP_AFTER_FIRST_SOLUTION = False
 DISPLAY_SPHERE_SAMPLES = 54
 DISPLAY_PLANE_SAMPLES = 24
 MAX_GRAPH_PATH_INTERNAL_POINTS = 4
@@ -116,6 +117,7 @@ class StageEvidenceStore:
     explored_edges: list[tuple[np.ndarray, np.ndarray]] = field(default_factory=list)
     chart_centers: np.ndarray = field(default_factory=lambda: np.zeros((0, 3), dtype=float))
     update_count: int = 0
+    stage_edges_rejected_joint_jump: int = 0
 
 
 @dataclass
@@ -141,6 +143,18 @@ class SequentialRouteCandidate:
     raw_path: np.ndarray
     display_path: np.ndarray
     joint_path: np.ndarray = field(default_factory=lambda: np.zeros((0, 3), dtype=float))
+    dense_joint_path: np.ndarray = field(default_factory=lambda: np.zeros((0, 3), dtype=float))
+    dense_joint_path_stage_labels: list[str] = field(default_factory=list)
+    dense_joint_path_constraint_residuals: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=float))
+    dense_joint_path_is_certified: bool = False
+    dense_joint_path_joint_steps: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=float))
+    dense_joint_path_max_joint_step: float = 0.0
+    dense_joint_path_mean_joint_step: float = 0.0
+    dense_joint_path_worst_joint_step_index: int = -1
+    dense_joint_path_execution_certified: bool = False
+    dense_joint_path_constraint_certified: bool = False
+    dense_joint_path_joint_continuity_certified: bool = False
+    dense_joint_path_message: str = ""
 
 
 @dataclass
@@ -196,6 +210,18 @@ class FixedPlaneRoute:
     stagnation_stage: str | None = None
     obstacles: list[object] = field(default_factory=list)
     joint_path: np.ndarray = field(default_factory=lambda: np.zeros((0, 3), dtype=float))
+    dense_joint_path: np.ndarray = field(default_factory=lambda: np.zeros((0, 3), dtype=float))
+    dense_joint_path_stage_labels: list[str] = field(default_factory=list)
+    dense_joint_path_constraint_residuals: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=float))
+    dense_joint_path_is_certified: bool = False
+    dense_joint_path_joint_steps: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=float))
+    dense_joint_path_max_joint_step: float = 0.0
+    dense_joint_path_mean_joint_step: float = 0.0
+    dense_joint_path_worst_joint_step_index: int = -1
+    dense_joint_path_execution_certified: bool = False
+    dense_joint_path_constraint_certified: bool = False
+    dense_joint_path_joint_continuity_certified: bool = False
+    dense_joint_path_message: str = ""
 
 
 @dataclass
@@ -347,17 +373,34 @@ def sparsify_graph_path_indices(path: np.ndarray) -> list[int]:
     return [0, *internal_indices, len(arr) - 1]
 
 
+def wrapped_path_step_statistics(path: np.ndarray) -> tuple[np.ndarray, float, float, int]:
+    arr = np.asarray(path, dtype=float)
+    if len(arr) < 2:
+        return np.zeros(0, dtype=float), 0.0, 0.0, -1
+    deltas = (np.diff(arr, axis=0) + np.pi) % (2.0 * np.pi) - np.pi
+    steps = np.linalg.norm(deltas, axis=1)
+    worst_idx = int(np.argmax(steps)) if len(steps) > 0 else -1
+    return (
+        np.asarray(steps, dtype=float),
+        float(np.max(steps)) if len(steps) > 0 else 0.0,
+        float(np.mean(steps)) if len(steps) > 0 else 0.0,
+        worst_idx,
+    )
+
+
 def connect_path_to_stage_graph(
     store: StageEvidenceStore,
     source_node_id: int,
     path: np.ndarray,
     kind: str,
     terminal_node_id: int | None = None,
+    preserve_dense_path: bool = False,
+    max_joint_step_for_edge: float | None = None,
 ) -> tuple[int, list[int], list[int]]:
     full_path = np.asarray(path, dtype=float)
     if len(full_path) == 0:
         return source_node_id, [source_node_id], []
-    sparse_indices = sparsify_graph_path_indices(full_path)
+    sparse_indices = list(range(len(full_path))) if preserve_dense_path else sparsify_graph_path_indices(full_path)
     if len(sparse_indices) == 0:
         return source_node_id, [source_node_id], []
 
@@ -375,6 +418,22 @@ def connect_path_to_stage_graph(
         segment = np.asarray(full_path[prev_idx : int(path_idx) + 1], dtype=float)
         if len(segment) == 0:
             segment = np.asarray([store.graph.nodes[current_id].q.copy(), np.asarray(q, dtype=float).copy()], dtype=float)
+        if max_joint_step_for_edge is not None:
+            src_q = np.asarray(store.graph.nodes[current_id].q, dtype=float)
+            dst_q = np.asarray(store.graph.nodes[next_id].q, dtype=float)
+            if len(segment) > 0:
+                segment = np.asarray(segment, dtype=float).copy()
+                segment[0] = src_q.copy()
+                segment[-1] = dst_q.copy()
+            steps, max_step, _mean_step, _worst_idx = wrapped_path_step_statistics(segment)
+            endpoints_match = (
+                len(segment) > 0
+                and float(np.linalg.norm(((segment[0] - src_q) + np.pi) % (2.0 * np.pi) - np.pi)) <= max(GRAPH_NODE_TOL, 1e-6)
+                and float(np.linalg.norm(((segment[-1] - dst_q) + np.pi) % (2.0 * np.pi) - np.pi)) <= max(GRAPH_NODE_TOL, 1e-6)
+            )
+            if not endpoints_match or (len(steps) > 0 and max_step > float(max_joint_step_for_edge) + 1e-9):
+                store.stage_edges_rejected_joint_jump += 1
+                continue
         if next_id != current_id or step_idx == len(sparse_indices) - 1:
             edge_ids.append(add_stage_edge(store, current_id, next_id, kind, segment))
         current_id = next_id
@@ -1769,6 +1828,8 @@ def should_stop_exploration(
 
     if first_solution_round is None:
         return node_gain == 0 and transition_gain == 0 and not plane_lagging
+    if STOP_AFTER_FIRST_SOLUTION and total_rounds >= first_solution_round:
+        return True
     if total_rounds - first_solution_round < MIN_POST_SOLUTION_ROUNDS:
         return False
     return node_gain == 0 and transition_gain == 0 and route_gain == 0 and not plane_lagging
@@ -2208,6 +2269,7 @@ def plan_fixed_manifold_multimodal_route(
     robot=None,
     serial_mode: bool = False,
     obstacles=None,
+    joint_max_step: float | None = None,
 ) -> FixedPlaneRoute:
     if robot is not None:
         from .jointspace_helpers import plan_fixed_manifold_multimodal_route_jointspace
@@ -2219,6 +2281,7 @@ def plan_fixed_manifold_multimodal_route(
             robot=robot,
             serial_mode=serial_mode,
             obstacles=obstacles,
+            joint_max_step=joint_max_step,
         )
 
     left_family, plane_family, right_family = families
