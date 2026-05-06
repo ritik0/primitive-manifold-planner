@@ -217,6 +217,20 @@ class RobotJointspaceContinuousEvidence:
         return store
 
 
+@dataclass
+class RobotContinuousTransitionHypothesis:
+    q: np.ndarray
+    task_point: np.ndarray
+    lambda_value: float
+    source_stage: str
+    target_stage: str
+    source_node_id: int
+    target_node_id: int
+    provenance: str
+    residual_norm: float
+    score: float
+
+
 def _lambda_key(lam: float, digits: int = 6) -> float:
     return round(float(lam), int(digits))
 
@@ -289,6 +303,335 @@ def project_joint_proposal_to_supports(
     for lam in candidate_lambdas:
         store = evidence.get_or_create_family_store(robot, transfer_family, float(lam))
         _project_joint_to_store(store, q, "family", counters)
+
+
+def _record_failure(reasons: dict[str, int], message: str) -> None:
+    key = str(message).split(":", 1)[0].strip()
+    reasons[key] = int(reasons.get(key, 0)) + 1
+
+
+def solve_shared_robot_transition_q(
+    *,
+    robot,
+    source_manifold,
+    target_manifold,
+    source_hint: np.ndarray,
+    target_hint: np.ndarray,
+    transition_task_hint: np.ndarray | None = None,
+    collision_fn=None,
+    residual_tol: float = 2.0e-3,
+    task_tol: float = 1.2e-1,
+) -> tuple[np.ndarray | None, dict[str, object]]:
+    source = np.asarray(source_hint, dtype=float).reshape(3)
+    target = np.asarray(target_hint, dtype=float).reshape(3)
+    midpoint = wrap_joint_angles(source + 0.5 * wrap_joint_angles(target - source))
+    task_anchor = (
+        np.asarray(transition_task_hint, dtype=float).reshape(3)
+        if transition_task_hint is not None
+        else 0.5 * (end_effector_point(robot, source) + end_effector_point(robot, target))
+    )
+    joint_lower = getattr(source_manifold, "joint_lower", -np.pi * np.ones(3, dtype=float))
+    joint_upper = getattr(source_manifold, "joint_upper", np.pi * np.ones(3, dtype=float))
+    guesses: list[np.ndarray] = [source, target, midpoint]
+    for alpha in (0.25, 0.5, 0.75):
+        guesses.append(wrap_joint_angles(source + float(alpha) * wrap_joint_angles(target - source)))
+    for scale in (0.03, -0.03, 0.06, -0.06):
+        guesses.append(wrap_joint_angles(midpoint + np.asarray([scale, -0.5 * scale, 0.35 * scale], dtype=float)))
+
+    best: dict[str, object] = {
+        "message": "no_candidate",
+        "score": float("inf"),
+        "residual_norm": float("inf"),
+        "task_error": float("inf"),
+    }
+
+    def evaluate(q: np.ndarray) -> tuple[bool, dict[str, object]]:
+        q_arr = np.asarray(q, dtype=float).reshape(3)
+        source_res = float(np.linalg.norm(source_manifold.residual(q_arr)))
+        target_res = float(np.linalg.norm(target_manifold.residual(q_arr)))
+        residual_norm = max(source_res, target_res)
+        task_error = float(np.linalg.norm(end_effector_point(robot, q_arr) - task_anchor))
+        source_bounds = bool(source_manifold.within_bounds(q_arr, tol=residual_tol))
+        target_bounds = bool(target_manifold.within_bounds(q_arr, tol=residual_tol))
+        collision_free = True if collision_fn is None else not bool(collision_fn(q_arr))
+        score = float(residual_norm + 0.15 * task_error + 0.02 * np.linalg.norm(wrap_joint_angles(q_arr - midpoint)))
+        detail = {
+            "message": "ok",
+            "score": score,
+            "residual_norm": residual_norm,
+            "task_error": task_error,
+            "source_residual": source_res,
+            "target_residual": target_res,
+            "source_bounds": source_bounds,
+            "target_bounds": target_bounds,
+            "collision_free": collision_free,
+        }
+        if residual_norm > residual_tol:
+            detail["message"] = "residual_too_large"
+            if score < float(best["score"]):
+                best.update(detail)
+            return False, detail
+        if task_error > task_tol:
+            detail["message"] = "task_anchor_too_far"
+            if score < float(best["score"]):
+                best.update(detail)
+            return False, detail
+        if not source_bounds or not target_bounds:
+            detail["message"] = "bounds_or_leaf_mask_failed"
+            if score < float(best["score"]):
+                best.update(detail)
+            return False, detail
+        if not collision_free:
+            detail["message"] = "collision"
+            if score < float(best["score"]):
+                best.update(detail)
+            return False, detail
+        if score < float(best["score"]):
+            best.update(detail)
+        return True, detail
+
+    for guess in guesses:
+        q0 = np.clip(wrap_joint_angles(np.asarray(guess, dtype=float).reshape(3)), joint_lower, joint_upper)
+        candidates = [q0]
+        if least_squares is not None:
+
+            def objective(q: np.ndarray) -> np.ndarray:
+                q_arr = np.asarray(q, dtype=float)
+                return np.concatenate(
+                    [
+                        np.asarray(source_manifold.residual(q_arr), dtype=float).reshape(-1),
+                        np.asarray(target_manifold.residual(q_arr), dtype=float).reshape(-1),
+                        0.35 * (end_effector_point(robot, q_arr) - task_anchor),
+                        2.0e-3 * wrap_joint_angles(q_arr - q0),
+                    ]
+                )
+
+            try:
+                solved = least_squares(
+                    objective,
+                    q0,
+                    bounds=(joint_lower, joint_upper),
+                    max_nfev=120,
+                    xtol=1.0e-9,
+                    ftol=1.0e-9,
+                    gtol=1.0e-9,
+                )
+                candidates.insert(0, wrap_joint_angles(np.asarray(solved.x, dtype=float)))
+            except Exception:
+                pass
+        for candidate in candidates:
+            ok, detail = evaluate(candidate)
+            if ok:
+                return np.asarray(candidate, dtype=float), detail
+    best["message"] = str(best.get("message", "solve_failed"))
+    return None, best
+
+
+def _task_points_for_nodes(robot, nodes: list[np.ndarray]) -> np.ndarray:
+    if not nodes:
+        return np.zeros((0, 3), dtype=float)
+    return np.asarray([end_effector_point(robot, q) for q in nodes], dtype=float)
+
+
+def _nearest_index(points: np.ndarray, point: np.ndarray) -> int:
+    if len(points) == 0:
+        return -1
+    distances = np.linalg.norm(points - np.asarray(point, dtype=float).reshape(1, 3), axis=1)
+    return int(np.argmin(distances))
+
+
+def _dedup_transition(
+    transitions: list[RobotContinuousTransitionHypothesis],
+    q: np.ndarray,
+    task_point: np.ndarray,
+    lam: float,
+    task_tol: float = 7.5e-2,
+    joint_tol: float = 1.8e-1,
+) -> bool:
+    for existing in transitions:
+        if abs(float(existing.lambda_value) - float(lam)) > 1.0e-4:
+            continue
+        if float(np.linalg.norm(existing.task_point - task_point)) <= float(task_tol):
+            return True
+        if float(np.linalg.norm(wrap_joint_angles(existing.q - q))) <= float(joint_tol):
+            return True
+    return False
+
+
+def _candidate_pairs_for_transition(
+    *,
+    robot,
+    source_nodes: list[np.ndarray],
+    target_nodes: list[np.ndarray],
+    source_manifold,
+    target_manifold,
+    max_pairs: int = 4,
+) -> list[tuple[int, int]]:
+    if not source_nodes or not target_nodes:
+        return []
+    source_tasks = _task_points_for_nodes(robot, source_nodes)
+    target_tasks = _task_points_for_nodes(robot, target_nodes)
+    pairs: list[tuple[int, int]] = []
+
+    target_residual_on_source = np.asarray(
+        [float(np.linalg.norm(target_manifold.residual(q))) for q in source_nodes],
+        dtype=float,
+    )
+    source_residual_on_target = np.asarray(
+        [float(np.linalg.norm(source_manifold.residual(q))) for q in target_nodes],
+        dtype=float,
+    )
+    for source_idx in np.argsort(target_residual_on_source)[: max(1, max_pairs)]:
+        target_idx = _nearest_index(target_tasks, source_tasks[int(source_idx)])
+        if target_idx >= 0:
+            pairs.append((int(source_idx), int(target_idx)))
+    for target_idx in np.argsort(source_residual_on_target)[: max(1, max_pairs)]:
+        source_idx = _nearest_index(source_tasks, target_tasks[int(target_idx)])
+        if source_idx >= 0:
+            pairs.append((int(source_idx), int(target_idx)))
+
+    unique: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for pair in pairs:
+        if pair in seen:
+            continue
+        seen.add(pair)
+        unique.append(pair)
+        if len(unique) >= max_pairs:
+            break
+    return unique
+
+
+def discover_full_jointspace_transitions(
+    *,
+    evidence: RobotJointspaceContinuousEvidence,
+    robot,
+    max_pairs_per_leaf: int = 4,
+) -> tuple[list[RobotContinuousTransitionHypothesis], list[RobotContinuousTransitionHypothesis], dict[str, object]]:
+    entry: list[RobotContinuousTransitionHypothesis] = []
+    exit: list[RobotContinuousTransitionHypothesis] = []
+    diagnostics: dict[str, object] = {
+        "entry_transition_attempts": 0,
+        "exit_transition_attempts": 0,
+        "entry_transition_failure_reasons": {},
+        "exit_transition_failure_reasons": {},
+        "best_entry_residual": float("inf"),
+        "best_exit_residual": float("inf"),
+    }
+    left_store = evidence.left_store
+    right_store = evidence.right_store
+
+    for lam, family_store in sorted(evidence.family_leaf_stores.items()):
+        entry_pairs = _candidate_pairs_for_transition(
+            robot=robot,
+            source_nodes=left_store.nodes,
+            target_nodes=family_store.nodes,
+            source_manifold=left_store.manifold,
+            target_manifold=family_store.manifold,
+            max_pairs=max_pairs_per_leaf,
+        )
+        for left_idx, family_idx in entry_pairs:
+            diagnostics["entry_transition_attempts"] = int(diagnostics["entry_transition_attempts"]) + 1
+            source_q = left_store.nodes[left_idx]
+            target_q = family_store.nodes[family_idx]
+            task_hint = 0.5 * (end_effector_point(robot, source_q) + end_effector_point(robot, target_q))
+            q, detail = solve_shared_robot_transition_q(
+                robot=robot,
+                source_manifold=left_store.manifold,
+                target_manifold=family_store.manifold,
+                source_hint=source_q,
+                target_hint=target_q,
+                transition_task_hint=task_hint,
+            )
+            diagnostics["best_entry_residual"] = min(
+                float(diagnostics["best_entry_residual"]),
+                float(detail.get("residual_norm", float("inf"))),
+            )
+            if q is None:
+                _record_failure(diagnostics["entry_transition_failure_reasons"], str(detail.get("message", "solve_failed")))
+                continue
+            task_point = end_effector_point(robot, q)
+            if _dedup_transition(entry, q, task_point, float(lam)):
+                _record_failure(diagnostics["entry_transition_failure_reasons"], "duplicate_rejected")
+                continue
+            residual_norm = float(detail.get("residual_norm", 0.0))
+            score = float(detail.get("score", residual_norm))
+            entry.append(
+                RobotContinuousTransitionHypothesis(
+                    q=np.asarray(q, dtype=float),
+                    task_point=np.asarray(task_point, dtype=float),
+                    lambda_value=float(lam),
+                    source_stage=LEFT_STAGE,
+                    target_stage=FAMILY_STAGE,
+                    source_node_id=int(left_idx),
+                    target_node_id=int(family_idx),
+                    provenance="phase3b_node_pair_left_family",
+                    residual_norm=residual_norm,
+                    score=score,
+                )
+            )
+
+        exit_pairs = _candidate_pairs_for_transition(
+            robot=robot,
+            source_nodes=family_store.nodes,
+            target_nodes=right_store.nodes,
+            source_manifold=family_store.manifold,
+            target_manifold=right_store.manifold,
+            max_pairs=max_pairs_per_leaf,
+        )
+        for family_idx, right_idx in exit_pairs:
+            diagnostics["exit_transition_attempts"] = int(diagnostics["exit_transition_attempts"]) + 1
+            source_q = family_store.nodes[family_idx]
+            target_q = right_store.nodes[right_idx]
+            task_hint = 0.5 * (end_effector_point(robot, source_q) + end_effector_point(robot, target_q))
+            q, detail = solve_shared_robot_transition_q(
+                robot=robot,
+                source_manifold=family_store.manifold,
+                target_manifold=right_store.manifold,
+                source_hint=source_q,
+                target_hint=target_q,
+                transition_task_hint=task_hint,
+            )
+            diagnostics["best_exit_residual"] = min(
+                float(diagnostics["best_exit_residual"]),
+                float(detail.get("residual_norm", float("inf"))),
+            )
+            if q is None:
+                _record_failure(diagnostics["exit_transition_failure_reasons"], str(detail.get("message", "solve_failed")))
+                continue
+            task_point = end_effector_point(robot, q)
+            if _dedup_transition(exit, q, task_point, float(lam)):
+                _record_failure(diagnostics["exit_transition_failure_reasons"], "duplicate_rejected")
+                continue
+            residual_norm = float(detail.get("residual_norm", 0.0))
+            score = float(detail.get("score", residual_norm))
+            exit.append(
+                RobotContinuousTransitionHypothesis(
+                    q=np.asarray(q, dtype=float),
+                    task_point=np.asarray(task_point, dtype=float),
+                    lambda_value=float(lam),
+                    source_stage=FAMILY_STAGE,
+                    target_stage=RIGHT_STAGE,
+                    source_node_id=int(family_idx),
+                    target_node_id=int(right_idx),
+                    provenance="phase3b_node_pair_family_right",
+                    residual_norm=residual_norm,
+                    score=score,
+                )
+            )
+
+    diagnostics["entry_transitions_found"] = len(entry)
+    diagnostics["exit_transitions_found"] = len(exit)
+    diagnostics["certified_entry_transitions"] = len(entry)
+    diagnostics["certified_exit_transitions"] = len(exit)
+    diagnostics["entry_transition_lambdas"] = sorted(set(round(float(t.lambda_value), 6) for t in entry))
+    diagnostics["exit_transition_lambdas"] = sorted(set(round(float(t.lambda_value), 6) for t in exit))
+    diagnostics["transition_lambdas"] = sorted(
+        set([*diagnostics["entry_transition_lambdas"], *diagnostics["exit_transition_lambdas"]])
+    )
+    diagnostics["family_regions_with_entry"] = len(set(round(float(t.lambda_value), 6) for t in entry))
+    diagnostics["family_regions_with_exit"] = len(set(round(float(t.lambda_value), 6) for t in exit))
+    return entry, exit, diagnostics
 
 
 def build_robot_manifolds_for_selected_lambda(robot, families, selected_lambda: float) -> dict[str, object]:
@@ -1051,6 +1394,11 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
                 scene_lambdas,
             )
 
+    entry_transitions, exit_transitions, transition_diagnostics = discover_full_jointspace_transitions(
+        evidence=evidence,
+        robot=robot,
+        max_pairs_per_leaf=4,
+    )
     family_nodes = sum(len(store.nodes) for store in evidence.family_leaf_stores.values())
     active_lambdas = sorted(float(key) for key in evidence.family_leaf_stores.keys())
     lambda_range = (
@@ -1082,8 +1430,8 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
             "active_family_lambdas": [round(float(v), 6) for v in active_lambdas[:20]],
             "active_family_lambdas_omitted": max(0, len(active_lambdas) - 20),
             "lambda_coverage_range": lambda_range,
-            "entry_transitions_found": 0,
-            "exit_transitions_found": 0,
+            "entry_transitions_found": int(transition_diagnostics.get("entry_transitions_found", 0)),
+            "exit_transitions_found": int(transition_diagnostics.get("exit_transitions_found", 0)),
             "final_route_realization": "pending_phase_3c",
             "graph_route_used_for_execution": False,
             "execution_source": "none",
@@ -1093,6 +1441,34 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
             "proposal_rounds": int(proposal_rounds),
             "proposals_per_round": int(proposal_count),
             "next_step": "phase_3b_transition_discovery",
+        },
+    )
+    best_entry = float(transition_diagnostics.get("best_entry_residual", float("inf")))
+    best_exit = float(transition_diagnostics.get("best_exit_residual", float("inf")))
+    _print_key_value_block(
+        "Full Joint-Space Transition Discovery",
+        {
+            "entry_transition_attempts": int(transition_diagnostics.get("entry_transition_attempts", 0)),
+            "entry_transitions_found": int(transition_diagnostics.get("entry_transitions_found", 0)),
+            "exit_transition_attempts": int(transition_diagnostics.get("exit_transition_attempts", 0)),
+            "exit_transitions_found": int(transition_diagnostics.get("exit_transitions_found", 0)),
+            "certified_entry_transitions": int(transition_diagnostics.get("certified_entry_transitions", 0)),
+            "certified_exit_transitions": int(transition_diagnostics.get("certified_exit_transitions", 0)),
+            "entry_transition_lambdas": list(transition_diagnostics.get("entry_transition_lambdas", []))[:20],
+            "entry_transition_lambdas_omitted": max(0, len(list(transition_diagnostics.get("entry_transition_lambdas", []))) - 20),
+            "exit_transition_lambdas": list(transition_diagnostics.get("exit_transition_lambdas", []))[:20],
+            "exit_transition_lambdas_omitted": max(0, len(list(transition_diagnostics.get("exit_transition_lambdas", []))) - 20),
+            "transition_lambdas": list(transition_diagnostics.get("transition_lambdas", []))[:20],
+            "transition_lambdas_omitted": max(0, len(list(transition_diagnostics.get("transition_lambdas", []))) - 20),
+            "family_regions_with_entry": int(transition_diagnostics.get("family_regions_with_entry", 0)),
+            "family_regions_with_exit": int(transition_diagnostics.get("family_regions_with_exit", 0)),
+            "best_entry_residual": round(best_entry, 8) if np.isfinite(best_entry) else float("inf"),
+            "best_exit_residual": round(best_exit, 8) if np.isfinite(best_exit) else float("inf"),
+            "entry_transition_failure_reasons": dict(transition_diagnostics.get("entry_transition_failure_reasons", {})),
+            "exit_transition_failure_reasons": dict(transition_diagnostics.get("exit_transition_failure_reasons", {})),
+            "final_route_realization": "pending_phase_3c",
+            "graph_route_used_for_execution": False,
+            "execution_source": "none",
         },
     )
     return scene, None, robot, None
