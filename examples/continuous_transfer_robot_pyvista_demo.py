@@ -16,6 +16,7 @@ from dataclasses import dataclass
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 from ompl import util as ou
@@ -85,6 +86,15 @@ def _polyline_error(reference: np.ndarray, trace: np.ndarray) -> tuple[float, fl
     else:
         errors = np.asarray([float(np.min(np.linalg.norm(ref - p, axis=1))) for p in pts], dtype=float)
     return float(np.max(errors)), float(np.mean(errors))
+
+
+def _downsample_points(points: np.ndarray, max_points: int) -> np.ndarray:
+    pts = np.asarray(points, dtype=float).reshape((-1, 3)) if len(points) else np.zeros((0, 3), dtype=float)
+    limit = int(max_points)
+    if limit <= 0 or len(pts) <= limit:
+        return pts
+    indices = np.linspace(0, len(pts) - 1, num=limit, dtype=int)
+    return pts[indices]
 
 
 def _print_key_value_block(title: str, values: dict[str, object]) -> None:
@@ -229,6 +239,15 @@ class RobotContinuousTransitionHypothesis:
     provenance: str
     residual_norm: float
     score: float
+
+
+@dataclass
+class FullJointspaceRouteCandidate:
+    entry: RobotContinuousTransitionHypothesis
+    exit: RobotContinuousTransitionHypothesis
+    selected_lambda: float
+    score: float
+    lambda_reconciliation: str
 
 
 def _lambda_key(lam: float, digits: int = 6) -> float:
@@ -1128,6 +1147,247 @@ def realize_selected_continuous_transfer_route_jointspace(
     )
 
 
+def _task_route_length(points: list[np.ndarray]) -> float:
+    if len(points) < 2:
+        return 0.0
+    return float(
+        sum(
+            np.linalg.norm(np.asarray(b, dtype=float) - np.asarray(a, dtype=float))
+            for a, b in zip(points[:-1], points[1:])
+        )
+    )
+
+
+def _build_full_jointspace_route_candidates(
+    *,
+    entry_transitions: list[RobotContinuousTransitionHypothesis],
+    exit_transitions: list[RobotContinuousTransitionHypothesis],
+    start_task: np.ndarray,
+    goal_task: np.ndarray,
+    lambda_tol: float = 1.0e-4,
+    reconcile_tol: float = 3.0e-2,
+) -> tuple[list[FullJointspaceRouteCandidate], dict[str, int]]:
+    counters = {
+        "route_candidates_evaluated": int(len(entry_transitions) * len(exit_transitions)),
+        "route_candidates_built": 0,
+        "route_candidates_rejected_lambda_mismatch": 0,
+    }
+    exact_candidates: list[FullJointspaceRouteCandidate] = []
+    reconciled_candidates: list[FullJointspaceRouteCandidate] = []
+    for entry in entry_transitions:
+        for exit in exit_transitions:
+            lambda_gap = abs(float(entry.lambda_value) - float(exit.lambda_value))
+            task_cost = _task_route_length(
+                [
+                    np.asarray(start_task, dtype=float),
+                    np.asarray(entry.task_point, dtype=float),
+                    np.asarray(exit.task_point, dtype=float),
+                    np.asarray(goal_task, dtype=float),
+                ]
+            )
+            joint_cost = float(np.linalg.norm(wrap_joint_angles(entry.q - exit.q)))
+            residual_cost = float(entry.residual_norm + exit.residual_norm)
+            score = (
+                task_cost
+                + 0.20 * joint_cost
+                + 200.0 * residual_cost
+                + 50.0 * lambda_gap
+                + 0.01 * float(entry.score + exit.score)
+            )
+            if lambda_gap <= float(lambda_tol):
+                exact_candidates.append(
+                    FullJointspaceRouteCandidate(
+                        entry=entry,
+                        exit=exit,
+                        selected_lambda=float(entry.lambda_value),
+                        score=float(score),
+                        lambda_reconciliation="exact_same_lambda",
+                    )
+                )
+            elif lambda_gap <= float(reconcile_tol):
+                reconciled_candidates.append(
+                    FullJointspaceRouteCandidate(
+                        entry=entry,
+                        exit=exit,
+                        selected_lambda=float(entry.lambda_value),
+                        score=float(score + 5.0 * lambda_gap),
+                        lambda_reconciliation="reconciled_to_entry_lambda",
+                    )
+                )
+            else:
+                counters["route_candidates_rejected_lambda_mismatch"] += 1
+    candidates = exact_candidates if exact_candidates else reconciled_candidates
+    candidates.sort(key=lambda candidate: float(candidate.score))
+    counters["route_candidates_built"] = len(candidates)
+    if exact_candidates:
+        counters["route_candidates_rejected_lambda_mismatch"] += len(reconciled_candidates)
+    return candidates, counters
+
+
+def realize_full_jointspace_candidate_route(
+    *,
+    robot,
+    families,
+    start_q: np.ndarray,
+    goal_q: np.ndarray,
+    start_task: np.ndarray,
+    goal_task: np.ndarray,
+    candidate: FullJointspaceRouteCandidate,
+    joint_max_step: float,
+) -> tuple[JointspaceRouteRealization, dict[str, object], str]:
+    manifolds = build_robot_manifolds_for_selected_lambda(robot, families, float(candidate.selected_lambda))
+    collision_fn = None
+    segment_messages: dict[str, str] = {}
+    q_entry = np.asarray(candidate.entry.q, dtype=float)
+    q_exit = np.asarray(candidate.exit.q, dtype=float)
+    lambda_reconciliation = str(candidate.lambda_reconciliation)
+
+    if lambda_reconciliation != "exact_same_lambda":
+        q_entry_new, detail = solve_shared_robot_transition_q(
+            robot=robot,
+            source_manifold=manifolds[LEFT_STAGE],
+            target_manifold=manifolds[FAMILY_STAGE],
+            source_hint=q_entry,
+            target_hint=q_entry,
+            transition_task_hint=candidate.entry.task_point,
+            collision_fn=collision_fn,
+        )
+        segment_messages["entry_lambda_reconciliation"] = str(detail)
+        q_exit_new, detail = solve_shared_robot_transition_q(
+            robot=robot,
+            source_manifold=manifolds[FAMILY_STAGE],
+            target_manifold=manifolds[RIGHT_STAGE],
+            source_hint=q_exit,
+            target_hint=q_exit,
+            transition_task_hint=candidate.exit.task_point,
+            collision_fn=collision_fn,
+        )
+        segment_messages["exit_lambda_reconciliation"] = str(detail)
+        if q_entry_new is None or q_exit_new is None:
+            return (
+                JointspaceRouteRealization(
+                    success=False,
+                    dense_joint_path=np.zeros((0, 3), dtype=float),
+                    stage_labels=[],
+                    task_path=np.zeros((0, 3), dtype=float),
+                    residuals=np.zeros(0, dtype=float),
+                    joint_steps=np.zeros(0, dtype=float),
+                    max_constraint_residual=float("inf"),
+                    mean_constraint_residual=float("inf"),
+                    max_joint_step=float("inf"),
+                    mean_joint_step=float("inf"),
+                    collision_free=False,
+                    message="lambda reconciliation failed",
+                    segment_messages=segment_messages,
+                ),
+                manifolds,
+                lambda_reconciliation,
+            )
+        q_entry = np.asarray(q_entry_new, dtype=float)
+        q_exit = np.asarray(q_exit_new, dtype=float)
+
+    left_path, segment_messages["left_segment"] = _connect_joint_segment(
+        LEFT_STAGE, manifolds[LEFT_STAGE], start_q, q_entry, float(joint_max_step), collision_fn=collision_fn
+    )
+    if left_path is None:
+        left_path, segment_messages["left_segment_task_waypoint_fallback"] = _connect_joint_segment_by_task_waypoints(
+            LEFT_STAGE,
+            manifolds[LEFT_STAGE],
+            start_q,
+            q_entry,
+            start_task,
+            candidate.entry.task_point,
+            float(joint_max_step),
+            collision_fn=collision_fn,
+        )
+    family_path, segment_messages["family_segment"] = _connect_joint_segment(
+        FAMILY_STAGE, manifolds[FAMILY_STAGE], q_entry, q_exit, float(joint_max_step), collision_fn=collision_fn
+    )
+    if family_path is None:
+        family_path, segment_messages["family_segment_task_waypoint_fallback"] = _connect_joint_segment_by_task_waypoints(
+            FAMILY_STAGE,
+            manifolds[FAMILY_STAGE],
+            q_entry,
+            q_exit,
+            candidate.entry.task_point,
+            candidate.exit.task_point,
+            float(joint_max_step),
+            collision_fn=collision_fn,
+        )
+    right_path, segment_messages["right_segment"] = _connect_joint_segment(
+        RIGHT_STAGE, manifolds[RIGHT_STAGE], q_exit, goal_q, float(joint_max_step), collision_fn=collision_fn
+    )
+    if right_path is None:
+        right_path, segment_messages["right_segment_task_waypoint_fallback"] = _connect_joint_segment_by_task_waypoints(
+            RIGHT_STAGE,
+            manifolds[RIGHT_STAGE],
+            q_exit,
+            goal_q,
+            candidate.exit.task_point,
+            goal_task,
+            float(joint_max_step),
+            collision_fn=collision_fn,
+        )
+
+    if left_path is None or family_path is None or right_path is None:
+        return (
+            JointspaceRouteRealization(
+                success=False,
+                dense_joint_path=np.zeros((0, 3), dtype=float),
+                stage_labels=[],
+                task_path=np.zeros((0, 3), dtype=float),
+                residuals=np.zeros(0, dtype=float),
+                joint_steps=np.zeros(0, dtype=float),
+                max_constraint_residual=float("inf"),
+                mean_constraint_residual=float("inf"),
+                max_joint_step=float("inf"),
+                mean_joint_step=float("inf"),
+                collision_free=False,
+                message="full joint-space local replan failed during segment planning",
+                segment_messages=segment_messages,
+            ),
+            manifolds,
+            lambda_reconciliation,
+        )
+
+    dense_joint_path, labels = _concatenate_labeled_segments(
+        [(LEFT_STAGE, left_path), (FAMILY_STAGE, family_path), (RIGHT_STAGE, right_path)]
+    )
+    cert = _certify_labeled_joint_path(
+        robot=robot,
+        joint_path=dense_joint_path,
+        stage_labels=labels,
+        manifolds=manifolds,
+        joint_max_step=float(joint_max_step),
+        collision_fn=collision_fn,
+    )
+    task_path = joint_path_to_task_path(robot, dense_joint_path)
+    message = (
+        "full joint-space selected-transition local replan certified"
+        if bool(cert["certified"])
+        else "full joint-space selected-transition local replan failed certification"
+    )
+    return (
+        JointspaceRouteRealization(
+            success=bool(cert["certified"]),
+            dense_joint_path=np.asarray(dense_joint_path, dtype=float),
+            stage_labels=list(labels),
+            task_path=np.asarray(task_path, dtype=float),
+            residuals=np.asarray(cert["residuals"], dtype=float),
+            joint_steps=np.asarray(cert["joint_steps"], dtype=float),
+            max_constraint_residual=float(cert["max_constraint_residual"]),
+            mean_constraint_residual=float(cert["mean_constraint_residual"]),
+            max_joint_step=float(cert["max_joint_step"]),
+            mean_joint_step=float(cert["mean_joint_step"]),
+            collision_free=bool(cert["collision_free"]),
+            message=message,
+            segment_messages=segment_messages,
+        ),
+        manifolds,
+        lambda_reconciliation,
+    )
+
+
 def plan_continuous_transfer_jointspace_robot(*, scene_description, seed: int, joint_max_step: float, **planner_kwargs):
     """Phase 2B selected-lambda robot realization bridge.
 
@@ -1399,6 +1659,77 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
         robot=robot,
         max_pairs_per_leaf=4,
     )
+    route_candidates, route_counters = _build_full_jointspace_route_candidates(
+        entry_transitions=entry_transitions,
+        exit_transitions=exit_transitions,
+        start_task=scene.start_q,
+        goal_task=scene.goal_q,
+    )
+    route_realization: JointspaceRouteRealization | None = None
+    selected_candidate: FullJointspaceRouteCandidate | None = None
+    lambda_reconciliation = "failed"
+    route_candidates_rejected_local_replan = 0
+    failure_reason = ""
+    max_candidates_to_try = min(len(route_candidates), max(5, int(planner_kwargs.get("top_k_paths", 1)) * 8))
+    if q_start is None or q_goal is None:
+        failure_reason = "start or goal IK/projected joint state unavailable"
+    elif len(route_candidates) == 0:
+        failure_reason = "no entry/exit transition pair with compatible lambda"
+    else:
+        for candidate in route_candidates[:max_candidates_to_try]:
+            realization, _candidate_manifolds, reconciliation = realize_full_jointspace_candidate_route(
+                robot=robot,
+                families=families,
+                start_q=np.asarray(q_start, dtype=float),
+                goal_q=np.asarray(q_goal, dtype=float),
+                start_task=scene.start_q,
+                goal_task=scene.goal_q,
+                candidate=candidate,
+                joint_max_step=float(joint_max_step),
+            )
+            route_realization = realization
+            lambda_reconciliation = reconciliation
+            if realization.success:
+                selected_candidate = candidate
+                break
+            route_candidates_rejected_local_replan += 1
+            failure_reason = realization.message
+    route_success = bool(route_realization is not None and route_realization.success and selected_candidate is not None)
+    final_route_realization = (
+        "full_jointspace_selected_transition_local_replan" if route_success else "full_jointspace_route_failed"
+    )
+    execution_source = "certified_dense_joint_path" if route_success else "none"
+    route_source = "FK(result.dense_joint_path)" if route_success else "none"
+    robot_execution = None
+    display_vs_trace_max_error = float("inf")
+    display_vs_trace_mean_error = float("inf")
+    if route_success and route_realization is not None:
+        task_path = joint_path_to_task_path(robot, route_realization.dense_joint_path)
+        robot_execution = RobotExecutionResult(
+            target_task_points_3d=np.asarray(task_path, dtype=float),
+            joint_path=np.asarray(route_realization.dense_joint_path, dtype=float),
+            end_effector_points_3d=np.asarray(task_path, dtype=float),
+            ik_success_count=int(len(route_realization.dense_joint_path)),
+            ik_failure_count=0,
+            max_tracking_error=0.0,
+            mean_tracking_error=0.0,
+            max_joint_step=float(route_realization.max_joint_step),
+            execution_success=True,
+            diagnostics=str(route_realization.message),
+            animation_enabled=True,
+            planner_path_resampled_for_robot=False,
+            planner_joint_path_used_directly=True,
+            max_constraint_residual=float(route_realization.max_constraint_residual),
+            mean_constraint_residual=float(route_realization.mean_constraint_residual),
+            constraint_validation_success=True,
+            worst_constraint_stage="full_jointspace_selected_transition",
+            worst_constraint_index=-1,
+            execution_source="certified_dense_joint_path",
+        )
+        display_vs_trace_max_error, display_vs_trace_mean_error = _polyline_error(
+            np.asarray(route_realization.task_path, dtype=float),
+            np.asarray(robot_execution.end_effector_points_3d, dtype=float),
+        )
     family_nodes = sum(len(store.nodes) for store in evidence.family_leaf_stores.values())
     active_lambdas = sorted(float(key) for key in evidence.family_leaf_stores.keys())
     lambda_range = (
@@ -1412,7 +1743,7 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
         {
             "full_jointspace_exploration": True,
             "implementation_phase": "phase_3a_evidence_projection",
-            "planner_success": "evidence_ready" if evidence_ready else False,
+            "planner_success": bool(route_success) if route_candidates else ("evidence_ready" if evidence_ready else False),
             "left_evidence_nodes": int(len(evidence.left_store.nodes)),
             "left_evidence_edges": int(len(evidence.left_store.edges)),
             "right_evidence_nodes": int(len(evidence.right_store.nodes)),
@@ -1432,15 +1763,17 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
             "lambda_coverage_range": lambda_range,
             "entry_transitions_found": int(transition_diagnostics.get("entry_transitions_found", 0)),
             "exit_transitions_found": int(transition_diagnostics.get("exit_transitions_found", 0)),
-            "final_route_realization": "pending_phase_3c",
+            "final_route_realization": final_route_realization,
             "graph_route_used_for_execution": False,
-            "execution_source": "none",
-            "route_source": "none",
-            "display_vs_trace_max_error": "not_applicable",
+            "execution_source": execution_source,
+            "route_source": route_source,
+            "display_vs_trace_max_error": round(float(display_vs_trace_max_error), 6)
+            if route_success
+            else "not_applicable",
             "joint_max_step": float(joint_max_step),
             "proposal_rounds": int(proposal_rounds),
             "proposals_per_round": int(proposal_count),
-            "next_step": "phase_3b_transition_discovery",
+            "next_step": "phase_3c_route_extraction" if not route_success else "phase_3d_visualization_cleanup",
         },
     )
     best_entry = float(transition_diagnostics.get("best_entry_residual", float("inf")))
@@ -1466,12 +1799,111 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
             "best_exit_residual": round(best_exit, 8) if np.isfinite(best_exit) else float("inf"),
             "entry_transition_failure_reasons": dict(transition_diagnostics.get("entry_transition_failure_reasons", {})),
             "exit_transition_failure_reasons": dict(transition_diagnostics.get("exit_transition_failure_reasons", {})),
-            "final_route_realization": "pending_phase_3c",
+            "final_route_realization": final_route_realization,
             "graph_route_used_for_execution": False,
-            "execution_source": "none",
+            "execution_source": execution_source,
         },
     )
-    return scene, None, robot, None
+    selected_entry = selected_candidate.entry if selected_candidate is not None else None
+    selected_exit = selected_candidate.exit if selected_candidate is not None else None
+    max_residual = (
+        float(route_realization.max_constraint_residual)
+        if route_realization is not None
+        else float("inf")
+    )
+    mean_residual = (
+        float(route_realization.mean_constraint_residual)
+        if route_realization is not None
+        else float("inf")
+    )
+    max_step = (
+        float(route_realization.max_joint_step)
+        if route_realization is not None
+        else float("inf")
+    )
+    visualization_result = None
+    if route_success and route_realization is not None and selected_candidate is not None:
+        # Phase 3D wiring: the visual final route is the FK image of the same
+        # certified dense joint path used by robot animation. The exploration
+        # stores remain evidence only and are not used as robot motion.
+        display_route = np.asarray(route_realization.task_path, dtype=float)
+        left_evidence_points = joint_path_to_task_path(robot, evidence.left_store.nodes)
+        right_evidence_points = joint_path_to_task_path(robot, evidence.right_store.nodes)
+        family_joint_nodes = [
+            np.asarray(q, dtype=float)
+            for store in evidence.family_leaf_stores.values()
+            for q in store.nodes
+        ]
+        family_evidence_points = joint_path_to_task_path(robot, family_joint_nodes)
+        visualization_result = SimpleNamespace(
+            success=True,
+            full_jointspace_exploration=True,
+            selected_lambda_for_realization=float(selected_candidate.selected_lambda),
+            selected_lambda=float(selected_candidate.selected_lambda),
+            active_family_lambdas=np.asarray(active_lambdas, dtype=float),
+            lambda_coverage_range=np.asarray(lambda_range, dtype=float),
+            explored_edges_by_mode={
+                "left": [],
+                "family_leaf": [],
+                "family_transverse": [],
+                "right": [],
+            },
+            left_evidence_points_task=np.asarray(left_evidence_points, dtype=float),
+            family_evidence_points_task=np.asarray(family_evidence_points, dtype=float),
+            right_evidence_points_task=np.asarray(right_evidence_points, dtype=float),
+            entry_transition_points=np.asarray([hyp.task_point for hyp in entry_transitions], dtype=float)
+            if entry_transitions
+            else np.zeros((0, 3), dtype=float),
+            exit_transition_points=np.asarray([hyp.task_point for hyp in exit_transitions], dtype=float)
+            if exit_transitions
+            else np.zeros((0, 3), dtype=float),
+            selected_entry_point=np.asarray(selected_candidate.entry.task_point, dtype=float),
+            selected_exit_point=np.asarray(selected_candidate.exit.task_point, dtype=float),
+            path=display_route,
+            raw_path=display_route,
+            dense_joint_path=np.asarray(route_realization.dense_joint_path, dtype=float),
+            dense_joint_path_execution_certified=True,
+            route_source="FK(result.dense_joint_path)",
+            final_route_realization=final_route_realization,
+            graph_route_used_for_execution=False,
+        )
+
+    _print_key_value_block(
+        "Full Joint-Space Continuous-Transfer Route",
+        {
+            "planner_success": bool(route_success),
+            "route_candidates_evaluated": int(route_counters.get("route_candidates_evaluated", 0)),
+            "route_candidates_built": int(route_counters.get("route_candidates_built", 0)),
+            "route_candidates_rejected_lambda_mismatch": int(route_counters.get("route_candidates_rejected_lambda_mismatch", 0)),
+            "route_candidates_rejected_local_replan": int(route_candidates_rejected_local_replan),
+            "selected_lambda": None if selected_candidate is None else round(float(selected_candidate.selected_lambda), 6),
+            "selected_entry_point": None if selected_entry is None else np.round(selected_entry.task_point, 6).tolist(),
+            "selected_exit_point": None if selected_exit is None else np.round(selected_exit.task_point, 6).tolist(),
+            "selected_entry_residual": None if selected_entry is None else round(float(selected_entry.residual_norm), 8),
+            "selected_exit_residual": None if selected_exit is None else round(float(selected_exit.residual_norm), 8),
+            "lambda_reconciliation": lambda_reconciliation,
+            "final_route_realization": final_route_realization,
+            "graph_route_used_for_execution": False,
+            "dense_joint_path_execution_certified": bool(route_success),
+            "dense_joint_path_points": 0 if route_realization is None else int(len(route_realization.dense_joint_path)),
+            "max_dense_constraint_residual": round(max_residual, 8) if np.isfinite(max_residual) else float("inf"),
+            "mean_dense_constraint_residual": round(mean_residual, 8) if np.isfinite(mean_residual) else float("inf"),
+            "dense_joint_path_max_joint_step": round(max_step, 6) if np.isfinite(max_step) else float("inf"),
+            "collision_free": bool(route_realization.collision_free) if route_realization is not None else False,
+            "execution_source": execution_source,
+            "route_source": route_source,
+            "display_vs_trace_max_error": round(float(display_vs_trace_max_error), 6) if route_success else float("inf"),
+            "display_vs_trace_mean_error": round(float(display_vs_trace_mean_error), 6) if route_success else float("inf"),
+            "segment_left": "" if route_realization is None else route_realization.segment_messages.get("left_segment", ""),
+            "segment_left_fallback": "" if route_realization is None else route_realization.segment_messages.get("left_segment_task_waypoint_fallback", ""),
+            "segment_family": "" if route_realization is None else route_realization.segment_messages.get("family_segment", ""),
+            "segment_family_fallback": "" if route_realization is None else route_realization.segment_messages.get("family_segment_task_waypoint_fallback", ""),
+            "segment_right": "" if route_realization is None else route_realization.segment_messages.get("right_segment", ""),
+            "segment_right_fallback": "" if route_realization is None else route_realization.segment_messages.get("right_segment_task_waypoint_fallback", ""),
+            "failure_reason": "" if route_success else str(failure_reason or (route_realization.message if route_realization is not None else "unknown")),
+        },
+    )
+    return scene, visualization_result, robot, robot_execution
 
 
 def show_continuous_transfer_robot_demo(
@@ -1481,6 +1913,9 @@ def show_continuous_transfer_robot_demo(
     robot,
     robot_execution: RobotExecutionResult | None,
     show_exploration: bool = True,
+    max_evidence_points: int = 500,
+    show_family_leaves: bool = True,
+    num_family_leaf_surfaces: int = 9,
 ) -> bool:
     if pv is None or not pyvista_available():
         print("PyVista is not available; skipping continuous-transfer robot visualization.")
@@ -1528,13 +1963,56 @@ def show_continuous_transfer_robot_demo(
         if actor is not None:
             actor_groups["Manifolds"].append(actor)
 
+    if show_family_leaves:
+        active_lambdas = np.asarray(getattr(result, "active_family_lambdas", []), dtype=float)
+        coverage = np.asarray(getattr(result, "lambda_coverage_range", []), dtype=float)
+        leaf_count = max(1, int(num_family_leaf_surfaces))
+        if len(coverage) >= 2 and np.all(np.isfinite(coverage[:2])):
+            representative_lambdas = np.linspace(float(coverage[0]), float(coverage[1]), num=leaf_count)
+        elif len(active_lambdas) > 0:
+            if len(active_lambdas) <= leaf_count:
+                representative_lambdas = active_lambdas
+            else:
+                indices = np.linspace(0, len(active_lambdas) - 1, num=leaf_count, dtype=int)
+                representative_lambdas = active_lambdas[indices]
+        else:
+            representative_lambdas = np.asarray(transfer_family.sample_lambdas({"count": leaf_count}), dtype=float)
+        representative_lambdas = np.asarray(
+            sorted(
+                {
+                    round(float(np.clip(lam, transfer_family.lambda_min, transfer_family.lambda_max)), 6)
+                    for lam in representative_lambdas
+                    if transfer_family.lambda_in_range(float(lam), tol=1.0e-6)
+                }
+            ),
+            dtype=float,
+        )
+        for lam in representative_lambdas:
+            if abs(float(lam) - float(selected_lambda)) <= 1.0e-4:
+                continue
+            corners = plane_leaf_patch(transfer_family, float(lam))
+            patch = pv.PolyData(corners, faces=np.hstack([[4, 0, 1, 2, 3]]))
+            actor = plotter.add_mesh(
+                patch,
+                color="#90caf9",
+                opacity=0.075,
+                show_edges=True,
+                edge_color="#5d7890",
+                line_width=0.7,
+                label="sampled family leaves",
+            )
+            if actor is not None:
+                actor_groups["Manifolds"].append(actor)
+
     leaf_corners = plane_leaf_patch(transfer_family, float(selected_lambda))
     leaf_patch = pv.PolyData(leaf_corners, faces=np.hstack([[4, 0, 1, 2, 3]]))
     actor = plotter.add_mesh(
         leaf_patch,
-        color="#7fa7c6",
-        opacity=0.22,
-        show_edges=False,
+        color="#1565c0",
+        opacity=0.32,
+        show_edges=True,
+        edge_color="#0d47a1",
+        line_width=1.2,
         label=f"selected transfer leaf lambda={selected_lambda:.3f}",
     )
     if actor is not None:
@@ -1547,7 +2025,7 @@ def show_continuous_transfer_robot_demo(
             "family_transverse": "#8e24aa",
             "right": "#a5d6a7",
         }
-        for mode, edges in result.explored_edges_by_mode.items():
+        for mode, edges in getattr(result, "explored_edges_by_mode", {}).items():
             poly = build_segment_polydata(edges)
             if poly is None:
                 continue
@@ -1560,13 +2038,47 @@ def show_continuous_transfer_robot_demo(
             )
             if actor is not None:
                 actor_groups["Evidence"].append(actor)
+        left_points = _downsample_points(
+            np.asarray(getattr(result, "left_evidence_points_task", np.zeros((0, 3), dtype=float)), dtype=float),
+            min(300, int(max_evidence_points)),
+        )
+        family_points = _downsample_points(
+            np.asarray(getattr(result, "family_evidence_points_task", np.zeros((0, 3), dtype=float)), dtype=float),
+            int(max_evidence_points),
+        )
+        right_points = _downsample_points(
+            np.asarray(getattr(result, "right_evidence_points_task", np.zeros((0, 3), dtype=float)), dtype=float),
+            min(300, int(max_evidence_points)),
+        )
+        if len(left_points) > 0:
+            actor = add_points(plotter, left_points, color="#2e7d32", size=5.5, label="left q-evidence FK points")
+            if actor is not None:
+                actor_groups["Evidence"].append(actor)
+        if len(family_points) > 0:
+            actor = add_points(plotter, family_points, color="#1e88e5", size=5.0, label="family q-evidence FK points")
+            if actor is not None:
+                actor_groups["Evidence"].append(actor)
+        if len(right_points) > 0:
+            actor = add_points(plotter, right_points, color="#558b2f", size=5.5, label="right q-evidence FK points")
+            if actor is not None:
+                actor_groups["Evidence"].append(actor)
 
     if len(result.entry_transition_points) > 0:
-        actor = add_points(plotter, result.entry_transition_points, color="#ff7043", size=9.0, label="entry transitions")
+        actor = add_points(plotter, result.entry_transition_points, color="#ff8a65", size=7.0, label="entry transition candidates")
         if actor is not None:
             actor_groups["Transitions"].append(actor)
     if len(result.exit_transition_points) > 0:
-        actor = add_points(plotter, result.exit_transition_points, color="#26a69a", size=9.0, label="exit transitions")
+        actor = add_points(plotter, result.exit_transition_points, color="#26a69a", size=7.0, label="exit transition candidates")
+        if actor is not None:
+            actor_groups["Transitions"].append(actor)
+    selected_entry_point = np.asarray(getattr(result, "selected_entry_point", np.zeros((0, 3), dtype=float)), dtype=float)
+    if selected_entry_point.size == 3:
+        actor = add_points(plotter, selected_entry_point, color="#bf360c", size=16.0, label="SELECTED entry transition")
+        if actor is not None:
+            actor_groups["Transitions"].append(actor)
+    selected_exit_point = np.asarray(getattr(result, "selected_exit_point", np.zeros((0, 3), dtype=float)), dtype=float)
+    if selected_exit_point.size == 3:
+        actor = add_points(plotter, selected_exit_point, color="#00695c", size=16.0, label="SELECTED exit transition")
         if actor is not None:
             actor_groups["Transitions"].append(actor)
 
@@ -1706,6 +2218,10 @@ def main() -> None:
     parser.add_argument("--ik-tolerance", type=float, default=3.0e-3)
     parser.add_argument("--show-exploration", dest="show_exploration", action="store_true", default=True)
     parser.add_argument("--hide-exploration", dest="show_exploration", action="store_false")
+    parser.add_argument("--max-evidence-points", type=int, default=500)
+    parser.add_argument("--show-family-leaves", dest="show_family_leaves", action="store_true", default=True)
+    parser.add_argument("--hide-family-leaves", dest="show_family_leaves", action="store_false")
+    parser.add_argument("--num-family-leaf-surfaces", type=int, default=9)
     parser.add_argument("--no-viz", action="store_true")
     args = parser.parse_args()
 
@@ -1735,6 +2251,72 @@ def main() -> None:
                 top_k_paths=args.top_k_paths,
                 obstacle_profile=args.obstacle_profile,
             )
+        if args.full_jointspace_exploration:
+            animation_ready = bool(
+                robot_execution is not None
+                and robot_execution.execution_success
+                and robot_execution.animation_enabled
+                and result is not None
+                and bool(getattr(result, "dense_joint_path_execution_certified", False))
+            )
+            print(f"pyvista_robot_animation = {'enabled' if animation_ready else 'disabled'}", flush=True)
+            print(
+                "visualization_route_source = "
+                f"{getattr(result, 'route_source', 'none') if result is not None else 'none'}",
+                flush=True,
+            )
+            print(
+                "display_route_source = "
+                f"{getattr(result, 'route_source', 'none') if result is not None else 'none'}",
+                flush=True,
+            )
+            print(
+                "robot_execution_source = "
+                f"{getattr(robot_execution, 'execution_source', 'none') if robot_execution is not None else 'none'}",
+                flush=True,
+            )
+            left_display_count = min(
+                len(getattr(result, "left_evidence_points_task", [])) if result is not None else 0,
+                min(300, int(args.max_evidence_points)),
+            )
+            family_display_count = min(
+                len(getattr(result, "family_evidence_points_task", [])) if result is not None else 0,
+                int(args.max_evidence_points),
+            )
+            right_display_count = min(
+                len(getattr(result, "right_evidence_points_task", [])) if result is not None else 0,
+                min(300, int(args.max_evidence_points)),
+            )
+            active_lambdas_for_viz = list(getattr(result, "active_family_lambdas", [])) if result is not None else []
+            if bool(args.show_family_leaves):
+                leaf_surface_count = int(args.num_family_leaf_surfaces) if active_lambdas_for_viz else 0
+            else:
+                leaf_surface_count = 0
+            _print_key_value_block(
+                "Full Joint-Space Visualization",
+                {
+                    "visualization_mode": "full_jointspace_continuous_transfer",
+                    "show_family_leaves": bool(args.show_family_leaves),
+                    "num_family_leaf_surfaces": leaf_surface_count,
+                    "show_exploration": bool(args.show_exploration),
+                    "left_evidence_points_displayed": int(left_display_count),
+                    "family_evidence_points_displayed": int(family_display_count),
+                    "right_evidence_points_displayed": int(right_display_count),
+                    "entry_transition_points_displayed": 0 if result is None else len(getattr(result, "entry_transition_points", [])),
+                    "exit_transition_points_displayed": 0 if result is None else len(getattr(result, "exit_transition_points", [])),
+                    "selected_lambda_visualized": None
+                    if result is None
+                    else round(float(getattr(result, "selected_lambda_for_realization", getattr(result, "selected_lambda", 0.0))), 6),
+                    "visualization_route_source": getattr(result, "route_source", "none") if result is not None else "none",
+                    "pyvista_robot_animation": "enabled" if animation_ready else "disabled",
+                },
+            )
+            if not animation_ready:
+                print(
+                    "Full joint-space exploration did not produce a certified dense joint path; "
+                    "robot animation disabled.",
+                    flush=True,
+                )
         if not args.no_viz and scene is not None and result is not None and robot is not None:
             show_continuous_transfer_robot_demo(
                 scene=scene,
@@ -1742,6 +2324,9 @@ def main() -> None:
                 robot=robot,
                 robot_execution=robot_execution,
                 show_exploration=bool(args.show_exploration),
+                max_evidence_points=int(args.max_evidence_points),
+                show_family_leaves=bool(args.show_family_leaves),
+                num_family_leaf_surfaces=int(args.num_family_leaf_surfaces),
             )
         sys.stdout.flush()
         sys.stderr.flush()
@@ -1817,6 +2402,9 @@ def main() -> None:
             robot=robot,
             robot_execution=robot_execution,
             show_exploration=bool(args.show_exploration),
+            max_evidence_points=int(args.max_evidence_points),
+            show_family_leaves=bool(args.show_family_leaves),
+            num_family_leaf_surfaces=int(args.num_family_leaf_surfaces),
         )
 
     sys.stdout.flush()
