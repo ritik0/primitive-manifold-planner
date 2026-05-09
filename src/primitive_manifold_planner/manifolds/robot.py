@@ -58,6 +58,12 @@ class _RobotConstraintBase(ImplicitManifold):
         ee = np.asarray(self.robot.forward_kinematics_3d(q)[-1], dtype=float)
         return bool(self.task_space_validity_fn(ee))
 
+    def validate(self, theta: np.ndarray, tol: float = 1e-6) -> bool:
+        """Return True when theta satisfies the FK-pulled-back constraint."""
+        q = self._coerce_point(theta)
+        residual_ok = bool(np.linalg.norm(self.residual(q)) <= float(tol))
+        return bool(residual_ok and self.within_bounds(q, tol=tol))
+
     def get_implicit_function(self) -> Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]]:
         def fn(theta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
             q = self._coerce_point(theta)

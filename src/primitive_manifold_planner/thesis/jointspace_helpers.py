@@ -2078,101 +2078,24 @@ def _realize_best_candidate_after_selection(
     robot,
     collision_fn=None,
 ) -> tuple[ex66.SequentialRouteCandidate, dict[str, int], str]:
+    """Return the route assembled from stored dense joint-space graph edges.
+
+    The thesis-facing robot demo must execute the configuration-space planner's
+    own dense theta path. We therefore do not rebuild execution from selected
+    task-space transition points here. Any post-selection local replan would be
+    a different planner product and must be reported separately, not silently
+    substituted for the graph route.
+    """
     stats = {
         "route_candidates_realized_by_local_replan": 0,
         "final_route_realization_selected_transition_local_replan": 0,
         "graph_route_used_for_execution": 1,
         "route_candidates_local_replan_attempted": 0,
     }
-    alternatives = list(getattr(candidate, "alternative_candidates", [candidate]))
-    if all(id(other) != id(candidate) for other in alternatives):
-        alternatives.insert(0, candidate)
-    seen: set[int] = set()
-    candidates_to_try: list[ex66.SequentialRouteCandidate] = []
-    for maybe_candidate in alternatives:
-        if id(maybe_candidate) in seen:
-            continue
-        seen.add(id(maybe_candidate))
-        candidates_to_try.append(maybe_candidate)
-
-    failure_messages: list[str] = []
-    for candidate_idx, candidate_to_try in enumerate(candidates_to_try):
-        if (
-            len(candidate_to_try.left_node_path) == 0
-            or len(candidate_to_try.plane_node_path) == 0
-            or len(candidate_to_try.right_node_path) == 0
-        ):
-            failure_messages.append(f"candidate_{candidate_idx}: selected candidate has an empty stage path")
-            continue
-
-        stats["route_candidates_local_replan_attempted"] += 1
-        start_q = stores[ex66.LEFT_STAGE].graph.nodes[int(candidate_to_try.left_node_path[0])].q
-        left_transition_q = stores[ex66.LEFT_STAGE].graph.nodes[int(candidate_to_try.left_node_path[-1])].q
-        plane_entry_q = stores[ex66.PLANE_STAGE].graph.nodes[int(candidate_to_try.plane_node_path[0])].q
-        plane_exit_q = stores[ex66.PLANE_STAGE].graph.nodes[int(candidate_to_try.plane_node_path[-1])].q
-        right_transition_q = stores[ex66.RIGHT_STAGE].graph.nodes[int(candidate_to_try.right_node_path[0])].q
-        goal_q = stores[ex66.RIGHT_STAGE].graph.nodes[int(candidate_to_try.right_node_path[-1])].q
-        entry_task = 0.5 * (_task_point(robot, left_transition_q) + _task_point(robot, plane_entry_q))
-        exit_task = 0.5 * (_task_point(robot, plane_exit_q) + _task_point(robot, right_transition_q))
-
-        realized_path, realized_labels, realized_info = realize_selected_transition_route_jointspace(
-            robot=robot,
-            start_q=start_q,
-            left_transition_q=left_transition_q,
-            plane_entry_q=plane_entry_q,
-            plane_exit_q=plane_exit_q,
-            right_transition_q=right_transition_q,
-            goal_q=goal_q,
-            transition_entry_task=entry_task,
-            transition_exit_task=exit_task,
-            left_robot_manifold=stores[ex66.LEFT_STAGE].manifold,
-            plane_robot_manifold=stores[ex66.PLANE_STAGE].manifold,
-            right_robot_manifold=stores[ex66.RIGHT_STAGE].manifold,
-            joint_max_step=LOCAL_MAX_JOINT_STEP,
-            collision_fn=collision_fn,
-        )
-        if not bool(realized_info.get("success", False)):
-            failure_messages.append(
-                f"candidate_{candidate_idx}: {realized_info.get('message', 'selected transition local replan failed')}"
-            )
-            continue
-
-        certification = dict(realized_info["certification"])
-        realized_task = joint_path_to_task_path(robot, realized_path)
-        candidate_to_try.raw_path = np.asarray(realized_task, dtype=float)
-        candidate_to_try.display_path = np.asarray(realized_task, dtype=float)
-        candidate_to_try.joint_path = np.asarray(realized_path, dtype=float)
-        candidate_to_try.dense_joint_path = np.asarray(realized_path, dtype=float)
-        candidate_to_try.dense_joint_path_stage_labels = list(realized_labels)
-        candidate_to_try.dense_joint_path_constraint_residuals = np.asarray(certification["residuals"], dtype=float)
-        candidate_to_try.dense_joint_path_is_certified = bool(certification["constraint_certified"])
-        candidate_to_try.dense_joint_path_joint_steps = np.asarray(certification["joint_steps"], dtype=float)
-        candidate_to_try.dense_joint_path_max_joint_step = float(certification["max_joint_step"])
-        candidate_to_try.dense_joint_path_mean_joint_step = float(certification["mean_joint_step"])
-        candidate_to_try.dense_joint_path_worst_joint_step_index = int(certification["worst_joint_step_index"])
-        candidate_to_try.dense_joint_path_execution_certified = bool(certification["execution_certified"])
-        candidate_to_try.dense_joint_path_constraint_certified = bool(certification["constraint_certified"])
-        candidate_to_try.dense_joint_path_joint_continuity_certified = bool(certification["joint_continuity_certified"])
-        candidate_to_try.total_cost = float(ex66.path_cost(realized_task))
-        message = (
-            "final_route_realization=selected_transition_local_replan; "
-            "graph_route_used_for_execution=False; "
-            f"{realized_info.get('message', 'selected transition local replan certified')}; "
-            f"{certification['message']}"
-        )
-        candidate_to_try.dense_joint_path_message = message
-        stats["route_candidates_realized_by_local_replan"] = 1
-        stats["final_route_realization_selected_transition_local_replan"] = 1
-        stats["graph_route_used_for_execution"] = 0
-        return candidate_to_try, stats, message
-
-    failure_summary = " | ".join(failure_messages[:4])
-    if len(failure_messages) > 4:
-        failure_summary += f" | ... {len(failure_messages) - 4} more candidate failures"
     message = (
-        "final_route_realization=graph_route_fallback; "
+        "final_route_realization=stored_dense_joint_edges; "
         "graph_route_used_for_execution=True; "
-        f"{failure_summary or 'selected transition local replan failed for all candidates'}; "
+        "execution_path_source=stored_dense_joint_edges; "
         f"{candidate.dense_joint_path_message}"
     )
     candidate.dense_joint_path_message = message

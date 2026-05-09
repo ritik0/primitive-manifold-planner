@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-"""Continuous-transfer planner with 3DOF robot task-space execution.
+"""Continuous-transfer planner with 3DOF robot execution experiments.
 
-Phase 1 intentionally keeps planning in task space:
-- the continuous-transfer evidence graph discovers entry/exit/lambda structure;
-- the final route is the selected-transition local replan from that planner;
-- the robot tracks only that final route with sequential IK.
+The thesis-facing robot claim should use full joint-space exploration
+(`--jointspace-planning --full-jointspace-exploration`). The task-space IK mode
+and selected-lambda realization mode are retained as legacy/debug comparisons:
+they may use task-space route/lambda/transition selection before robot
+realization and must not be described as full joint-space planning.
 
 Planner evidence is diagnostic context. Robot motion is not allowed to follow
 raw exploration branches.
@@ -1531,6 +1532,16 @@ def plan_continuous_transfer_jointspace_robot(*, scene_description, seed: int, j
         {
             "planning_mode": "selected_lambda_jointspace_realization",
             "full_jointspace_exploration": False,
+            "lambda_entry_exit_selection_space": "task_space_continuous_transfer_planner",
+            "full_jointspace_planner_claim": False,
+            "ik_waypoint_fallback_used": any(
+                bool(realization.segment_messages.get(key, ""))
+                for key in (
+                    "left_segment_task_waypoint_fallback",
+                    "family_segment_task_waypoint_fallback",
+                    "right_segment_task_waypoint_fallback",
+                )
+            ),
             "planner_success": bool(result.success),
             "selected_lambda_for_realization": round(float(selected_lambda), 6),
             "selected_entry_point": np.round(entry, 6).tolist(),
@@ -1872,6 +1883,23 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
         "Full Joint-Space Continuous-Transfer Route",
         {
             "planner_success": bool(route_success),
+            "planning_space": "joint_space",
+            "state_variable": "theta=[yaw, shoulder, elbow]",
+            "lambda_entry_exit_selection_space": "joint_space_evidence",
+            "task_space_robot_mode_enabled": False,
+            "ik_waypoint_fallback_used": bool(
+                (
+                    route_realization is not None
+                    and any(
+                        bool(route_realization.segment_messages.get(key, ""))
+                        for key in (
+                            "left_segment_task_waypoint_fallback",
+                            "family_segment_task_waypoint_fallback",
+                            "right_segment_task_waypoint_fallback",
+                        )
+                    )
+                )
+            ),
             "route_candidates_evaluated": int(route_counters.get("route_candidates_evaluated", 0)),
             "route_candidates_built": int(route_counters.get("route_candidates_built", 0)),
             "route_candidates_rejected_lambda_mismatch": int(route_counters.get("route_candidates_rejected_lambda_mismatch", 0)),
@@ -2198,9 +2226,19 @@ def show_continuous_transfer_robot_demo(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Continuous-transfer planner with 3DOF robot execution.")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--taskspace-planning", action="store_true", help="Run task-space continuous-transfer planning plus IK execution.")
-    mode.add_argument("--jointspace-planning", action="store_true", help="Reserved for Phase 2 joint-space continuous-family planning.")
-    parser.set_defaults(taskspace_planning=True)
+    mode.add_argument(
+        "--legacy-taskspace-ik-demo",
+        "--taskspace-planning",
+        dest="taskspace_planning",
+        action="store_true",
+        help="LEGACY DEBUG ONLY: task-space continuous-transfer route followed by IK; not a joint-space planner.",
+    )
+    mode.add_argument(
+        "--jointspace-planning",
+        action="store_true",
+        help="Run robot joint-space realization; add --full-jointspace-exploration for full q-space lambda/transition discovery.",
+    )
+    parser.set_defaults(taskspace_planning=False, jointspace_planning=True)
     parser.add_argument(
         "--full-jointspace-exploration",
         action="store_true",
@@ -2224,6 +2262,19 @@ def main() -> None:
     parser.add_argument("--num-family-leaf-surfaces", type=int, default=9)
     parser.add_argument("--no-viz", action="store_true")
     args = parser.parse_args()
+
+    if args.taskspace_planning:
+        print(
+            "WARNING: LEGACY DEBUG ONLY: task-space continuous-transfer route followed by IK; not a joint-space planner.",
+            flush=True,
+        )
+    if args.jointspace_planning and not args.full_jointspace_exploration:
+        print(
+            "NOTE: selected-lambda joint-space realization uses task-space continuous-transfer planning "
+            "to choose lambda/entry/exit before robot realization. Use --full-jointspace-exploration "
+            "for full q-space transition discovery.",
+            flush=True,
+        )
 
     if args.jointspace_planning:
         scene_description = default_example_65_scene_description(obstacle_profile=args.obstacle_profile)

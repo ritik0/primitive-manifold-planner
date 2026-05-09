@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-"""Example 66.1: Example 66 with a simple 3DOF robot in the same PyVista scene.
+"""Example 66.1: FK-pulled-back constrained planning for a simple 3DOF robot.
 
-This demo uses a simple 3DOF spatial positioning arm to follow the exact
-task-space path produced by Example 66. It is still an execution-layer IK
-demonstration, not yet full robot configuration-space constrained planning.
+The thesis-facing mode plans directly in configuration space with
+theta = [yaw, shoulder, elbow]. Task-space sphere/plane constraints are pulled
+back through FK(theta), and the robot animation uses only the certified dense
+theta path returned by the joint-space planner.
+
+Legacy task-space IK tracking is kept only behind an explicit debug flag.
 """
 
 import argparse
@@ -18,6 +21,7 @@ from ompl import util as ou
 from primitive_manifold_planner.examplesupport.collision_utilities import configuration_in_collision, default_example_66_obstacles
 from primitive_manifold_planner.examplesupport.example66_scene import build_example66_scene
 from primitive_manifold_planner.examplesupport.jointspace_planner_utils import explore_joint_manifold, joint_step_statistics
+from primitive_manifold_planner.examplesupport.spatial_robot import SpatialRobot3DOF
 from primitive_manifold_planner.manifolds.robot import RobotPlaneManifold, RobotSphereManifold
 from primitive_manifold_planner.thesis import parallel_evidence_planner as ex66
 from primitive_manifold_planner.visualization import pyvista_available
@@ -32,41 +36,6 @@ try:
     from scipy.optimize import least_squares
 except Exception:
     least_squares = None
-
-
-@dataclass
-class SpatialRobot3DOF:
-    link_lengths: np.ndarray
-    base_world: np.ndarray
-    link_radius: float = 0.055
-    joint_radius: float = 0.095
-    ee_radius: float = 0.075
-
-    @property
-    def max_reach(self) -> float:
-        return float(np.sum(self.link_lengths))
-
-    def forward_kinematics_3d(self, joint_angles: np.ndarray) -> np.ndarray:
-        theta0, theta1, theta2 = np.asarray(joint_angles, dtype=float).reshape(3)
-        l1, l2, l3 = np.asarray(self.link_lengths, dtype=float).reshape(3)
-
-        yaw_dir = np.asarray([math.cos(theta0), math.sin(theta0), 0.0], dtype=float)
-
-        radial_1 = l1 * math.cos(theta1)
-        z_1 = l1 * math.sin(theta1)
-
-        angle_12 = theta1 + theta2
-        radial_2 = radial_1 + l2 * math.cos(angle_12)
-        z_2 = z_1 + l2 * math.sin(angle_12)
-
-        radial_3 = radial_2 + l3 * math.cos(angle_12)
-        z_3 = z_2 + l3 * math.sin(angle_12)
-
-        p0 = np.asarray(self.base_world, dtype=float)
-        p1 = p0 + radial_1 * yaw_dir + np.asarray([0.0, 0.0, z_1], dtype=float)
-        p2 = p0 + radial_2 * yaw_dir + np.asarray([0.0, 0.0, z_2], dtype=float)
-        p3 = p0 + radial_3 * yaw_dir + np.asarray([0.0, 0.0, z_3], dtype=float)
-        return np.asarray([p0, p1, p2, p3], dtype=float)
 
 
 @dataclass
@@ -483,6 +452,15 @@ def build_robot_execution(
     allow_taskspace_fallback: bool = False,
     joint_max_step: float = 0.08,
 ) -> RobotExecutionResult | None:
+    if use_planner_joint_path and allow_taskspace_fallback:
+        raise RuntimeError(
+            "Task-space IK fallback is forbidden in joint-space planning mode. "
+            "The robot execution path must come from the planner's dense theta trajectory."
+        )
+    if use_planner_joint_path and allow_uncertified_joint_animation:
+        raise RuntimeError(
+            "Uncertified joint animation is disabled for the thesis-facing joint-space demo."
+        )
     dense_joint_path = np.asarray(getattr(result, "dense_joint_path", np.zeros((0, 3), dtype=float)), dtype=float)
     dense_constraint_certified = bool(
         getattr(result, "dense_joint_path_constraint_certified", getattr(result, "dense_joint_path_is_certified", False))
@@ -499,22 +477,11 @@ def build_robot_execution(
         residuals = np.asarray(getattr(result, "dense_joint_path_constraint_residuals", np.zeros(0, dtype=float)), dtype=float)
         max_step_seen = float(getattr(result, "dense_joint_path_max_joint_step", float(np.max(joint_steps)) if len(joint_steps) > 0 else 0.0))
         step_ok = bool(dense_execution_certified and max_step_seen <= float(joint_max_step) + 1e-9)
-        if not step_ok and allow_taskspace_fallback:
-            fallback = build_continuous_robot_execution_path(result.path if len(result.path) >= 2 else result.raw_path, robot)
-            if fallback is not None:
-                fallback.diagnostics = f"dense joint path violates joint-step threshold; using explicit task-space fallback. max_step={max_step_seen:.4g}"
-                fallback.execution_source = "taskspace_fallback"
-                fallback.max_constraint_residual = float(np.max(residuals)) if len(residuals) > 0 else 0.0
-                fallback.mean_constraint_residual = float(np.mean(residuals)) if len(residuals) > 0 else 0.0
-                fallback.constraint_validation_success = bool(dense_constraint_certified)
-                fallback.worst_constraint_stage = "dense_joint_step_violation"
-                fallback.worst_constraint_index = -1
-                return fallback
         return RobotExecutionResult(
             target_task_points_3d=ee_points,
             joint_path=dense_joint_path,
             end_effector_points_3d=ee_points,
-            ik_success_count=int(len(dense_joint_path)),
+            ik_success_count=2,
             ik_failure_count=0,
             max_tracking_error=0.0,
             mean_tracking_error=0.0,
@@ -537,81 +504,48 @@ def build_robot_execution(
         )
 
     planned_joint_path = np.asarray(getattr(result, "joint_path", np.zeros((0, 3), dtype=float)), dtype=float)
-    if use_planner_joint_path and len(planned_joint_path) >= 2:
-        execution_joint_path = interpolate_joint_path_by_step(planned_joint_path, max_joint_step=float(joint_max_step))
-        ee_points = np.asarray([robot.forward_kinematics_3d(theta)[-1] for theta in execution_joint_path], dtype=float)
-        joint_steps = np.linalg.norm(
-            [wrap_angles(b - a) for a, b in zip(execution_joint_path[:-1], execution_joint_path[1:])],
-            axis=1,
-        )
-        max_joint_step = float(np.max(joint_steps)) if len(joint_steps) > 0 else 0.0
-        validation = (
-            validate_jointspace_execution_against_stages(
-                execution_joint_path,
-                robot,
-                result,
-                families,
-                np.asarray(start_q, dtype=float),
-                np.asarray(goal_q, dtype=float),
-            )
-            if validate_joint_execution and families is not None and start_q is not None and goal_q is not None
-            else JointspaceExecutionValidation(
-                valid=True,
-                max_constraint_residual=0.0,
-                mean_constraint_residual=0.0,
-                worst_index=-1,
-                worst_stage="not_checked",
-                stage_labels=[],
-                per_waypoint_residuals=np.zeros(0, dtype=float),
-                message="joint execution validation skipped",
-            )
-        )
-        certified = bool(validation.valid and max_joint_step <= float(joint_max_step) + 1e-9)
-        if not certified and allow_taskspace_fallback:
-            fallback = build_continuous_robot_execution_path(result.path if len(result.path) >= 2 else result.raw_path, robot)
-            if fallback is not None:
-                fallback.diagnostics = "joint execution uncertified; using explicit task-space fallback. " + validation.message
-                fallback.execution_source = "taskspace_fallback"
-                fallback.max_constraint_residual = float(validation.max_constraint_residual)
-                fallback.mean_constraint_residual = float(validation.mean_constraint_residual)
-                fallback.constraint_validation_success = bool(validation.valid)
-                fallback.worst_constraint_stage = str(validation.worst_stage)
-                fallback.worst_constraint_index = int(validation.worst_index)
-                return fallback
-        animation_enabled = bool((certified or allow_uncertified_joint_animation) and len(execution_joint_path) >= 2)
-        source = "direct_joint_path" if certified else "disabled"
-        if not certified and allow_uncertified_joint_animation:
-            source = "uncertified_direct_joint_path"
-        sparse_route_note = str(
+    if use_planner_joint_path:
+        message = str(
             getattr(
                 result,
                 "dense_joint_path_message",
-                "joint-space route has sparse nodes only; dense constrained local edges not stored yet",
+                "joint-space planner did not return an execution-certified dense theta path",
             )
         )
-        diagnostics = validation.message if certified else validation.message + "; refusing to animate misleading loops"
-        if not dense_constraint_certified and sparse_route_note:
-            diagnostics = diagnostics + "; " + sparse_route_note
+        fallback_theta = dense_joint_path if len(dense_joint_path) >= 2 else planned_joint_path
+        ee_points = (
+            np.asarray([robot.forward_kinematics_3d(theta)[-1] for theta in fallback_theta], dtype=float)
+            if len(fallback_theta) >= 2
+            else np.zeros((0, 3), dtype=float)
+        )
         return RobotExecutionResult(
             target_task_points_3d=np.asarray(ee_points, dtype=float),
-            joint_path=execution_joint_path,
+            joint_path=np.asarray(fallback_theta, dtype=float),
             end_effector_points_3d=ee_points,
-            ik_success_count=int(len(planned_joint_path)),
+            ik_success_count=0,
             ik_failure_count=0,
-            max_tracking_error=float(validation.max_constraint_residual),
-            mean_tracking_error=float(validation.mean_constraint_residual),
-            max_joint_step=max_joint_step,
-            execution_success=bool(certified),
-            diagnostics=diagnostics,
-            animation_enabled=animation_enabled,
+            max_tracking_error=0.0,
+            mean_tracking_error=0.0,
+            max_joint_step=float(getattr(result, "dense_joint_path_max_joint_step", 0.0)),
+            execution_success=False,
+            diagnostics=message + "; no task-space fallback or sparse joint interpolation was used",
+            animation_enabled=False,
             planner_path_resampled_for_robot=False,
             planner_joint_path_used_directly=True,
-            max_constraint_residual=float(validation.max_constraint_residual),
-            mean_constraint_residual=float(validation.mean_constraint_residual),
-            constraint_validation_success=bool(validation.valid),
-            worst_constraint_stage=str(validation.worst_stage),
-            worst_constraint_index=int(validation.worst_index),
-            execution_source=source,
+            max_constraint_residual=float(
+                np.max(getattr(result, "dense_joint_path_constraint_residuals", np.zeros(0, dtype=float)))
+                if len(getattr(result, "dense_joint_path_constraint_residuals", [])) > 0
+                else 0.0
+            ),
+            mean_constraint_residual=float(
+                np.mean(getattr(result, "dense_joint_path_constraint_residuals", np.zeros(0, dtype=float)))
+                if len(getattr(result, "dense_joint_path_constraint_residuals", [])) > 0
+                else 0.0
+            ),
+            constraint_validation_success=bool(dense_constraint_certified),
+            worst_constraint_stage="dense_theta_path_unavailable",
+            worst_constraint_index=-1,
+            execution_source="disabled_no_certified_dense_theta_path",
         )
 
     route = np.asarray(result.path if len(result.path) >= 2 else result.raw_path, dtype=float)
@@ -730,6 +664,7 @@ def primary_display_route_for_mode(
         dense_route = jointspace_display_route_from_dense(result, robot)
         if len(dense_route) >= 2:
             return dense_route, "FK(result.dense_joint_path)"
+        return np.zeros((0, 3), dtype=float), "none"
     if len(result.path) >= 2:
         return np.asarray(result.path, dtype=float), "result.path"
     if len(result.raw_path) >= 2:
@@ -1421,6 +1356,38 @@ def print_taskspace_execution_block(robot_execution: RobotExecutionResult | None
     )
 
 
+def print_jointspace_methodology_block(result: ex66.FixedPlaneRoute, robot_execution: RobotExecutionResult | None) -> None:
+    residuals = np.asarray(getattr(result, "dense_joint_path_constraint_residuals", np.zeros(0, dtype=float)), dtype=float)
+    stack_values = [
+        float(value)
+        for key, value in result.mode_counts.items()
+        if "best_stacked" in str(key) and "residual" in str(key) and np.isfinite(float(value))
+    ]
+    graph_route_used = bool(result.mode_counts.get("graph_route_used_for_execution", 1))
+    dense_path = np.asarray(getattr(result, "dense_joint_path", np.zeros((0, 3), dtype=float)), dtype=float)
+    print_block(
+        "Joint-space methodology guardrails",
+        {
+            "planning_space": "joint_space",
+            "state_variable": "theta=[yaw, shoulder, elbow]",
+            "task_space_robot_mode_enabled": False,
+            "task_space_planner_used": False,
+            "ik_used_for_start_goal_only": True,
+            "ik_waypoint_fallback_used": False,
+            "task_space_route_reconstruction": False,
+            "execution_path_source": "stored_dense_joint_edges" if graph_route_used else "projected_jointspace_local_edges",
+            "visual_trace_source": "FK(dense_theta_path)",
+            "graph_route_used_for_execution": graph_route_used,
+            "dense_theta_points": int(len(dense_path)),
+            "max_joint_step": 0.0 if robot_execution is None else float(robot_execution.max_joint_step),
+            "max_active_constraint_residual": float(np.max(residuals)) if len(residuals) > 0 else 0.0,
+            "max_transition_stack_residual": max(stack_values) if stack_values else "not_recorded",
+            "left_plane_transition_count": int(result.transition_hypotheses_left_plane),
+            "plane_right_transition_count": int(result.transition_hypotheses_plane_right),
+        },
+    )
+
+
 def print_jointspace_exploration_block(result: ex66.FixedPlaneRoute) -> None:
     def diag_mean(prefix: str) -> float:
         count = int(result.mode_counts.get(f"{prefix}_count", 0))
@@ -1515,11 +1482,15 @@ def print_dense_joint_certification_block(result: ex66.FixedPlaneRoute, robot_ex
     message = str(getattr(result, "dense_joint_path_message", ""))
     local_replan = bool(result.mode_counts.get("final_route_realization_selected_transition_local_replan", 0))
     graph_route_used = bool(result.mode_counts.get("graph_route_used_for_execution", 1))
+    final_realization = "selected_transition_local_replan" if local_replan else (
+        "stored_dense_joint_edges" if graph_route_used else "none"
+    )
     print_block(
         "Dense joint route certification",
         {
-            "final_route_realization": "selected_transition_local_replan" if local_replan else "graph_route_fallback",
+            "final_route_realization": final_realization,
             "graph_route_used_for_execution": graph_route_used,
+            "execution_path_source": "stored_dense_joint_edges" if graph_route_used else "projected_jointspace_local_edges",
             "dense_joint_path_points": int(len(getattr(result, "dense_joint_path", []))),
             "dense_joint_path_is_certified": bool(getattr(result, "dense_joint_path_is_certified", False)),
             "dense_joint_path_constraint_certified": bool(
@@ -1672,7 +1643,7 @@ def print_comparison(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Example 66.1: Example 66 with a simple 3DOF robot in the same PyVista scene."
+        description="Example 66.1: joint-space FK-constrained planning for a simple 3DOF robot."
     )
     parser.add_argument("--seed", type=int, default=41)
     parser.add_argument("--max-rounds", type=int, default=None)
@@ -1680,22 +1651,29 @@ def main():
     parser.add_argument("--fast", action="store_true")
     parser.add_argument("--serial", action="store_true")
     planning_mode = parser.add_mutually_exclusive_group()
-    planning_mode.add_argument("--taskspace-planning", dest="planning_mode", action="store_const", const="taskspace_ik_execution")
+    planning_mode.add_argument(
+        "--legacy-taskspace-ik-demo",
+        "--taskspace-planning",
+        dest="planning_mode",
+        action="store_const",
+        const="taskspace_ik_execution",
+        help="LEGACY DEBUG ONLY: run task-space planning then IK tracking. Not a joint-space planner.",
+    )
     planning_mode.add_argument(
         "--jointspace-planning",
         dest="planning_mode",
         action="store_const",
         const="jointspace_constrained_planning",
-        help="Plan directly in robot joint space instead of tracking the task-space route after planning.",
+        help="Plan directly in robot joint space with FK-pulled-back sphere/plane constraints.",
     )
     planning_mode.add_argument(
         "--compare-taskspace-jointspace",
         dest="planning_mode",
         action="store_const",
         const="compare_taskspace_vs_jointspace",
-        help="Run both task-space IK execution and joint-space constrained planning, then compare feasibility.",
+        help=argparse.SUPPRESS,
     )
-    parser.set_defaults(planning_mode="taskspace_ik_execution")
+    parser.set_defaults(planning_mode="jointspace_constrained_planning")
     first_solution_mode = parser.add_mutually_exclusive_group()
     first_solution_mode.add_argument("--continue-after-first-solution", action="store_true", default=False)
     first_solution_mode.add_argument("--stop-after-first-solution", action="store_true")
@@ -1721,12 +1699,12 @@ def main():
     parser.add_argument(
         "--allow-uncertified-joint-animation",
         action="store_true",
-        help="Debug only: animate a joint path even when dense constraint validation fails.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--allow-taskspace-fallback",
         action="store_true",
-        help="If joint-space execution is uncertified, explicitly fall back to task-space IK tracking.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--show-rejected-joint-interpolation",
@@ -1762,6 +1740,22 @@ def main():
     parser.add_argument("--route-selection-top-k-for-smoothing", type=int, default=3)
     parser.add_argument("--no-viz", action="store_true")
     args = parser.parse_args()
+
+    if args.planning_mode == "jointspace_constrained_planning":
+        if bool(args.allow_taskspace_fallback):
+            parser.error("--allow-taskspace-fallback is forbidden in joint-space thesis mode.")
+        if bool(args.allow_uncertified_joint_animation):
+            parser.error("--allow-uncertified-joint-animation is forbidden in joint-space thesis mode.")
+    if args.planning_mode == "taskspace_ik_execution":
+        print(
+            "WARNING: LEGACY DEBUG ONLY: task-space path followed by IK; not a joint-space planner.",
+            flush=True,
+        )
+    if args.planning_mode == "compare_taskspace_vs_jointspace":
+        print(
+            "WARNING: LEGACY DEBUG ONLY: comparison mode includes task-space IK tracking and is not the thesis robot planner.",
+            flush=True,
+        )
 
     np.random.seed(args.seed)
     ou.RNG.setSeed(args.seed)
@@ -1942,6 +1936,7 @@ def main():
         },
     )
     if planner_mode_label == "joint_space":
+        print_jointspace_methodology_block(result, robot_execution)
         print_jointspace_exploration_block(result)
         print_dense_joint_certification_block(result, robot_execution)
         print_jointspace_smoothing_block(smoothing_summary)
@@ -1950,7 +1945,7 @@ def main():
             "Joint-space execution validation",
             {
                 "joint_path_nodes": int(len(getattr(result, "joint_path", []))),
-                "interpolated_waypoints": 0 if robot_execution is None else len(robot_execution.joint_path),
+                "execution_theta_waypoints": 0 if robot_execution is None else len(robot_execution.joint_path),
                 "max_joint_step": 0.0 if robot_execution is None else robot_execution.max_joint_step,
                 "dense_joint_path_constraint_certified": bool(
                     getattr(result, "dense_joint_path_constraint_certified", getattr(result, "dense_joint_path_is_certified", False))

@@ -16,7 +16,7 @@ if str(ROOT) not in sys.path:
 from primitive_manifold_planner.examplesupport.example66_scene import build_example66_scene
 from primitive_manifold_planner.examplesupport.intrinsic_multimodal_helpers import build_segment_polydata
 from primitive_manifold_planner.thesis import parallel_evidence_planner as planner_core
-from primitive_manifold_planner.thesis.parallel_evidence_planner import *  # noqa: F401,F403
+from primitive_manifold_planner.thesis.parallel_evidence_planner import *  
 from primitive_manifold_planner.visualization.display import (
     draw_edge_segments,
     plane_patch_corners,
