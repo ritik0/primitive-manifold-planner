@@ -174,6 +174,8 @@ class JointspaceRouteRealization:
     lambda_fixed_during_transfer: bool = False
     lambda_variation_transfer: float = float("inf")
     final_route_stored_evidence_edges: int = 0
+    final_route_dense_segments: int = 0
+    final_route_segment_source: str = ""
     final_route_projected_jointspace_edges: int = 0
     final_route_taskspace_edges: int = 0
 
@@ -1440,8 +1442,10 @@ def realize_full_jointspace_candidate_route(
             stage_order_valid=bool(stage_order_valid),
             lambda_fixed_during_transfer=bool(lambda_fixed),
             lambda_variation_transfer=float(lambda_variation),
-            final_route_stored_evidence_edges=3,
-            final_route_projected_jointspace_edges=0,
+            final_route_stored_evidence_edges=0,
+            final_route_dense_segments=3,
+            final_route_segment_source="certified_projected_jointspace_continuation_segments",
+            final_route_projected_jointspace_edges=3,
             final_route_taskspace_edges=0,
         ),
         manifolds,
@@ -1767,10 +1771,13 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
             failure_reason = realization.message
     route_success = bool(route_realization is not None and route_realization.success and selected_candidate is not None)
     final_route_realization = (
-        "full_jointspace_stored_dense_joint_edges" if route_success else "full_jointspace_route_failed"
+        "certified_projected_jointspace_continuation_segments" if route_success else "full_jointspace_route_failed"
     )
     execution_source = "certified_dense_joint_path" if route_success else "none"
     route_source = "FK(result.dense_joint_path)" if route_success else "none"
+    route_realization_source = (
+        "certified_projected_jointspace_continuation_segments" if route_success else "none"
+    )
     robot_execution = None
     display_vs_trace_max_error = float("inf")
     display_vs_trace_mean_error = float("inf")
@@ -1813,7 +1820,7 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
         "Full Joint-Space Continuous-Transfer Exploration Scaffold",
         {
             "full_jointspace_exploration": True,
-            "implementation_phase": "phase_3a_evidence_projection",
+            "implementation_phase": "certified_full_jointspace_continuous_transfer",
             "planner_success": bool(route_success) if route_candidates else ("evidence_ready" if evidence_ready else False),
             "left_evidence_nodes": int(len(evidence.left_store.nodes)),
             "left_evidence_edges": int(len(evidence.left_store.edges)),
@@ -1835,7 +1842,8 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
             "entry_transitions_found": int(transition_diagnostics.get("entry_transitions_found", 0)),
             "exit_transitions_found": int(transition_diagnostics.get("exit_transitions_found", 0)),
             "final_route_realization": final_route_realization,
-            "graph_route_used_for_execution": True if route_success else False,
+            "graph_route_used_for_execution": False,
+            "route_realization_source": route_realization_source,
             "execution_source": execution_source,
             "route_source": route_source,
             "display_vs_trace_max_error": round(float(display_vs_trace_max_error), 6)
@@ -1871,7 +1879,8 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
             "entry_transition_failure_reasons": dict(transition_diagnostics.get("entry_transition_failure_reasons", {})),
             "exit_transition_failure_reasons": dict(transition_diagnostics.get("exit_transition_failure_reasons", {})),
             "final_route_realization": final_route_realization,
-            "graph_route_used_for_execution": True if route_success else False,
+            "graph_route_used_for_execution": False,
+            "route_realization_source": route_realization_source,
             "execution_source": execution_source,
         },
     )
@@ -1957,16 +1966,19 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
             lambda_fixed_during_transfer=bool(route_realization.lambda_fixed_during_transfer),
             lambda_variation_transfer=float(route_realization.lambda_variation_transfer),
             final_route_stored_evidence_edges=int(route_realization.final_route_stored_evidence_edges),
+            final_route_dense_segments=int(route_realization.final_route_dense_segments),
+            final_route_segment_source=str(route_realization.final_route_segment_source),
             final_route_projected_jointspace_edges=int(route_realization.final_route_projected_jointspace_edges),
             final_route_taskspace_edges=int(route_realization.final_route_taskspace_edges),
             task_space_planner_used=False,
             ik_waypoint_fallback_used=False,
             task_space_route_reconstruction=False,
-            execution_path_source="stored_dense_joint_edges",
+            execution_path_source="certified_projected_jointspace_continuation_segments",
             visual_trace_source="FK(dense_theta_path)",
             route_source="FK(result.dense_joint_path)",
+            route_realization_source=route_realization_source,
             final_route_realization=final_route_realization,
-            graph_route_used_for_execution=True,
+            graph_route_used_for_execution=False,
         )
 
     _print_key_value_block(
@@ -2001,7 +2013,8 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
             "selected_exit_residual": None if selected_exit is None else round(float(selected_exit.residual_norm), 8),
             "lambda_reconciliation": lambda_reconciliation,
             "final_route_realization": final_route_realization,
-            "graph_route_used_for_execution": True if route_success else False,
+            "graph_route_used_for_execution": False,
+            "route_realization_source": route_realization_source,
             "dense_joint_path_execution_certified": bool(route_success),
             "dense_joint_path_constraint_certified": bool(route_success and route_realization is not None),
             "dense_joint_path_joint_continuity_certified": bool(route_success and route_realization is not None),
@@ -2030,6 +2043,8 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
             if route_realization is None or not np.isfinite(route_realization.max_transition_stack_residual)
             else float(route_realization.max_transition_stack_residual),
             "transition_stack_certified": bool(route_realization.transition_stack_certified) if route_realization is not None else False,
+            "final_route_dense_segments": 0 if route_realization is None else int(route_realization.final_route_dense_segments),
+            "final_route_segment_source": "" if route_realization is None else str(route_realization.final_route_segment_source),
             "final_route_stored_evidence_edges": 0 if route_realization is None else int(route_realization.final_route_stored_evidence_edges),
             "final_route_projected_jointspace_edges": 0 if route_realization is None else int(route_realization.final_route_projected_jointspace_edges),
             "final_route_taskspace_edges": 0 if route_realization is None else int(route_realization.final_route_taskspace_edges),
@@ -2185,8 +2200,13 @@ def compute_ex65_jointspace_audit(scene, result, robot, robot_execution) -> dict
         "planning_space": "joint_space",
         "state_variable": "theta=[yaw, shoulder, elbow]",
         "family_state": "theta+lambda",
-        "execution_path_source": str(getattr(result, "execution_path_source", "stored_dense_joint_edges")),
+        "execution_path_source": str(
+            getattr(result, "execution_path_source", "certified_projected_jointspace_continuation_segments")
+        ),
         "visual_trace_source": str(getattr(result, "visual_trace_source", "FK(dense_theta_path)")),
+        "route_realization_source": str(
+            getattr(result, "route_realization_source", "certified_projected_jointspace_continuation_segments")
+        ),
         "task_space_planner_used": bool(getattr(result, "task_space_planner_used", False)),
         "ik_waypoint_fallback_used": bool(getattr(result, "ik_waypoint_fallback_used", False)),
         "task_space_route_reconstruction": bool(getattr(result, "task_space_route_reconstruction", False)),
@@ -2196,6 +2216,8 @@ def compute_ex65_jointspace_audit(scene, result, robot, robot_execution) -> dict
         "collision_free": bool(getattr(result, "collision_free", False)),
         "graph_route_used_for_execution": bool(getattr(result, "graph_route_used_for_execution", False)),
         "final_route_stored_evidence_edges": int(getattr(result, "final_route_stored_evidence_edges", 0)),
+        "final_route_dense_segments": int(getattr(result, "final_route_dense_segments", 0)),
+        "final_route_segment_source": str(getattr(result, "final_route_segment_source", "")),
         "final_route_projected_jointspace_edges": int(getattr(result, "final_route_projected_jointspace_edges", 0)),
         "final_route_taskspace_edges": int(getattr(result, "final_route_taskspace_edges", 0)),
         "route_source": str(getattr(result, "route_source", "none")),
@@ -2218,6 +2240,7 @@ def print_ex65_jointspace_audits(audit: dict[str, object]) -> None:
             "execution_path_source": audit["execution_path_source"],
             "visual_trace_source": audit["visual_trace_source"],
             "graph_route_used_for_execution": audit["graph_route_used_for_execution"],
+            "route_realization_source": audit["route_realization_source"],
             "dense_theta_points": audit["theta_path_points"],
             "dense_joint_path_execution_certified": audit["dense_joint_path_execution_certified"],
             "final_route_taskspace_edges": audit["final_route_taskspace_edges"],
@@ -2258,6 +2281,8 @@ def print_ex65_jointspace_audits(audit: dict[str, object]) -> None:
             "selected_family_right_stack_residual": audit["selected_family_right_stack_residual"],
             "max_transition_stack_residual": audit["max_transition_stack_residual"],
             "transition_stack_certified": audit["transition_stack_certified"],
+            "final_route_dense_segments": audit["final_route_dense_segments"],
+            "final_route_segment_source": audit["final_route_segment_source"],
             "final_route_stored_evidence_edges": audit["final_route_stored_evidence_edges"],
             "final_route_projected_jointspace_edges": audit["final_route_projected_jointspace_edges"],
             "final_route_taskspace_edges": audit["final_route_taskspace_edges"],
@@ -2295,6 +2320,7 @@ def save_ex65_cspace_debug_artifacts(audit: dict[str, object], *, output_root: P
         "lambda_variation_transfer": audit["lambda_variation_transfer"],
         "execution_path_source": audit["execution_path_source"],
         "visual_trace_source": audit["visual_trace_source"],
+        "route_realization_source": audit["route_realization_source"],
         "task_space_planner_used": audit["task_space_planner_used"],
         "ik_waypoint_fallback_used": audit["ik_waypoint_fallback_used"],
         "task_space_route_reconstruction": audit["task_space_route_reconstruction"],
@@ -2304,6 +2330,9 @@ def save_ex65_cspace_debug_artifacts(audit: dict[str, object], *, output_root: P
         "max_constraint_residual": audit["max_constraint_residual"],
         "max_joint_step": audit["max_joint_step"],
         "stage_order_valid": audit["stage_order_valid"],
+        "graph_route_used_for_execution": audit["graph_route_used_for_execution"],
+        "final_route_dense_segments": audit["final_route_dense_segments"],
+        "final_route_segment_source": audit["final_route_segment_source"],
         "final_route_taskspace_edges": audit["final_route_taskspace_edges"],
         "total_joint_path_length": audit["total_joint_path_length"],
         "total_task_fk_path_length": audit["total_task_fk_path_length"],
@@ -2379,8 +2408,12 @@ def assert_ex65_jointspace_methodology(result, robot_execution, audit: dict[str,
         raise RuntimeError("IK waypoint fallback is forbidden in Example 65 full joint-space thesis mode.")
     if bool(audit["task_space_route_reconstruction"]):
         raise RuntimeError("Task-space route reconstruction is forbidden in Example 65 full joint-space thesis mode.")
-    if str(audit["execution_path_source"]) != "stored_dense_joint_edges":
+    if str(audit["execution_path_source"]) != "certified_projected_jointspace_continuation_segments":
         raise RuntimeError(f"Unexpected execution path source: {audit['execution_path_source']}")
+    if bool(audit["graph_route_used_for_execution"]):
+        raise RuntimeError("Example 65 full joint-space mode should not claim raw graph route execution.")
+    if str(audit["route_realization_source"]) != "certified_projected_jointspace_continuation_segments":
+        raise RuntimeError(f"Unexpected route realization source: {audit['route_realization_source']}")
     if str(audit["visual_trace_source"]) != "FK(dense_theta_path)":
         raise RuntimeError(f"Unexpected visual trace source: {audit['visual_trace_source']}")
     if int(audit["final_route_taskspace_edges"]) != 0:
