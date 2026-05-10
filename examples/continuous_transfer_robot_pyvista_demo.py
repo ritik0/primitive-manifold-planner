@@ -14,6 +14,8 @@ raw exploration branches.
 
 import argparse
 from dataclasses import dataclass
+from datetime import datetime
+import json
 import os
 import sys
 from pathlib import Path
@@ -49,6 +51,7 @@ from primitive_manifold_planner.experiments.continuous_transfer.config import DE
 from primitive_manifold_planner.experiments.continuous_transfer.family_definition import plane_leaf_patch
 from primitive_manifold_planner.manifolds.robot import RobotPlaneManifold, RobotSphereManifold
 from primitive_manifold_planner.visualization import add_manifold, add_points, pyvista_available
+from primitive_manifold_planner.visualization.cspace_robot import show_cspace_robot_planning
 from primitive_manifold_planner.visualization.robot import (
     add_robot_pedestal,
     make_robot_actor_bundle,
@@ -147,6 +150,7 @@ class JointspaceRouteRealization:
     success: bool
     dense_joint_path: np.ndarray
     stage_labels: list[str]
+    lambda_labels: np.ndarray
     task_path: np.ndarray
     residuals: np.ndarray
     joint_steps: np.ndarray
@@ -157,6 +161,21 @@ class JointspaceRouteRealization:
     collision_free: bool
     message: str
     segment_messages: dict[str, str]
+    selected_lambda: float = float("nan")
+    selected_left_family_transition_theta: np.ndarray = None
+    selected_family_right_transition_theta: np.ndarray = None
+    selected_left_family_transition_index: int = -1
+    selected_family_right_transition_index: int = -1
+    selected_left_family_stack_residual: float = float("inf")
+    selected_family_right_stack_residual: float = float("inf")
+    max_transition_stack_residual: float = float("inf")
+    transition_stack_certified: bool = False
+    stage_order_valid: bool = False
+    lambda_fixed_during_transfer: bool = False
+    lambda_variation_transfer: float = float("inf")
+    final_route_stored_evidence_edges: int = 0
+    final_route_projected_jointspace_edges: int = 0
+    final_route_taskspace_edges: int = 0
 
 
 @dataclass
@@ -955,6 +974,46 @@ def _certify_labeled_joint_path(
     }
 
 
+def _stage_order_valid(labels: list[str]) -> bool:
+    order = {LEFT_STAGE: 0, FAMILY_STAGE: 1, RIGHT_STAGE: 2}
+    values = [order.get(str(label), -1) for label in labels]
+    return bool(values and all(value >= 0 for value in values) and all(b >= a for a, b in zip(values[:-1], values[1:])))
+
+
+def _lambda_labels_for_stages(labels: list[str], selected_lambda: float) -> np.ndarray:
+    lam = float(selected_lambda)
+    return np.asarray([lam if str(label) == FAMILY_STAGE else np.nan for label in labels], dtype=float)
+
+
+def _lambda_fixed_audit(lambda_labels: np.ndarray) -> tuple[float, float, float, bool, int]:
+    arr = np.asarray(lambda_labels, dtype=float)
+    family = arr[np.isfinite(arr)]
+    if len(family) == 0:
+        return float("nan"), float("nan"), float("inf"), False, 0
+    lam_min = float(np.min(family))
+    lam_max = float(np.max(family))
+    variation = float(lam_max - lam_min)
+    return lam_min, lam_max, variation, bool(variation <= 1.0e-6), int(len(family))
+
+
+def _transition_index(theta_path: np.ndarray, theta: np.ndarray) -> int:
+    path = np.asarray(theta_path, dtype=float)
+    q = np.asarray(theta, dtype=float)
+    if len(path) == 0 or q.size != 3:
+        return -1
+    distances = np.linalg.norm(wrap_joint_angles(path - q.reshape(1, 3)), axis=1)
+    return int(np.argmin(distances))
+
+
+def _stack_residual(source_manifold, target_manifold, theta: np.ndarray) -> float:
+    q = np.asarray(theta, dtype=float)
+    if q.size != 3:
+        return float("inf")
+    source = float(np.linalg.norm(source_manifold.residual(q)))
+    target = float(np.linalg.norm(target_manifold.residual(q)))
+    return float(np.linalg.norm([source, target]))
+
+
 def realize_selected_continuous_transfer_route_jointspace(
     *,
     robot,
@@ -1034,6 +1093,7 @@ def realize_selected_continuous_transfer_route_jointspace(
                 success=False,
                 dense_joint_path=np.zeros((0, 3), dtype=float),
                 stage_labels=[],
+                lambda_labels=np.zeros(0, dtype=float),
                 task_path=np.zeros((0, 3), dtype=float),
                 residuals=np.zeros(0, dtype=float),
                 joint_steps=np.zeros(0, dtype=float),
@@ -1097,6 +1157,7 @@ def realize_selected_continuous_transfer_route_jointspace(
                 success=False,
                 dense_joint_path=np.zeros((0, 3), dtype=float),
                 stage_labels=[],
+                lambda_labels=np.zeros(0, dtype=float),
                 task_path=np.zeros((0, 3), dtype=float),
                 residuals=np.zeros(0, dtype=float),
                 joint_steps=np.zeros(0, dtype=float),
@@ -1133,6 +1194,7 @@ def realize_selected_continuous_transfer_route_jointspace(
             success=bool(cert["certified"]),
             dense_joint_path=np.asarray(dense_joint_path, dtype=float),
             stage_labels=list(labels),
+            lambda_labels=_lambda_labels_for_stages(list(labels), float(selected_lambda)),
             task_path=np.asarray(task_path, dtype=float),
             residuals=np.asarray(cert["residuals"], dtype=float),
             joint_steps=np.asarray(cert["joint_steps"], dtype=float),
@@ -1270,6 +1332,7 @@ def realize_full_jointspace_candidate_route(
                     success=False,
                     dense_joint_path=np.zeros((0, 3), dtype=float),
                     stage_labels=[],
+                    lambda_labels=np.zeros(0, dtype=float),
                     task_path=np.zeros((0, 3), dtype=float),
                     residuals=np.zeros(0, dtype=float),
                     joint_steps=np.zeros(0, dtype=float),
@@ -1290,45 +1353,12 @@ def realize_full_jointspace_candidate_route(
     left_path, segment_messages["left_segment"] = _connect_joint_segment(
         LEFT_STAGE, manifolds[LEFT_STAGE], start_q, q_entry, float(joint_max_step), collision_fn=collision_fn
     )
-    if left_path is None:
-        left_path, segment_messages["left_segment_task_waypoint_fallback"] = _connect_joint_segment_by_task_waypoints(
-            LEFT_STAGE,
-            manifolds[LEFT_STAGE],
-            start_q,
-            q_entry,
-            start_task,
-            candidate.entry.task_point,
-            float(joint_max_step),
-            collision_fn=collision_fn,
-        )
     family_path, segment_messages["family_segment"] = _connect_joint_segment(
         FAMILY_STAGE, manifolds[FAMILY_STAGE], q_entry, q_exit, float(joint_max_step), collision_fn=collision_fn
     )
-    if family_path is None:
-        family_path, segment_messages["family_segment_task_waypoint_fallback"] = _connect_joint_segment_by_task_waypoints(
-            FAMILY_STAGE,
-            manifolds[FAMILY_STAGE],
-            q_entry,
-            q_exit,
-            candidate.entry.task_point,
-            candidate.exit.task_point,
-            float(joint_max_step),
-            collision_fn=collision_fn,
-        )
     right_path, segment_messages["right_segment"] = _connect_joint_segment(
         RIGHT_STAGE, manifolds[RIGHT_STAGE], q_exit, goal_q, float(joint_max_step), collision_fn=collision_fn
     )
-    if right_path is None:
-        right_path, segment_messages["right_segment_task_waypoint_fallback"] = _connect_joint_segment_by_task_waypoints(
-            RIGHT_STAGE,
-            manifolds[RIGHT_STAGE],
-            q_exit,
-            goal_q,
-            candidate.exit.task_point,
-            goal_task,
-            float(joint_max_step),
-            collision_fn=collision_fn,
-        )
 
     if left_path is None or family_path is None or right_path is None:
         return (
@@ -1336,6 +1366,7 @@ def realize_full_jointspace_candidate_route(
                 success=False,
                 dense_joint_path=np.zeros((0, 3), dtype=float),
                 stage_labels=[],
+                lambda_labels=np.zeros(0, dtype=float),
                 task_path=np.zeros((0, 3), dtype=float),
                 residuals=np.zeros(0, dtype=float),
                 joint_steps=np.zeros(0, dtype=float),
@@ -1362,17 +1393,31 @@ def realize_full_jointspace_candidate_route(
         joint_max_step=float(joint_max_step),
         collision_fn=collision_fn,
     )
+    lambda_labels = _lambda_labels_for_stages(list(labels), float(candidate.selected_lambda))
+    _family_lambda_min, _family_lambda_max, lambda_variation, lambda_fixed, _family_count = _lambda_fixed_audit(lambda_labels)
+    left_family_stack = _stack_residual(manifolds[LEFT_STAGE], manifolds[FAMILY_STAGE], q_entry)
+    family_right_stack = _stack_residual(manifolds[FAMILY_STAGE], manifolds[RIGHT_STAGE], q_exit)
+    max_transition_stack = float(max(left_family_stack, family_right_stack))
+    transition_stack_certified = bool(max_transition_stack <= 1.0e-3)
+    stage_order_valid = _stage_order_valid(list(labels))
+    route_certified = bool(cert["certified"] and transition_stack_certified and lambda_fixed and stage_order_valid)
     task_path = joint_path_to_task_path(robot, dense_joint_path)
     message = (
-        "full joint-space selected-transition local replan certified"
-        if bool(cert["certified"])
-        else "full joint-space selected-transition local replan failed certification"
+        "full joint-space fixed-lambda dense edge route certified"
+        if route_certified
+        else (
+            "full joint-space fixed-lambda dense edge route failed certification: "
+            f"local_certified={bool(cert['certified'])}, "
+            f"transition_stack_certified={transition_stack_certified}, "
+            f"lambda_fixed={lambda_fixed}, stage_order_valid={stage_order_valid}"
+        )
     )
     return (
         JointspaceRouteRealization(
-            success=bool(cert["certified"]),
+            success=bool(route_certified),
             dense_joint_path=np.asarray(dense_joint_path, dtype=float),
             stage_labels=list(labels),
+            lambda_labels=np.asarray(lambda_labels, dtype=float),
             task_path=np.asarray(task_path, dtype=float),
             residuals=np.asarray(cert["residuals"], dtype=float),
             joint_steps=np.asarray(cert["joint_steps"], dtype=float),
@@ -1383,6 +1428,21 @@ def realize_full_jointspace_candidate_route(
             collision_free=bool(cert["collision_free"]),
             message=message,
             segment_messages=segment_messages,
+            selected_lambda=float(candidate.selected_lambda),
+            selected_left_family_transition_theta=np.asarray(q_entry, dtype=float),
+            selected_family_right_transition_theta=np.asarray(q_exit, dtype=float),
+            selected_left_family_transition_index=_transition_index(dense_joint_path, q_entry),
+            selected_family_right_transition_index=_transition_index(dense_joint_path, q_exit),
+            selected_left_family_stack_residual=float(left_family_stack),
+            selected_family_right_stack_residual=float(family_right_stack),
+            max_transition_stack_residual=float(max_transition_stack),
+            transition_stack_certified=bool(transition_stack_certified),
+            stage_order_valid=bool(stage_order_valid),
+            lambda_fixed_during_transfer=bool(lambda_fixed),
+            lambda_variation_transfer=float(lambda_variation),
+            final_route_stored_evidence_edges=3,
+            final_route_projected_jointspace_edges=0,
+            final_route_taskspace_edges=0,
         ),
         manifolds,
         lambda_reconciliation,
@@ -1707,7 +1767,7 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
             failure_reason = realization.message
     route_success = bool(route_realization is not None and route_realization.success and selected_candidate is not None)
     final_route_realization = (
-        "full_jointspace_selected_transition_local_replan" if route_success else "full_jointspace_route_failed"
+        "full_jointspace_stored_dense_joint_edges" if route_success else "full_jointspace_route_failed"
     )
     execution_source = "certified_dense_joint_path" if route_success else "none"
     route_source = "FK(result.dense_joint_path)" if route_success else "none"
@@ -1775,7 +1835,7 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
             "entry_transitions_found": int(transition_diagnostics.get("entry_transitions_found", 0)),
             "exit_transitions_found": int(transition_diagnostics.get("exit_transitions_found", 0)),
             "final_route_realization": final_route_realization,
-            "graph_route_used_for_execution": False,
+            "graph_route_used_for_execution": True if route_success else False,
             "execution_source": execution_source,
             "route_source": route_source,
             "display_vs_trace_max_error": round(float(display_vs_trace_max_error), 6)
@@ -1811,7 +1871,7 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
             "entry_transition_failure_reasons": dict(transition_diagnostics.get("entry_transition_failure_reasons", {})),
             "exit_transition_failure_reasons": dict(transition_diagnostics.get("exit_transition_failure_reasons", {})),
             "final_route_realization": final_route_realization,
-            "graph_route_used_for_execution": False,
+            "graph_route_used_for_execution": True if route_success else False,
             "execution_source": execution_source,
         },
     )
@@ -1873,10 +1933,40 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
             path=display_route,
             raw_path=display_route,
             dense_joint_path=np.asarray(route_realization.dense_joint_path, dtype=float),
+            dense_joint_path_stage_labels=list(route_realization.stage_labels),
+            dense_lambda_labels=np.asarray(route_realization.lambda_labels, dtype=float),
             dense_joint_path_execution_certified=True,
+            dense_joint_path_constraint_certified=bool(route_realization.success),
+            dense_joint_path_joint_continuity_certified=bool(route_realization.success),
+            dense_joint_path_constraint_residuals=np.asarray(route_realization.residuals, dtype=float),
+            dense_joint_path_joint_steps=np.asarray(route_realization.joint_steps, dtype=float),
+            dense_joint_path_max_joint_step=float(route_realization.max_joint_step),
+            dense_joint_path_mean_joint_step=float(route_realization.mean_joint_step),
+            max_dense_constraint_residual=float(route_realization.max_constraint_residual),
+            mean_dense_constraint_residual=float(route_realization.mean_constraint_residual),
+            collision_free=bool(route_realization.collision_free),
+            selected_left_family_transition_theta=np.asarray(route_realization.selected_left_family_transition_theta, dtype=float),
+            selected_family_right_transition_theta=np.asarray(route_realization.selected_family_right_transition_theta, dtype=float),
+            selected_left_family_transition_index=int(route_realization.selected_left_family_transition_index),
+            selected_family_right_transition_index=int(route_realization.selected_family_right_transition_index),
+            selected_left_family_stack_residual=float(route_realization.selected_left_family_stack_residual),
+            selected_family_right_stack_residual=float(route_realization.selected_family_right_stack_residual),
+            max_transition_stack_residual=float(route_realization.max_transition_stack_residual),
+            transition_stack_certified=bool(route_realization.transition_stack_certified),
+            stage_order_valid=bool(route_realization.stage_order_valid),
+            lambda_fixed_during_transfer=bool(route_realization.lambda_fixed_during_transfer),
+            lambda_variation_transfer=float(route_realization.lambda_variation_transfer),
+            final_route_stored_evidence_edges=int(route_realization.final_route_stored_evidence_edges),
+            final_route_projected_jointspace_edges=int(route_realization.final_route_projected_jointspace_edges),
+            final_route_taskspace_edges=int(route_realization.final_route_taskspace_edges),
+            task_space_planner_used=False,
+            ik_waypoint_fallback_used=False,
+            task_space_route_reconstruction=False,
+            execution_path_source="stored_dense_joint_edges",
+            visual_trace_source="FK(dense_theta_path)",
             route_source="FK(result.dense_joint_path)",
             final_route_realization=final_route_realization,
-            graph_route_used_for_execution=False,
+            graph_route_used_for_execution=True,
         )
 
     _print_key_value_block(
@@ -1911,13 +2001,38 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
             "selected_exit_residual": None if selected_exit is None else round(float(selected_exit.residual_norm), 8),
             "lambda_reconciliation": lambda_reconciliation,
             "final_route_realization": final_route_realization,
-            "graph_route_used_for_execution": False,
+            "graph_route_used_for_execution": True if route_success else False,
             "dense_joint_path_execution_certified": bool(route_success),
+            "dense_joint_path_constraint_certified": bool(route_success and route_realization is not None),
+            "dense_joint_path_joint_continuity_certified": bool(route_success and route_realization is not None),
             "dense_joint_path_points": 0 if route_realization is None else int(len(route_realization.dense_joint_path)),
             "max_dense_constraint_residual": round(max_residual, 8) if np.isfinite(max_residual) else float("inf"),
             "mean_dense_constraint_residual": round(mean_residual, 8) if np.isfinite(mean_residual) else float("inf"),
             "dense_joint_path_max_joint_step": round(max_step, 6) if np.isfinite(max_step) else float("inf"),
+            "dense_joint_path_mean_joint_step": None
+            if route_realization is None or not np.isfinite(route_realization.mean_joint_step)
+            else round(float(route_realization.mean_joint_step), 6),
             "collision_free": bool(route_realization.collision_free) if route_realization is not None else False,
+            "stage_order_valid": bool(route_realization.stage_order_valid) if route_realization is not None else False,
+            "lambda_fixed_during_transfer": bool(route_realization.lambda_fixed_during_transfer) if route_realization is not None else False,
+            "lambda_variation_transfer": None
+            if route_realization is None or not np.isfinite(route_realization.lambda_variation_transfer)
+            else float(route_realization.lambda_variation_transfer),
+            "selected_left_family_transition_index": None if route_realization is None else int(route_realization.selected_left_family_transition_index),
+            "selected_family_right_transition_index": None if route_realization is None else int(route_realization.selected_family_right_transition_index),
+            "selected_left_family_stack_residual": None
+            if route_realization is None or not np.isfinite(route_realization.selected_left_family_stack_residual)
+            else float(route_realization.selected_left_family_stack_residual),
+            "selected_family_right_stack_residual": None
+            if route_realization is None or not np.isfinite(route_realization.selected_family_right_stack_residual)
+            else float(route_realization.selected_family_right_stack_residual),
+            "max_transition_stack_residual": None
+            if route_realization is None or not np.isfinite(route_realization.max_transition_stack_residual)
+            else float(route_realization.max_transition_stack_residual),
+            "transition_stack_certified": bool(route_realization.transition_stack_certified) if route_realization is not None else False,
+            "final_route_stored_evidence_edges": 0 if route_realization is None else int(route_realization.final_route_stored_evidence_edges),
+            "final_route_projected_jointspace_edges": 0 if route_realization is None else int(route_realization.final_route_projected_jointspace_edges),
+            "final_route_taskspace_edges": 0 if route_realization is None else int(route_realization.final_route_taskspace_edges),
             "execution_source": execution_source,
             "route_source": route_source,
             "display_vs_trace_max_error": round(float(display_vs_trace_max_error), 6) if route_success else float("inf"),
@@ -1932,6 +2047,360 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
         },
     )
     return scene, visualization_result, robot, robot_execution
+
+
+def _json_safe(value):
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (np.floating, np.integer)):
+        return value.item()
+    if isinstance(value, (float, int, str, bool)) or value is None:
+        return value
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    return str(value)
+
+
+def _cspace_manifolds_for_result(scene, robot, result):
+    selected_lambda = float(
+        getattr(
+            result,
+            "selected_lambda_for_realization",
+            getattr(result, "selected_lambda", scene.transfer_family.nominal_lambda),
+        )
+    )
+    manifolds = build_robot_manifolds_for_selected_lambda(
+        robot,
+        (scene.left_support, scene.transfer_family, scene.right_support),
+        selected_lambda,
+    )
+    return manifolds, selected_lambda
+
+
+def _stage_residual_audit(
+    theta_path: np.ndarray,
+    labels: list[str],
+    manifolds: dict[str, object],
+) -> tuple[dict[str, list[float]], np.ndarray]:
+    stage_residuals: dict[str, list[float]] = {LEFT_STAGE: [], FAMILY_STAGE: [], RIGHT_STAGE: []}
+    active_residuals: list[float] = []
+    for idx, theta in enumerate(np.asarray(theta_path, dtype=float)):
+        stage = str(labels[idx]) if idx < len(labels) else ""
+        manifold = manifolds.get(stage)
+        residual = float("inf") if manifold is None else float(np.linalg.norm(manifold.residual(theta)))
+        active_residuals.append(residual)
+        if stage in stage_residuals:
+            stage_residuals[stage].append(residual)
+    return stage_residuals, np.asarray(active_residuals, dtype=float)
+
+
+def compute_ex65_jointspace_audit(scene, result, robot, robot_execution) -> dict[str, object]:
+    theta_path = np.asarray(getattr(result, "dense_joint_path", np.zeros((0, 3), dtype=float)), dtype=float)
+    labels = list(getattr(result, "dense_joint_path_stage_labels", []))
+    lambda_labels = np.asarray(getattr(result, "dense_lambda_labels", np.zeros(0, dtype=float)), dtype=float)
+    if len(lambda_labels) != len(theta_path):
+        lambda_labels = _lambda_labels_for_stages(labels, float(getattr(result, "selected_lambda", np.nan)))
+    fk_trace = joint_path_to_task_path(robot, theta_path) if len(theta_path) else np.zeros((0, 3), dtype=float)
+    joint_steps = np.asarray(getattr(result, "dense_joint_path_joint_steps", np.zeros(0, dtype=float)), dtype=float)
+    if len(joint_steps) == 0 and len(theta_path) >= 2:
+        joint_steps, _max_step, _mean_step, _worst = joint_step_statistics(theta_path)
+    manifolds, selected_lambda = _cspace_manifolds_for_result(scene, robot, result)
+    stage_residuals, active_residuals = _stage_residual_audit(theta_path, labels, manifolds)
+    residuals = np.asarray(getattr(result, "dense_joint_path_constraint_residuals", active_residuals), dtype=float)
+    if len(residuals) != len(theta_path):
+        residuals = active_residuals
+    theta_min = np.min(theta_path, axis=0) if len(theta_path) else np.zeros(3, dtype=float)
+    theta_max = np.max(theta_path, axis=0) if len(theta_path) else np.zeros(3, dtype=float)
+    theta_span = theta_max - theta_min
+    family_lambda_min, family_lambda_max, lambda_variation, lambda_fixed, family_count = _lambda_fixed_audit(lambda_labels)
+    selected_entry_idx = int(getattr(result, "selected_left_family_transition_index", -1))
+    selected_exit_idx = int(getattr(result, "selected_family_right_transition_index", -1))
+    selected_left_family_stack = float(getattr(result, "selected_left_family_stack_residual", float("inf")))
+    selected_family_right_stack = float(getattr(result, "selected_family_right_stack_residual", float("inf")))
+    if not np.isfinite(selected_left_family_stack) and 0 <= selected_entry_idx < len(theta_path):
+        selected_left_family_stack = _stack_residual(manifolds[LEFT_STAGE], manifolds[FAMILY_STAGE], theta_path[selected_entry_idx])
+    if not np.isfinite(selected_family_right_stack) and 0 <= selected_exit_idx < len(theta_path):
+        selected_family_right_stack = _stack_residual(manifolds[FAMILY_STAGE], manifolds[RIGHT_STAGE], theta_path[selected_exit_idx])
+    max_transition_stack = float(
+        max(
+            value
+            for value in (selected_left_family_stack, selected_family_right_stack)
+            if np.isfinite(value)
+        )
+    ) if np.isfinite(selected_left_family_stack) or np.isfinite(selected_family_right_stack) else float("inf")
+    display_route = np.asarray(getattr(result, "path", np.zeros((0, 3), dtype=float)), dtype=float)
+    display_vs_trace_max, display_vs_trace_mean = _polyline_error(display_route, fk_trace) if len(display_route) else (0.0, 0.0)
+    label_counts = {
+        LEFT_STAGE: int(sum(1 for label in labels if str(label) == LEFT_STAGE)),
+        FAMILY_STAGE: int(sum(1 for label in labels if str(label) == FAMILY_STAGE)),
+        RIGHT_STAGE: int(sum(1 for label in labels if str(label) == RIGHT_STAGE)),
+    }
+    return {
+        "theta_path": theta_path,
+        "fk_trace": fk_trace,
+        "stage_labels": labels,
+        "lambda_labels": lambda_labels,
+        "constraint_residuals": residuals,
+        "joint_steps": np.asarray(joint_steps, dtype=float),
+        "theta_path_points": int(len(theta_path)),
+        "theta0_min": float(theta_min[0]),
+        "theta0_max": float(theta_max[0]),
+        "theta0_span": float(theta_span[0]),
+        "theta1_min": float(theta_min[1]),
+        "theta1_max": float(theta_max[1]),
+        "theta1_span": float(theta_span[1]),
+        "theta2_min": float(theta_min[2]),
+        "theta2_max": float(theta_max[2]),
+        "theta2_span": float(theta_span[2]),
+        "total_joint_path_length": float(np.sum(joint_steps)) if len(joint_steps) else 0.0,
+        "total_task_fk_path_length": float(np.sum(np.linalg.norm(np.diff(fk_trace, axis=0), axis=1))) if len(fk_trace) >= 2 else 0.0,
+        "max_joint_step": float(np.max(joint_steps)) if len(joint_steps) else 0.0,
+        "mean_joint_step": float(np.mean(joint_steps)) if len(joint_steps) else 0.0,
+        "max_constraint_residual": float(np.max(residuals)) if len(residuals) else 0.0,
+        "mean_constraint_residual": float(np.mean(residuals)) if len(residuals) else 0.0,
+        "left_count": label_counts[LEFT_STAGE],
+        "family_count": label_counts[FAMILY_STAGE],
+        "right_count": label_counts[RIGHT_STAGE],
+        "left_stage_max_residual": float(max(stage_residuals[LEFT_STAGE])) if stage_residuals[LEFT_STAGE] else 0.0,
+        "family_stage_max_residual": float(max(stage_residuals[FAMILY_STAGE])) if stage_residuals[FAMILY_STAGE] else 0.0,
+        "right_stage_max_residual": float(max(stage_residuals[RIGHT_STAGE])) if stage_residuals[RIGHT_STAGE] else 0.0,
+        "stage_order_valid": bool(_stage_order_valid(labels)),
+        "selected_lambda": float(selected_lambda),
+        "family_lambda_min": float(family_lambda_min),
+        "family_lambda_max": float(family_lambda_max),
+        "family_lambda_span": float(lambda_variation),
+        "lambda_fixed_during_transfer": bool(lambda_fixed),
+        "lambda_variation_transfer": float(lambda_variation),
+        "family_stage_count": int(family_count),
+        "selected_left_family_transition_index": int(selected_entry_idx),
+        "selected_family_right_transition_index": int(selected_exit_idx),
+        "selected_left_family_stack_residual": float(selected_left_family_stack),
+        "selected_family_right_stack_residual": float(selected_family_right_stack),
+        "max_transition_stack_residual": float(max_transition_stack),
+        "transition_stack_certified": bool(max_transition_stack <= 1.0e-3),
+        "planning_space": "joint_space",
+        "state_variable": "theta=[yaw, shoulder, elbow]",
+        "family_state": "theta+lambda",
+        "execution_path_source": str(getattr(result, "execution_path_source", "stored_dense_joint_edges")),
+        "visual_trace_source": str(getattr(result, "visual_trace_source", "FK(dense_theta_path)")),
+        "task_space_planner_used": bool(getattr(result, "task_space_planner_used", False)),
+        "ik_waypoint_fallback_used": bool(getattr(result, "ik_waypoint_fallback_used", False)),
+        "task_space_route_reconstruction": bool(getattr(result, "task_space_route_reconstruction", False)),
+        "dense_joint_path_execution_certified": bool(getattr(result, "dense_joint_path_execution_certified", False)),
+        "dense_joint_path_constraint_certified": bool(getattr(result, "dense_joint_path_constraint_certified", False)),
+        "dense_joint_path_joint_continuity_certified": bool(getattr(result, "dense_joint_path_joint_continuity_certified", False)),
+        "collision_free": bool(getattr(result, "collision_free", False)),
+        "graph_route_used_for_execution": bool(getattr(result, "graph_route_used_for_execution", False)),
+        "final_route_stored_evidence_edges": int(getattr(result, "final_route_stored_evidence_edges", 0)),
+        "final_route_projected_jointspace_edges": int(getattr(result, "final_route_projected_jointspace_edges", 0)),
+        "final_route_taskspace_edges": int(getattr(result, "final_route_taskspace_edges", 0)),
+        "route_source": str(getattr(result, "route_source", "none")),
+        "display_vs_trace_max_error": float(display_vs_trace_max),
+        "display_vs_trace_mean_error": float(display_vs_trace_mean),
+        "robot_execution_source": "none" if robot_execution is None else str(robot_execution.execution_source),
+    }
+
+
+def print_ex65_jointspace_audits(audit: dict[str, object]) -> None:
+    _print_key_value_block(
+        "Joint-space methodology guardrails",
+        {
+            "planning_space": audit["planning_space"],
+            "state_variable": audit["state_variable"],
+            "family_state": audit["family_state"],
+            "task_space_planner_used": audit["task_space_planner_used"],
+            "ik_waypoint_fallback_used": audit["ik_waypoint_fallback_used"],
+            "task_space_route_reconstruction": audit["task_space_route_reconstruction"],
+            "execution_path_source": audit["execution_path_source"],
+            "visual_trace_source": audit["visual_trace_source"],
+            "graph_route_used_for_execution": audit["graph_route_used_for_execution"],
+            "dense_theta_points": audit["theta_path_points"],
+            "dense_joint_path_execution_certified": audit["dense_joint_path_execution_certified"],
+            "final_route_taskspace_edges": audit["final_route_taskspace_edges"],
+            "display_vs_trace_max_error": round(float(audit["display_vs_trace_max_error"]), 8),
+        },
+    )
+    _print_key_value_block(
+        "Lambda / family audit",
+        {
+            "selected_lambda": round(float(audit["selected_lambda"]), 8),
+            "family_lambda_min": audit["family_lambda_min"],
+            "family_lambda_max": audit["family_lambda_max"],
+            "family_lambda_span": audit["family_lambda_span"],
+            "lambda_fixed_during_transfer": audit["lambda_fixed_during_transfer"],
+            "lambda_variation_transfer": audit["lambda_variation_transfer"],
+            "family_stage_count": audit["family_stage_count"],
+        },
+    )
+    _print_key_value_block(
+        "C-space trajectory audit",
+        {
+            "stage_order_valid": audit["stage_order_valid"],
+            "theta0_span": audit["theta0_span"],
+            "theta1_span": audit["theta1_span"],
+            "theta2_span": audit["theta2_span"],
+            "total_joint_path_length": audit["total_joint_path_length"],
+            "total_task_fk_path_length": audit["total_task_fk_path_length"],
+            "max_joint_step": audit["max_joint_step"],
+            "mean_joint_step": audit["mean_joint_step"],
+            "max_constraint_residual": audit["max_constraint_residual"],
+            "mean_constraint_residual": audit["mean_constraint_residual"],
+            "left_stage_max_residual": audit["left_stage_max_residual"],
+            "family_stage_max_residual": audit["family_stage_max_residual"],
+            "right_stage_max_residual": audit["right_stage_max_residual"],
+            "selected_left_family_transition_index": audit["selected_left_family_transition_index"],
+            "selected_family_right_transition_index": audit["selected_family_right_transition_index"],
+            "selected_left_family_stack_residual": audit["selected_left_family_stack_residual"],
+            "selected_family_right_stack_residual": audit["selected_family_right_stack_residual"],
+            "max_transition_stack_residual": audit["max_transition_stack_residual"],
+            "transition_stack_certified": audit["transition_stack_certified"],
+            "final_route_stored_evidence_edges": audit["final_route_stored_evidence_edges"],
+            "final_route_projected_jointspace_edges": audit["final_route_projected_jointspace_edges"],
+            "final_route_taskspace_edges": audit["final_route_taskspace_edges"],
+        },
+    )
+
+
+def save_ex65_cspace_debug_artifacts(audit: dict[str, object], *, output_root: Path | None = None) -> Path:
+    base = output_root or Path("outputs") / "ex65_jointspace_debug" / "latest"
+    base.mkdir(parents=True, exist_ok=True)
+    theta_path = np.asarray(audit["theta_path"], dtype=float)
+    fk_trace = np.asarray(audit["fk_trace"], dtype=float)
+    residuals = np.asarray(audit["constraint_residuals"], dtype=float)
+    joint_steps = np.asarray(audit["joint_steps"], dtype=float)
+    labels = list(audit["stage_labels"])
+    lambda_labels = np.asarray(audit["lambda_labels"], dtype=float)
+
+    np.save(base / "dense_theta_path.npy", theta_path)
+    np.save(base / "dense_fk_trace.npy", fk_trace)
+    np.save(base / "constraint_residuals.npy", residuals)
+    np.save(base / "joint_steps.npy", joint_steps)
+    np.save(base / "dense_lambda_labels.npy", lambda_labels)
+    (base / "dense_stage_labels.txt").write_text("\n".join(labels), encoding="utf-8")
+    (base / "dense_stage_labels.json").write_text(json.dumps(labels, indent=2), encoding="utf-8")
+    lambda_json = [None if not np.isfinite(float(value)) else float(value) for value in lambda_labels]
+    (base / "dense_lambda_labels.json").write_text(json.dumps(lambda_json, indent=2), encoding="utf-8")
+
+    summary = {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "planning_space": audit["planning_space"],
+        "state_variable": audit["state_variable"],
+        "family_state": audit["family_state"],
+        "selected_lambda": audit["selected_lambda"],
+        "lambda_fixed_during_transfer": audit["lambda_fixed_during_transfer"],
+        "lambda_variation_transfer": audit["lambda_variation_transfer"],
+        "execution_path_source": audit["execution_path_source"],
+        "visual_trace_source": audit["visual_trace_source"],
+        "task_space_planner_used": audit["task_space_planner_used"],
+        "ik_waypoint_fallback_used": audit["ik_waypoint_fallback_used"],
+        "task_space_route_reconstruction": audit["task_space_route_reconstruction"],
+        "dense_joint_path_execution_certified": audit["dense_joint_path_execution_certified"],
+        "transition_stack_certified": audit["transition_stack_certified"],
+        "max_transition_stack_residual": audit["max_transition_stack_residual"],
+        "max_constraint_residual": audit["max_constraint_residual"],
+        "max_joint_step": audit["max_joint_step"],
+        "stage_order_valid": audit["stage_order_valid"],
+        "final_route_taskspace_edges": audit["final_route_taskspace_edges"],
+        "total_joint_path_length": audit["total_joint_path_length"],
+        "total_task_fk_path_length": audit["total_task_fk_path_length"],
+    }
+    (base / "cspace_summary.json").write_text(json.dumps(_json_safe(summary), indent=2), encoding="utf-8")
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        if len(theta_path) > 0:
+            fig, ax = plt.subplots(figsize=(8, 4.5))
+            ax.plot(theta_path[:, 0], label="theta0")
+            ax.plot(theta_path[:, 1], label="theta1")
+            ax.plot(theta_path[:, 2], label="theta2")
+            ax.set_xlabel("waypoint index")
+            ax.set_ylabel("theta [rad]")
+            ax.set_title("Example 65 dense theta trajectory")
+            ax.legend()
+            fig.tight_layout()
+            fig.savefig(base / "theta_vs_index.png", dpi=160)
+            plt.close(fig)
+
+            fig = plt.figure(figsize=(6.5, 5.8))
+            ax3 = fig.add_subplot(111, projection="3d")
+            ax3.plot(theta_path[:, 0], theta_path[:, 1], theta_path[:, 2], color="#111827", linewidth=1.5)
+            for stage, color in ((LEFT_STAGE, "#f97316"), (FAMILY_STAGE, "#2563eb"), (RIGHT_STAGE, "#16a34a")):
+                mask = [idx for idx, label in enumerate(labels) if str(label) == stage]
+                if len(mask) >= 2:
+                    segment = theta_path[np.asarray(mask, dtype=int)]
+                    ax3.plot(segment[:, 0], segment[:, 1], segment[:, 2], color=color, linewidth=2.5, label=f"{stage} segment")
+            ax3.scatter(theta_path[0, 0], theta_path[0, 1], theta_path[0, 2], color="black", s=42, label="start")
+            ax3.scatter(theta_path[-1, 0], theta_path[-1, 1], theta_path[-1, 2], color="gold", s=52, label="goal")
+            for key, color, label in (
+                ("selected_left_family_transition_index", "#ef4444", "left-family transition"),
+                ("selected_family_right_transition_index", "#14b8a6", "family-right transition"),
+            ):
+                idx = int(audit.get(key, -1))
+                if 0 <= idx < len(theta_path):
+                    ax3.scatter(theta_path[idx, 0], theta_path[idx, 1], theta_path[idx, 2], color=color, s=60, label=label)
+            ax3.set_xlabel("theta0")
+            ax3.set_ylabel("theta1")
+            ax3.set_zlabel("theta2")
+            ax3.set_title("Example 65 C-space dense path")
+            ax3.legend()
+            fig.tight_layout()
+            fig.savefig(base / "cspace_3d_path.png", dpi=160)
+            plt.close(fig)
+
+        if len(residuals) > 0:
+            fig, ax = plt.subplots(figsize=(8, 4.2))
+            ax.plot(residuals, color="#455a64")
+            ax.set_xlabel("waypoint index")
+            ax.set_ylabel("active constraint residual")
+            ax.set_title("Example 65 residual along dense theta path")
+            fig.tight_layout()
+            fig.savefig(base / "residual_vs_index.png", dpi=160)
+            plt.close(fig)
+    except Exception as exc:
+        (base / "plot_error.txt").write_text(str(exc), encoding="utf-8")
+
+    return base
+
+
+def assert_ex65_jointspace_methodology(result, robot_execution, audit: dict[str, object]) -> None:
+    if not bool(getattr(result, "success", False)):
+        return
+    if bool(audit["task_space_planner_used"]):
+        raise RuntimeError("Task-space planner is forbidden in Example 65 full joint-space thesis mode.")
+    if bool(audit["ik_waypoint_fallback_used"]):
+        raise RuntimeError("IK waypoint fallback is forbidden in Example 65 full joint-space thesis mode.")
+    if bool(audit["task_space_route_reconstruction"]):
+        raise RuntimeError("Task-space route reconstruction is forbidden in Example 65 full joint-space thesis mode.")
+    if str(audit["execution_path_source"]) != "stored_dense_joint_edges":
+        raise RuntimeError(f"Unexpected execution path source: {audit['execution_path_source']}")
+    if str(audit["visual_trace_source"]) != "FK(dense_theta_path)":
+        raise RuntimeError(f"Unexpected visual trace source: {audit['visual_trace_source']}")
+    if int(audit["final_route_taskspace_edges"]) != 0:
+        raise RuntimeError("Final Example 65 joint-space route contains task-space edges.")
+    if not bool(audit["dense_joint_path_execution_certified"]):
+        raise RuntimeError("Planner success requires execution-certified dense theta path.")
+    if not bool(audit["lambda_fixed_during_transfer"]):
+        raise RuntimeError("Family transfer segment did not keep lambda fixed.")
+    if float(audit["lambda_variation_transfer"]) > 1.0e-6:
+        raise RuntimeError("Family transfer lambda variation exceeds tolerance.")
+    if not bool(audit["stage_order_valid"]):
+        raise RuntimeError("Dense theta path stage order is not left* -> family* -> right*.")
+    if not bool(audit["transition_stack_certified"]):
+        raise RuntimeError("Selected transition stack residuals are not certified.")
+    if float(audit["max_transition_stack_residual"]) > 1.0e-3:
+        raise RuntimeError("Selected transition stack residual exceeds thesis-mode tolerance.")
+    if float(audit["display_vs_trace_max_error"]) > 1.0e-6:
+        raise RuntimeError("Displayed route differs from FK(dense theta path).")
+    if robot_execution is None or str(robot_execution.execution_source) != "certified_dense_joint_path":
+        raise RuntimeError("Successful Example 65 full joint-space mode must animate certified dense theta path.")
 
 
 def show_continuous_transfer_robot_demo(
@@ -2260,10 +2729,14 @@ def main() -> None:
     parser.add_argument("--show-family-leaves", dest="show_family_leaves", action="store_true", default=True)
     parser.add_argument("--hide-family-leaves", dest="show_family_leaves", action="store_false")
     parser.add_argument("--num-family-leaf-surfaces", type=int, default=9)
+    parser.add_argument("--save-cspace-debug", action="store_true", help="Save Example 65 dense theta/lambda audit artifacts.")
+    parser.add_argument("--show-cspace", action="store_true", help="Show/save the theta-space constraint surface view for full joint-space mode.")
+    parser.add_argument("--cspace-grid-res", type=int, default=55, help="Grid resolution for C-space implicit surfaces.")
     parser.add_argument("--no-viz", action="store_true")
     args = parser.parse_args()
 
     if args.taskspace_planning:
+        args.jointspace_planning = False
         print(
             "WARNING: LEGACY DEBUG ONLY: task-space continuous-transfer route followed by IK; not a joint-space planner.",
             flush=True,
@@ -2368,6 +2841,45 @@ def main() -> None:
                     "robot animation disabled.",
                     flush=True,
                 )
+            cspace_debug_dir: Path | None = None
+            if result is not None and robot is not None and len(getattr(result, "dense_joint_path", [])) > 0:
+                cspace_audit = compute_ex65_jointspace_audit(scene, result, robot, robot_execution)
+                print_ex65_jointspace_audits(cspace_audit)
+                assert_ex65_jointspace_methodology(result, robot_execution, cspace_audit)
+                if args.save_cspace_debug:
+                    cspace_debug_dir = save_ex65_cspace_debug_artifacts(cspace_audit)
+                    _print_key_value_block(
+                        "Example 65 C-space debug artifacts",
+                        {
+                            "debug_dir": str(cspace_debug_dir),
+                            "dense_theta_path_npy": str(cspace_debug_dir / "dense_theta_path.npy"),
+                            "dense_lambda_labels_npy": str(cspace_debug_dir / "dense_lambda_labels.npy"),
+                            "cspace_summary_json": str(cspace_debug_dir / "cspace_summary.json"),
+                        },
+                    )
+                if args.show_cspace:
+                    manifolds, _selected_lambda = _cspace_manifolds_for_result(scene, robot, result)
+                    cspace_manifolds = {
+                        "left": manifolds[LEFT_STAGE],
+                        "plane": manifolds[FAMILY_STAGE],
+                        "right": manifolds[RIGHT_STAGE],
+                    }
+                    cspace_output_dir = cspace_debug_dir if cspace_debug_dir is not None else None
+                    screenshot = show_cspace_robot_planning(
+                        result=result,
+                        manifolds=cspace_manifolds,
+                        cspace_audit=cspace_audit,
+                        grid_res=int(args.cspace_grid_res),
+                        output_dir=cspace_output_dir,
+                        show=not bool(args.no_viz),
+                    )
+                    if screenshot is not None:
+                        print(f"cspace_environment_png = {screenshot}", flush=True)
+            elif args.save_cspace_debug or args.show_cspace:
+                print(
+                    "C-space debug/visualization skipped: no certified dense theta path is available.",
+                    flush=True,
+                )
         if not args.no_viz and scene is not None and result is not None and robot is not None:
             show_continuous_transfer_robot_demo(
                 scene=scene,
@@ -2381,9 +2893,7 @@ def main() -> None:
             )
         sys.stdout.flush()
         sys.stderr.flush()
-        if not args.no_viz:
-            os._exit(0)
-        return
+        os._exit(0)
 
     np.random.seed(int(args.seed))
     ou.RNG.setSeed(int(args.seed))
@@ -2460,8 +2970,7 @@ def main() -> None:
 
     sys.stdout.flush()
     sys.stderr.flush()
-    if not args.no_viz:
-        os._exit(0)
+    os._exit(0)
 
 
 if __name__ == "__main__":

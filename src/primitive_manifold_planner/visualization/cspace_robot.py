@@ -9,6 +9,7 @@ import numpy as np
 STAGE_COLORS = {
     "left": "#f97316",
     "plane": "#2563eb",
+    "family": "#2563eb",
     "right": "#16a34a",
 }
 
@@ -152,6 +153,8 @@ def show_cspace_robot_planning(
     for key, color, label in (
         ("selected_left_plane_transition_index", "#ef4444", "left-plane transition theta"),
         ("selected_plane_right_transition_index", "#14b8a6", "plane-right transition theta"),
+        ("selected_left_family_transition_index", "#ef4444", "left-family transition theta"),
+        ("selected_family_right_transition_index", "#14b8a6", "family-right transition theta"),
     ):
         idx = int(audit.get(key, getattr(result, key, -1)))
         if 0 <= idx < len(theta_path):
@@ -219,6 +222,8 @@ def _save_matplotlib_cspace_fallback(
     for key, color in (
         ("selected_left_plane_transition_index", "#ef4444"),
         ("selected_plane_right_transition_index", "#14b8a6"),
+        ("selected_left_family_transition_index", "#ef4444"),
+        ("selected_family_right_transition_index", "#14b8a6"),
     ):
         idx = int(audit.get(key, -1))
         if 0 <= idx < len(theta_path):
