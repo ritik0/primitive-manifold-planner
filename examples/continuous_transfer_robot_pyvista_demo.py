@@ -2114,6 +2114,10 @@ def _stage_residual_audit(
 
 
 def compute_ex65_jointspace_audit(scene, result, robot, robot_execution) -> dict[str, object]:
+    # TODO(jointspace_method): this example-specific audit now mirrors the
+    # reusable certification/debug utilities in
+    # primitive_manifold_planner.thesis.jointspace_method. Keep behavior stable
+    # here until Example 65 and 66 are migrated together.
     theta_path = np.asarray(getattr(result, "dense_joint_path", np.zeros((0, 3), dtype=float)), dtype=float)
     labels = list(getattr(result, "dense_joint_path_stage_labels", []))
     lambda_labels = np.asarray(getattr(result, "dense_lambda_labels", np.zeros(0, dtype=float)), dtype=float)
@@ -2291,6 +2295,9 @@ def print_ex65_jointspace_audits(audit: dict[str, object]) -> None:
 
 
 def save_ex65_cspace_debug_artifacts(audit: dict[str, object], *, output_root: Path | None = None) -> Path:
+    # TODO(jointspace_method): replace this with the generic
+    # CspaceDebugArtifact/save_cspace_debug_artifacts helper after the examples
+    # share one audit schema.
     base = output_root or Path("outputs") / "ex65_jointspace_debug" / "latest"
     base.mkdir(parents=True, exist_ok=True)
     theta_path = np.asarray(audit["theta_path"], dtype=float)

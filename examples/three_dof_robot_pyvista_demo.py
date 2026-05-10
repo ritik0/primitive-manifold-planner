@@ -869,6 +869,9 @@ def compute_cspace_trajectory_audit(
     robot: SpatialRobot3DOF,
     families,
 ) -> dict[str, object]:
+    # TODO(jointspace_method): this audit should be migrated to the reusable
+    # RouteCertification/CspaceDebugArtifact helpers once Example 65 and 66
+    # share a single thesis-facing audit schema.
     theta_path = np.asarray(getattr(result, "dense_joint_path", np.zeros((0, 3), dtype=float)), dtype=float)
     labels = list(getattr(result, "dense_joint_path_stage_labels", []))
     residuals = np.asarray(getattr(result, "dense_joint_path_constraint_residuals", np.zeros(0, dtype=float)), dtype=float)
@@ -1608,6 +1611,8 @@ def save_cspace_debug_artifacts(
     result: ex66.FixedPlaneRoute,
     output_root: Path | None = None,
 ) -> Path:
+    # TODO(jointspace_method): replace with the generic debug_artifacts helper
+    # after preserving the current Example 66 file names and summary fields.
     base = output_root or Path("outputs") / "ex66_jointspace_debug" / "latest"
     base.mkdir(parents=True, exist_ok=True)
     theta_path = np.asarray(audit["theta_path"], dtype=float)
