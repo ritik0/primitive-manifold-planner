@@ -15,6 +15,7 @@ raw exploration branches.
 import argparse
 from dataclasses import dataclass
 from datetime import datetime
+import heapq
 import json
 import os
 import sys
@@ -178,6 +179,38 @@ class JointspaceRouteRealization:
     final_route_segment_source: str = ""
     final_route_projected_jointspace_edges: int = 0
     final_route_taskspace_edges: int = 0
+    family_segment_source: str = ""
+    family_graph_route_used_for_family_segment: bool = False
+    family_graph_edges_used: int = 0
+    family_graph_query_connectors_used: int = 0
+    family_graph_path_joint_length: float = 0.0
+    family_graph_route_certified: bool = False
+    family_graph_route_lambda_fixed: bool = False
+    family_graph_route_max_residual: float = float("inf")
+    family_graph_route_max_joint_step: float = float("inf")
+    family_graph_route_failure_reason: str = ""
+    family_graph_route_node_ids: list[int] = None
+    family_graph_route_edge_sources: list[str] = None
+    selected_lambda_family_nodes: int = 0
+    selected_lambda_family_edges: int = 0
+    lambda_match_tol: float = 0.0
+
+
+@dataclass
+class RobotFamilyEvidenceEdge:
+    src_node_id: int
+    dst_node_id: int
+    lambda_value: float
+    dense_theta_path: np.ndarray
+    residuals: np.ndarray
+    joint_steps: np.ndarray
+    cost: float
+    certified: bool
+    source: str = "family_evidence_edge"
+    max_residual: float = float("inf")
+    max_joint_step: float = float("inf")
+    collision_free: bool = True
+    message: str = ""
 
 
 @dataclass
@@ -185,7 +218,7 @@ class RobotFamilyLeafStore:
     lambda_value: float
     manifold: RobotPlaneLeafManifold
     nodes: list[np.ndarray]
-    edges: list[tuple[int, int]]
+    edges: list[RobotFamilyEvidenceEdge]
     frontier_ids: list[int]
 
     def add_node(self, q: np.ndarray, dedup_tol: float = 1.0e-4) -> int:
@@ -272,6 +305,25 @@ class FullJointspaceRouteCandidate:
     lambda_reconciliation: str
 
 
+@dataclass
+class FamilyGraphRouteResult:
+    success: bool
+    dense_theta_path: np.ndarray
+    edge_sources: list[str]
+    node_ids: list[int]
+    family_graph_edges_used: int
+    query_connectors_used: int
+    joint_length: float
+    max_residual: float
+    max_joint_step: float
+    certified: bool
+    lambda_fixed: bool
+    selected_lambda_family_nodes: int
+    selected_lambda_family_edges: int
+    lambda_match_tol: float
+    failure_reason: str = ""
+
+
 def _lambda_key(lam: float, digits: int = 6) -> float:
     return round(float(lam), int(digits))
 
@@ -314,10 +366,138 @@ def candidate_lambdas_for_joint_proposal(
     return deduped
 
 
-def _project_joint_to_store(store, q: np.ndarray, counter_prefix: str, counters: dict[str, int]) -> bool:
+def _family_edge_exists(store: RobotFamilyLeafStore, src_node_id: int, dst_node_id: int) -> bool:
+    src = int(src_node_id)
+    dst = int(dst_node_id)
+    return any(
+        {int(edge.src_node_id), int(edge.dst_node_id)} == {src, dst}
+        for edge in store.edges
+    )
+
+
+def _certify_family_edge_path(
+    *,
+    store: RobotFamilyLeafStore,
+    src_node_id: int,
+    dst_node_id: int,
+    dense_theta_path: np.ndarray,
+    joint_max_step: float,
+    collision_fn=None,
+    source: str = "family_evidence_edge",
+    constraint_tol: float = 2.0e-3,
+) -> RobotFamilyEvidenceEdge:
+    path = np.asarray(dense_theta_path, dtype=float).reshape((-1, 3))
+    residual_values: list[float] = []
+    collision_free = True
+    leaf_ok = bool(len(path) >= 2)
+    for theta in path:
+        residual = float(np.linalg.norm(store.manifold.residual(theta)))
+        within = bool(store.manifold.within_bounds(theta, tol=float(constraint_tol)))
+        if not within:
+            residual = max(residual, 10.0 * float(constraint_tol))
+            leaf_ok = False
+        if collision_fn is not None and bool(collision_fn(theta)):
+            residual = max(residual, 100.0 * float(constraint_tol))
+            collision_free = False
+        residual_values.append(float(residual))
+    residuals = np.asarray(residual_values, dtype=float)
+    joint_steps, max_step, _mean_step, _worst_step = joint_step_statistics(path)
+    max_residual = float(np.max(residuals)) if len(residuals) else float("inf")
+    cost = float(np.sum(joint_steps)) if len(joint_steps) else 0.0
+    certified = bool(
+        leaf_ok
+        and collision_free
+        and max_residual <= float(constraint_tol)
+        and float(max_step) <= float(joint_max_step) + 1.0e-9
+    )
+    return RobotFamilyEvidenceEdge(
+        src_node_id=int(src_node_id),
+        dst_node_id=int(dst_node_id),
+        lambda_value=float(store.lambda_value),
+        dense_theta_path=path,
+        residuals=residuals,
+        joint_steps=np.asarray(joint_steps, dtype=float),
+        cost=cost,
+        certified=bool(certified),
+        source=str(source),
+        max_residual=max_residual,
+        max_joint_step=float(max_step),
+        collision_free=bool(collision_free),
+        message="certified" if certified else "family edge certification failed",
+    )
+
+
+def _try_store_family_evidence_edges(
+    *,
+    store: RobotFamilyLeafStore,
+    node_id: int,
+    previous_nodes: list[np.ndarray],
+    joint_max_step: float,
+    counters: dict[str, int],
+    collision_fn=None,
+    max_neighbors: int = 3,
+) -> None:
+    if int(node_id) < 0 or int(node_id) >= len(store.nodes) or not previous_nodes:
+        return
+    q_new = np.asarray(store.nodes[int(node_id)], dtype=float)
+    distances = [
+        (float(np.linalg.norm(wrap_joint_angles(q_new - np.asarray(q, dtype=float)))), int(idx))
+        for idx, q in enumerate(previous_nodes)
+    ]
+    distances.sort(key=lambda item: item[0])
+    for _distance, src_id in distances[: max(1, int(max_neighbors))]:
+        if int(src_id) == int(node_id) or _family_edge_exists(store, int(src_id), int(node_id)):
+            continue
+        result = explore_joint_manifold(
+            store.manifold,
+            np.asarray(store.nodes[int(src_id)], dtype=float),
+            q_new,
+            max_step=float(joint_max_step),
+            projection_tol=1.0e-6,
+            collision_fn=collision_fn,
+            local_max_joint_step=float(joint_max_step),
+        )
+        if not result.success:
+            counters["family_evidence_edges_rejected"] = int(counters.get("family_evidence_edges_rejected", 0)) + 1
+            continue
+        edge = _certify_family_edge_path(
+            store=store,
+            src_node_id=int(src_id),
+            dst_node_id=int(node_id),
+            dense_theta_path=np.asarray(result.path, dtype=float),
+            joint_max_step=float(joint_max_step),
+            collision_fn=collision_fn,
+            source="family_evidence_edge",
+        )
+        if edge.certified:
+            store.edges.append(edge)
+            counters["family_evidence_edges_certified"] = int(counters.get("family_evidence_edges_certified", 0)) + 1
+        else:
+            counters["family_evidence_edges_rejected"] = int(counters.get("family_evidence_edges_rejected", 0)) + 1
+
+
+def _project_joint_to_store(
+    store,
+    q: np.ndarray,
+    counter_prefix: str,
+    counters: dict[str, int],
+    *,
+    joint_max_step: float | None = None,
+    collision_fn=None,
+) -> bool:
     projection = store.manifold.project(q, tol=1.0e-6, max_iters=100)
     if projection.success and bool(store.manifold.within_bounds(projection.x_projected, tol=2.0e-3)):
-        store.add_node(np.asarray(projection.x_projected, dtype=float))
+        previous_nodes = [np.asarray(node, dtype=float) for node in getattr(store, "nodes", [])]
+        node_id = store.add_node(np.asarray(projection.x_projected, dtype=float))
+        if isinstance(store, RobotFamilyLeafStore) and joint_max_step is not None:
+            _try_store_family_evidence_edges(
+                store=store,
+                node_id=int(node_id),
+                previous_nodes=previous_nodes,
+                joint_max_step=float(joint_max_step),
+                counters=counters,
+                collision_fn=collision_fn,
+            )
         counters[f"projected_to_{counter_prefix}_count"] = int(counters.get(f"projected_to_{counter_prefix}_count", 0)) + 1
         return True
     counters[f"{counter_prefix}_projection_failure_count"] = int(counters.get(f"{counter_prefix}_projection_failure_count", 0)) + 1
@@ -330,6 +510,9 @@ def project_joint_proposal_to_supports(
     robot,
     families,
     scene_lambdas: list[float],
+    *,
+    joint_max_step: float | None = None,
+    collision_fn=None,
 ) -> None:
     _left_family, transfer_family, _right_family = families
     counters = evidence.counters
@@ -343,7 +526,14 @@ def project_joint_proposal_to_supports(
         counters["family_projection_failure_count"] = int(counters.get("family_projection_failure_count", 0)) + 1
     for lam in candidate_lambdas:
         store = evidence.get_or_create_family_store(robot, transfer_family, float(lam))
-        _project_joint_to_store(store, q, "family", counters)
+        _project_joint_to_store(
+            store,
+            q,
+            "family",
+            counters,
+            joint_max_step=joint_max_step,
+            collision_fn=collision_fn,
+        )
 
 
 def _record_failure(reasons: dict[str, int], message: str) -> None:
@@ -1289,16 +1479,336 @@ def _build_full_jointspace_route_candidates(
     return candidates, counters
 
 
+def _selected_lambda_family_store(
+    evidence: RobotJointspaceContinuousEvidence,
+    selected_lambda: float,
+    lambda_match_tol: float,
+) -> RobotFamilyLeafStore | None:
+    compatible = [
+        store
+        for lam, store in evidence.family_leaf_stores.items()
+        if abs(float(lam) - float(selected_lambda)) <= float(lambda_match_tol)
+    ]
+    if not compatible:
+        return None
+    compatible.sort(key=lambda store: abs(float(store.lambda_value) - float(selected_lambda)))
+    return compatible[0]
+
+
+def _nearest_family_node_ids(store: RobotFamilyLeafStore, q: np.ndarray, *, preferred: int = -1, limit: int = 12) -> list[int]:
+    query = np.asarray(q, dtype=float).reshape(3)
+    ranked = [
+        (float(np.linalg.norm(wrap_joint_angles(query - np.asarray(node, dtype=float)))), int(idx))
+        for idx, node in enumerate(store.nodes)
+    ]
+    ranked.sort(key=lambda item: item[0])
+    ids: list[int] = []
+    if 0 <= int(preferred) < len(store.nodes):
+        ids.append(int(preferred))
+    for _distance, node_id in ranked:
+        if int(node_id) not in ids:
+            ids.append(int(node_id))
+        if len(ids) >= int(limit):
+            break
+    return ids
+
+
+def _build_family_query_connectors(
+    *,
+    store: RobotFamilyLeafStore,
+    query_q: np.ndarray,
+    query_node_id: int,
+    neighbor_ids: list[int],
+    joint_max_step: float,
+    direction: str,
+    collision_fn=None,
+) -> list[RobotFamilyEvidenceEdge]:
+    connectors: list[RobotFamilyEvidenceEdge] = []
+    for node_id in neighbor_ids:
+        node_q = np.asarray(store.nodes[int(node_id)], dtype=float)
+        if str(direction) == "entry":
+            src_id, dst_id = int(query_node_id), int(node_id)
+            q0, q1 = np.asarray(query_q, dtype=float), node_q
+        else:
+            src_id, dst_id = int(node_id), int(query_node_id)
+            q0, q1 = node_q, np.asarray(query_q, dtype=float)
+        result = explore_joint_manifold(
+            store.manifold,
+            q0,
+            q1,
+            max_step=float(joint_max_step),
+            projection_tol=1.0e-6,
+            collision_fn=collision_fn,
+            local_max_joint_step=float(joint_max_step),
+        )
+        if not result.success:
+            continue
+        edge = _certify_family_edge_path(
+            store=store,
+            src_node_id=src_id,
+            dst_node_id=dst_id,
+            dense_theta_path=np.asarray(result.path, dtype=float),
+            joint_max_step=float(joint_max_step),
+            collision_fn=collision_fn,
+            source="family_graph_query_connector",
+        )
+        if edge.certified:
+            connectors.append(edge)
+    return connectors
+
+
+def _dijkstra_family_edges(
+    *,
+    node_count: int,
+    edges: list[RobotFamilyEvidenceEdge],
+    start_node_id: int,
+    goal_node_id: int,
+) -> tuple[list[int], list[tuple[RobotFamilyEvidenceEdge, bool]]]:
+    adjacency: dict[int, list[tuple[int, float, int, bool]]] = {idx: [] for idx in range(int(node_count))}
+    for edge_idx, edge in enumerate(edges):
+        src = int(edge.src_node_id)
+        dst = int(edge.dst_node_id)
+        if src not in adjacency or dst not in adjacency:
+            continue
+        cost = float(edge.cost)
+        adjacency[src].append((dst, cost, int(edge_idx), False))
+        adjacency[dst].append((src, cost, int(edge_idx), True))
+    heap: list[tuple[float, int]] = [(0.0, int(start_node_id))]
+    distances = {int(start_node_id): 0.0}
+    parent: dict[int, tuple[int, int, bool]] = {}
+    visited: set[int] = set()
+    while heap:
+        cost, node = heapq.heappop(heap)
+        if node in visited:
+            continue
+        visited.add(node)
+        if node == int(goal_node_id):
+            break
+        for next_node, edge_cost, edge_idx, reversed_edge in adjacency.get(node, []):
+            new_cost = float(cost) + float(edge_cost)
+            if new_cost + 1.0e-12 < float(distances.get(int(next_node), float("inf"))):
+                distances[int(next_node)] = new_cost
+                parent[int(next_node)] = (int(node), int(edge_idx), bool(reversed_edge))
+                heapq.heappush(heap, (new_cost, int(next_node)))
+    if int(goal_node_id) not in distances:
+        return [], []
+    nodes = [int(goal_node_id)]
+    edge_refs: list[tuple[RobotFamilyEvidenceEdge, bool]] = []
+    current = int(goal_node_id)
+    while current != int(start_node_id):
+        prev, edge_idx, reversed_edge = parent[current]
+        edge_refs.append((edges[int(edge_idx)], bool(reversed_edge)))
+        nodes.append(int(prev))
+        current = int(prev)
+    nodes.reverse()
+    edge_refs.reverse()
+    return nodes, edge_refs
+
+
+def extract_selected_lambda_family_graph_route(
+    *,
+    evidence: RobotJointspaceContinuousEvidence,
+    candidate: FullJointspaceRouteCandidate,
+    joint_max_step: float,
+    lambda_match_tol: float = 1.0e-6,
+    collision_fn=None,
+) -> FamilyGraphRouteResult:
+    selected_lambda = float(candidate.selected_lambda)
+    store = _selected_lambda_family_store(evidence, selected_lambda, float(lambda_match_tol))
+    if store is None:
+        return FamilyGraphRouteResult(
+            success=False,
+            dense_theta_path=np.zeros((0, 3), dtype=float),
+            edge_sources=[],
+            node_ids=[],
+            family_graph_edges_used=0,
+            query_connectors_used=0,
+            joint_length=0.0,
+            max_residual=float("inf"),
+            max_joint_step=float("inf"),
+            certified=False,
+            lambda_fixed=False,
+            selected_lambda_family_nodes=0,
+            selected_lambda_family_edges=0,
+            lambda_match_tol=float(lambda_match_tol),
+            failure_reason="family_graph_no_selected_lambda_edges",
+        )
+    evidence_edges = [
+        edge
+        for edge in store.edges
+        if bool(edge.certified) and abs(float(edge.lambda_value) - selected_lambda) <= float(lambda_match_tol)
+    ]
+    selected_nodes = int(len(store.nodes))
+    selected_edges = int(len(evidence_edges))
+    if selected_nodes == 0 or selected_edges == 0:
+        return FamilyGraphRouteResult(
+            success=False,
+            dense_theta_path=np.zeros((0, 3), dtype=float),
+            edge_sources=[],
+            node_ids=[],
+            family_graph_edges_used=0,
+            query_connectors_used=0,
+            joint_length=0.0,
+            max_residual=float("inf"),
+            max_joint_step=float("inf"),
+            certified=False,
+            lambda_fixed=False,
+            selected_lambda_family_nodes=selected_nodes,
+            selected_lambda_family_edges=selected_edges,
+            lambda_match_tol=float(lambda_match_tol),
+            failure_reason="family_graph_no_selected_lambda_edges",
+        )
+
+    entry_query_id = selected_nodes
+    exit_query_id = selected_nodes + 1
+    entry_neighbors = _nearest_family_node_ids(
+        store,
+        candidate.entry.q,
+        preferred=int(candidate.entry.target_node_id),
+        limit=14,
+    )
+    exit_neighbors = _nearest_family_node_ids(
+        store,
+        candidate.exit.q,
+        preferred=int(candidate.exit.source_node_id),
+        limit=14,
+    )
+    entry_connectors = _build_family_query_connectors(
+        store=store,
+        query_q=np.asarray(candidate.entry.q, dtype=float),
+        query_node_id=int(entry_query_id),
+        neighbor_ids=entry_neighbors,
+        joint_max_step=float(joint_max_step),
+        direction="entry",
+        collision_fn=collision_fn,
+    )
+    exit_connectors = _build_family_query_connectors(
+        store=store,
+        query_q=np.asarray(candidate.exit.q, dtype=float),
+        query_node_id=int(exit_query_id),
+        neighbor_ids=exit_neighbors,
+        joint_max_step=float(joint_max_step),
+        direction="exit",
+        collision_fn=collision_fn,
+    )
+    if not entry_connectors or not exit_connectors:
+        return FamilyGraphRouteResult(
+            success=False,
+            dense_theta_path=np.zeros((0, 3), dtype=float),
+            edge_sources=[],
+            node_ids=[],
+            family_graph_edges_used=0,
+            query_connectors_used=0,
+            joint_length=0.0,
+            max_residual=float("inf"),
+            max_joint_step=float("inf"),
+            certified=False,
+            lambda_fixed=False,
+            selected_lambda_family_nodes=selected_nodes,
+            selected_lambda_family_edges=selected_edges,
+            lambda_match_tol=float(lambda_match_tol),
+            failure_reason="family_graph_query_connection_failed",
+        )
+
+    graph_edges = [*evidence_edges, *entry_connectors, *exit_connectors]
+    node_ids, edge_refs = _dijkstra_family_edges(
+        node_count=selected_nodes + 2,
+        edges=graph_edges,
+        start_node_id=int(entry_query_id),
+        goal_node_id=int(exit_query_id),
+    )
+    if not edge_refs:
+        return FamilyGraphRouteResult(
+            success=False,
+            dense_theta_path=np.zeros((0, 3), dtype=float),
+            edge_sources=[],
+            node_ids=node_ids,
+            family_graph_edges_used=0,
+            query_connectors_used=0,
+            joint_length=0.0,
+            max_residual=float("inf"),
+            max_joint_step=float("inf"),
+            certified=False,
+            lambda_fixed=False,
+            selected_lambda_family_nodes=selected_nodes,
+            selected_lambda_family_edges=selected_edges,
+            lambda_match_tol=float(lambda_match_tol),
+            failure_reason="family_graph_search_failed",
+        )
+
+    path_parts: list[np.ndarray] = []
+    edge_sources: list[str] = []
+    for idx, (edge, reversed_edge) in enumerate(edge_refs):
+        segment = np.asarray(edge.dense_theta_path, dtype=float)
+        if bool(reversed_edge):
+            segment = segment[::-1]
+        if idx > 0:
+            segment = segment[1:]
+        path_parts.append(segment)
+        edge_sources.append(str(edge.source))
+    dense_path = np.vstack(path_parts) if path_parts else np.zeros((0, 3), dtype=float)
+    route_cert = _certify_family_edge_path(
+        store=store,
+        src_node_id=int(entry_query_id),
+        dst_node_id=int(exit_query_id),
+        dense_theta_path=dense_path,
+        joint_max_step=float(joint_max_step),
+        collision_fn=collision_fn,
+        source="selected_lambda_family_evidence_graph_route",
+    )
+    family_edges_used = int(sum(1 for source in edge_sources if source == "family_evidence_edge"))
+    query_connectors_used = int(sum(1 for source in edge_sources if source == "family_graph_query_connector"))
+    lambda_fixed = bool(abs(float(store.lambda_value) - selected_lambda) <= float(lambda_match_tol))
+    if not route_cert.certified or not lambda_fixed or family_edges_used <= 0:
+        return FamilyGraphRouteResult(
+            success=False,
+            dense_theta_path=dense_path,
+            edge_sources=edge_sources,
+            node_ids=node_ids,
+            family_graph_edges_used=family_edges_used,
+            query_connectors_used=query_connectors_used,
+            joint_length=float(route_cert.cost),
+            max_residual=float(route_cert.max_residual),
+            max_joint_step=float(route_cert.max_joint_step),
+            certified=bool(route_cert.certified),
+            lambda_fixed=bool(lambda_fixed),
+            selected_lambda_family_nodes=selected_nodes,
+            selected_lambda_family_edges=selected_edges,
+            lambda_match_tol=float(lambda_match_tol),
+            failure_reason="family_graph_route_certification_failed",
+        )
+    return FamilyGraphRouteResult(
+        success=True,
+        dense_theta_path=dense_path,
+        edge_sources=edge_sources,
+        node_ids=node_ids,
+        family_graph_edges_used=family_edges_used,
+        query_connectors_used=query_connectors_used,
+        joint_length=float(route_cert.cost),
+        max_residual=float(route_cert.max_residual),
+        max_joint_step=float(route_cert.max_joint_step),
+        certified=True,
+        lambda_fixed=bool(lambda_fixed),
+        selected_lambda_family_nodes=selected_nodes,
+        selected_lambda_family_edges=selected_edges,
+        lambda_match_tol=float(lambda_match_tol),
+        failure_reason="",
+    )
+
+
 def realize_full_jointspace_candidate_route(
     *,
     robot,
     families,
+    evidence: RobotJointspaceContinuousEvidence,
     start_q: np.ndarray,
     goal_q: np.ndarray,
     start_task: np.ndarray,
     goal_task: np.ndarray,
     candidate: FullJointspaceRouteCandidate,
     joint_max_step: float,
+    allow_family_local_continuation_fallback: bool = False,
+    lambda_match_tol: float = 1.0e-6,
 ) -> tuple[JointspaceRouteRealization, dict[str, object], str]:
     manifolds = build_robot_manifolds_for_selected_lambda(robot, families, float(candidate.selected_lambda))
     collision_fn = None
@@ -1355,14 +1865,44 @@ def realize_full_jointspace_candidate_route(
     left_path, segment_messages["left_segment"] = _connect_joint_segment(
         LEFT_STAGE, manifolds[LEFT_STAGE], start_q, q_entry, float(joint_max_step), collision_fn=collision_fn
     )
-    family_path, segment_messages["family_segment"] = _connect_joint_segment(
-        FAMILY_STAGE, manifolds[FAMILY_STAGE], q_entry, q_exit, float(joint_max_step), collision_fn=collision_fn
+    family_graph_route = extract_selected_lambda_family_graph_route(
+        evidence=evidence,
+        candidate=candidate,
+        joint_max_step=float(joint_max_step),
+        lambda_match_tol=float(lambda_match_tol),
+        collision_fn=collision_fn,
     )
+    if family_graph_route.success:
+        family_path = np.asarray(family_graph_route.dense_theta_path, dtype=float)
+        segment_messages["family_segment"] = (
+            "selected-lambda family evidence graph route succeeded: "
+            f"family_edges={family_graph_route.family_graph_edges_used}, "
+            f"query_connectors={family_graph_route.query_connectors_used}"
+        )
+        family_segment_source = "selected_lambda_family_evidence_graph"
+    elif bool(allow_family_local_continuation_fallback):
+        family_path, segment_messages["family_segment"] = _connect_joint_segment(
+            FAMILY_STAGE, manifolds[FAMILY_STAGE], q_entry, q_exit, float(joint_max_step), collision_fn=collision_fn
+        )
+        family_segment_source = "fallback_projected_jointspace_continuation"
+        segment_messages["family_graph_route_failure"] = str(family_graph_route.failure_reason)
+    else:
+        family_path = None
+        family_segment_source = "selected_lambda_family_evidence_graph_failed"
+        segment_messages["family_segment"] = (
+            "selected-lambda family evidence graph route failed: "
+            f"{family_graph_route.failure_reason}"
+        )
     right_path, segment_messages["right_segment"] = _connect_joint_segment(
         RIGHT_STAGE, manifolds[RIGHT_STAGE], q_exit, goal_q, float(joint_max_step), collision_fn=collision_fn
     )
 
     if left_path is None or family_path is None or right_path is None:
+        failure = (
+            str(family_graph_route.failure_reason)
+            if family_path is None and family_graph_route.failure_reason
+            else "full joint-space local replan failed during segment planning"
+        )
         return (
             JointspaceRouteRealization(
                 success=False,
@@ -1377,8 +1917,24 @@ def realize_full_jointspace_candidate_route(
                 max_joint_step=float("inf"),
                 mean_joint_step=float("inf"),
                 collision_free=False,
-                message="full joint-space local replan failed during segment planning",
+                message=failure,
                 segment_messages=segment_messages,
+                selected_lambda=float(candidate.selected_lambda),
+                family_segment_source=family_segment_source,
+                family_graph_route_used_for_family_segment=False,
+                family_graph_edges_used=int(family_graph_route.family_graph_edges_used),
+                family_graph_query_connectors_used=int(family_graph_route.query_connectors_used),
+                family_graph_path_joint_length=float(family_graph_route.joint_length),
+                family_graph_route_certified=bool(family_graph_route.certified),
+                family_graph_route_lambda_fixed=bool(family_graph_route.lambda_fixed),
+                family_graph_route_max_residual=float(family_graph_route.max_residual),
+                family_graph_route_max_joint_step=float(family_graph_route.max_joint_step),
+                family_graph_route_failure_reason=str(family_graph_route.failure_reason),
+                family_graph_route_node_ids=list(family_graph_route.node_ids),
+                family_graph_route_edge_sources=list(family_graph_route.edge_sources),
+                selected_lambda_family_nodes=int(family_graph_route.selected_lambda_family_nodes),
+                selected_lambda_family_edges=int(family_graph_route.selected_lambda_family_edges),
+                lambda_match_tol=float(family_graph_route.lambda_match_tol),
             ),
             manifolds,
             lambda_reconciliation,
@@ -1404,11 +1960,18 @@ def realize_full_jointspace_candidate_route(
     stage_order_valid = _stage_order_valid(list(labels))
     route_certified = bool(cert["certified"] and transition_stack_certified and lambda_fixed and stage_order_valid)
     task_path = joint_path_to_task_path(robot, dense_joint_path)
+    family_graph_used = bool(family_graph_route.success)
+    stored_family_edges_used = int(family_graph_route.family_graph_edges_used) if family_graph_used else 0
+    query_connectors_used = int(family_graph_route.query_connectors_used) if family_graph_used else 0
+    projected_jointspace_edges = int(2 + query_connectors_used) if family_graph_used else 3
+    dense_segment_count = int(2 + stored_family_edges_used + query_connectors_used) if family_graph_used else 3
     message = (
-        "full joint-space fixed-lambda dense edge route certified"
+        "full joint-space fixed-lambda family-graph route certified"
+        if route_certified and family_graph_used
+        else "full joint-space fixed-lambda fallback projected route certified"
         if route_certified
         else (
-            "full joint-space fixed-lambda dense edge route failed certification: "
+            "full joint-space fixed-lambda family-graph route failed certification: "
             f"local_certified={bool(cert['certified'])}, "
             f"transition_stack_certified={transition_stack_certified}, "
             f"lambda_fixed={lambda_fixed}, stage_order_valid={stage_order_valid}"
@@ -1442,11 +2005,26 @@ def realize_full_jointspace_candidate_route(
             stage_order_valid=bool(stage_order_valid),
             lambda_fixed_during_transfer=bool(lambda_fixed),
             lambda_variation_transfer=float(lambda_variation),
-            final_route_stored_evidence_edges=0,
-            final_route_dense_segments=3,
-            final_route_segment_source="certified_projected_jointspace_continuation_segments",
-            final_route_projected_jointspace_edges=3,
+            final_route_stored_evidence_edges=int(stored_family_edges_used),
+            final_route_dense_segments=int(dense_segment_count),
+            final_route_segment_source=str(family_segment_source),
+            final_route_projected_jointspace_edges=int(projected_jointspace_edges),
             final_route_taskspace_edges=0,
+            family_segment_source=str(family_segment_source),
+            family_graph_route_used_for_family_segment=bool(family_graph_used),
+            family_graph_edges_used=int(stored_family_edges_used),
+            family_graph_query_connectors_used=int(query_connectors_used),
+            family_graph_path_joint_length=float(family_graph_route.joint_length),
+            family_graph_route_certified=bool(family_graph_route.certified),
+            family_graph_route_lambda_fixed=bool(family_graph_route.lambda_fixed),
+            family_graph_route_max_residual=float(family_graph_route.max_residual),
+            family_graph_route_max_joint_step=float(family_graph_route.max_joint_step),
+            family_graph_route_failure_reason=str(family_graph_route.failure_reason),
+            family_graph_route_node_ids=list(family_graph_route.node_ids),
+            family_graph_route_edge_sources=list(family_graph_route.edge_sources),
+            selected_lambda_family_nodes=int(family_graph_route.selected_lambda_family_nodes),
+            selected_lambda_family_edges=int(family_graph_route.selected_lambda_family_edges),
+            lambda_match_tol=float(family_graph_route.lambda_match_tol),
         ),
         manifolds,
         lambda_reconciliation,
@@ -1727,6 +2305,7 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
                 robot,
                 families,
                 scene_lambdas,
+                joint_max_step=float(joint_max_step),
             )
 
     entry_transitions, exit_transitions, transition_diagnostics = discover_full_jointspace_transitions(
@@ -1755,12 +2334,16 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
             realization, _candidate_manifolds, reconciliation = realize_full_jointspace_candidate_route(
                 robot=robot,
                 families=families,
+                evidence=evidence,
                 start_q=np.asarray(q_start, dtype=float),
                 goal_q=np.asarray(q_goal, dtype=float),
                 start_task=scene.start_q,
                 goal_task=scene.goal_q,
                 candidate=candidate,
                 joint_max_step=float(joint_max_step),
+                allow_family_local_continuation_fallback=bool(
+                    planner_kwargs.get("allow_family_local_continuation_fallback", False)
+                ),
             )
             route_realization = realization
             lambda_reconciliation = reconciliation
@@ -1771,12 +2354,24 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
             failure_reason = realization.message
     route_success = bool(route_realization is not None and route_realization.success and selected_candidate is not None)
     final_route_realization = (
-        "certified_projected_jointspace_continuation_segments" if route_success else "full_jointspace_route_failed"
+        "hybrid_left_right_continuation_family_graph"
+        if route_success
+        and route_realization is not None
+        and bool(route_realization.family_graph_route_used_for_family_segment)
+        else "certified_projected_jointspace_continuation_segments"
+        if route_success
+        else "full_jointspace_route_failed"
     )
     execution_source = "certified_dense_joint_path" if route_success else "none"
     route_source = "FK(result.dense_joint_path)" if route_success else "none"
     route_realization_source = (
-        "certified_projected_jointspace_continuation_segments" if route_success else "none"
+        "hybrid_left_right_continuation_family_graph"
+        if route_success
+        and route_realization is not None
+        and bool(route_realization.family_graph_route_used_for_family_segment)
+        else "fallback_projected_jointspace_continuation"
+        if route_success
+        else "none"
     )
     robot_execution = None
     display_vs_trace_max_error = float("inf")
@@ -1809,6 +2404,9 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
             np.asarray(robot_execution.end_effector_points_3d, dtype=float),
         )
     family_nodes = sum(len(store.nodes) for store in evidence.family_leaf_stores.values())
+    family_edges = sum(len(store.edges) for store in evidence.family_leaf_stores.values())
+    family_edges_certified = sum(1 for store in evidence.family_leaf_stores.values() for edge in store.edges if bool(edge.certified))
+    family_edges_rejected = int(evidence.counters.get("family_evidence_edges_rejected", 0))
     active_lambdas = sorted(float(key) for key in evidence.family_leaf_stores.keys())
     lambda_range = (
         [round(float(min(active_lambdas)), 6), round(float(max(active_lambdas)), 6)]
@@ -1828,7 +2426,9 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
             "right_evidence_edges": int(len(evidence.right_store.edges)),
             "family_leaf_store_count": int(len(evidence.family_leaf_stores)),
             "family_evidence_nodes": int(family_nodes),
-            "family_evidence_edges": int(sum(len(store.edges) for store in evidence.family_leaf_stores.values())),
+            "family_evidence_edges": int(family_edges),
+            "family_evidence_edges_certified": int(family_edges_certified),
+            "family_evidence_edges_rejected": int(family_edges_rejected),
             "projected_to_left_count": int(evidence.counters.get("projected_to_left_count", 0)),
             "projected_to_family_count": int(evidence.counters.get("projected_to_family_count", 0)),
             "projected_to_right_count": int(evidence.counters.get("projected_to_right_count", 0)),
@@ -1970,15 +2570,34 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
             final_route_segment_source=str(route_realization.final_route_segment_source),
             final_route_projected_jointspace_edges=int(route_realization.final_route_projected_jointspace_edges),
             final_route_taskspace_edges=int(route_realization.final_route_taskspace_edges),
+            family_segment_source=str(route_realization.family_segment_source),
+            family_graph_route_used_for_family_segment=bool(route_realization.family_graph_route_used_for_family_segment),
+            family_graph_edges_used=int(route_realization.family_graph_edges_used),
+            family_graph_query_connectors_used=int(route_realization.family_graph_query_connectors_used),
+            family_graph_path_joint_length=float(route_realization.family_graph_path_joint_length),
+            family_graph_route_certified=bool(route_realization.family_graph_route_certified),
+            family_graph_route_lambda_fixed=bool(route_realization.family_graph_route_lambda_fixed),
+            family_graph_route_max_residual=float(route_realization.family_graph_route_max_residual),
+            family_graph_route_max_joint_step=float(route_realization.family_graph_route_max_joint_step),
+            family_graph_route_failure_reason=str(route_realization.family_graph_route_failure_reason),
+            family_graph_route_node_ids=list(route_realization.family_graph_route_node_ids or []),
+            family_graph_route_edge_sources=list(route_realization.family_graph_route_edge_sources or []),
+            selected_lambda_family_nodes=int(route_realization.selected_lambda_family_nodes),
+            selected_lambda_family_edges=int(route_realization.selected_lambda_family_edges),
+            lambda_match_tol=float(route_realization.lambda_match_tol),
             task_space_planner_used=False,
             ik_waypoint_fallback_used=False,
             task_space_route_reconstruction=False,
-            execution_path_source="certified_projected_jointspace_continuation_segments",
+            execution_path_source=route_realization_source,
             visual_trace_source="FK(dense_theta_path)",
             route_source="FK(result.dense_joint_path)",
             route_realization_source=route_realization_source,
             final_route_realization=final_route_realization,
-            graph_route_used_for_execution=False,
+            graph_route_used_for_execution=(
+                "partial_family_graph"
+                if bool(route_realization.family_graph_route_used_for_family_segment)
+                else False
+            ),
         )
 
     _print_key_value_block(
@@ -2007,13 +2626,35 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
             "route_candidates_rejected_lambda_mismatch": int(route_counters.get("route_candidates_rejected_lambda_mismatch", 0)),
             "route_candidates_rejected_local_replan": int(route_candidates_rejected_local_replan),
             "selected_lambda": None if selected_candidate is None else round(float(selected_candidate.selected_lambda), 6),
+            "lambda_match_tol": None if route_realization is None else float(route_realization.lambda_match_tol),
+            "selected_lambda_family_nodes": 0 if route_realization is None else int(route_realization.selected_lambda_family_nodes),
+            "selected_lambda_family_edges": 0 if route_realization is None else int(route_realization.selected_lambda_family_edges),
             "selected_entry_point": None if selected_entry is None else np.round(selected_entry.task_point, 6).tolist(),
             "selected_exit_point": None if selected_exit is None else np.round(selected_exit.task_point, 6).tolist(),
             "selected_entry_residual": None if selected_entry is None else round(float(selected_entry.residual_norm), 8),
             "selected_exit_residual": None if selected_exit is None else round(float(selected_exit.residual_norm), 8),
             "lambda_reconciliation": lambda_reconciliation,
+            "family_segment_source": "" if route_realization is None else str(route_realization.family_segment_source),
+            "family_graph_route_used_for_family_segment": bool(
+                route_realization is not None and route_realization.family_graph_route_used_for_family_segment
+            ),
+            "family_graph_edges_used": 0 if route_realization is None else int(route_realization.family_graph_edges_used),
+            "family_graph_query_connectors_used": 0 if route_realization is None else int(route_realization.family_graph_query_connectors_used),
+            "family_graph_path_joint_length": 0.0 if route_realization is None else float(route_realization.family_graph_path_joint_length),
+            "family_graph_route_certified": bool(route_realization is not None and route_realization.family_graph_route_certified),
+            "family_graph_route_lambda_fixed": bool(route_realization is not None and route_realization.family_graph_route_lambda_fixed),
+            "family_graph_route_max_residual": float("inf")
+            if route_realization is None
+            else float(route_realization.family_graph_route_max_residual),
+            "family_graph_route_max_joint_step": float("inf")
+            if route_realization is None
+            else float(route_realization.family_graph_route_max_joint_step),
             "final_route_realization": final_route_realization,
-            "graph_route_used_for_execution": False,
+            "graph_route_used_for_execution": "partial_family_graph"
+            if route_success
+            and route_realization is not None
+            and bool(route_realization.family_graph_route_used_for_family_segment)
+            else False,
             "route_realization_source": route_realization_source,
             "dense_joint_path_execution_certified": bool(route_success),
             "dense_joint_path_constraint_certified": bool(route_success and route_realization is not None),
@@ -2224,6 +2865,22 @@ def compute_ex65_jointspace_audit(scene, result, robot, robot_execution) -> dict
         "final_route_segment_source": str(getattr(result, "final_route_segment_source", "")),
         "final_route_projected_jointspace_edges": int(getattr(result, "final_route_projected_jointspace_edges", 0)),
         "final_route_taskspace_edges": int(getattr(result, "final_route_taskspace_edges", 0)),
+        "family_segment_source": str(getattr(result, "family_segment_source", "")),
+        "family_graph_route_used_for_family_segment": bool(
+            getattr(result, "family_graph_route_used_for_family_segment", False)
+        ),
+        "family_graph_edges_used": int(getattr(result, "family_graph_edges_used", 0)),
+        "family_graph_query_connectors_used": int(getattr(result, "family_graph_query_connectors_used", 0)),
+        "selected_lambda_family_nodes": int(getattr(result, "selected_lambda_family_nodes", 0)),
+        "selected_lambda_family_edges": int(getattr(result, "selected_lambda_family_edges", 0)),
+        "lambda_match_tol": float(getattr(result, "lambda_match_tol", 0.0)),
+        "family_graph_route_joint_length": float(getattr(result, "family_graph_path_joint_length", 0.0)),
+        "family_graph_route_certified": bool(getattr(result, "family_graph_route_certified", False)),
+        "family_graph_route_lambda_fixed": bool(getattr(result, "family_graph_route_lambda_fixed", False)),
+        "family_graph_route_max_residual": float(getattr(result, "family_graph_route_max_residual", float("inf"))),
+        "family_graph_route_max_joint_step": float(getattr(result, "family_graph_route_max_joint_step", float("inf"))),
+        "family_graph_route_node_ids": list(getattr(result, "family_graph_route_node_ids", []) or []),
+        "family_graph_route_edge_sources": list(getattr(result, "family_graph_route_edge_sources", []) or []),
         "route_source": str(getattr(result, "route_source", "none")),
         "display_vs_trace_max_error": float(display_vs_trace_max),
         "display_vs_trace_mean_error": float(display_vs_trace_mean),
@@ -2290,6 +2947,14 @@ def print_ex65_jointspace_audits(audit: dict[str, object]) -> None:
             "final_route_stored_evidence_edges": audit["final_route_stored_evidence_edges"],
             "final_route_projected_jointspace_edges": audit["final_route_projected_jointspace_edges"],
             "final_route_taskspace_edges": audit["final_route_taskspace_edges"],
+            "family_segment_source": audit["family_segment_source"],
+            "family_graph_route_used_for_family_segment": audit["family_graph_route_used_for_family_segment"],
+            "family_graph_edges_used": audit["family_graph_edges_used"],
+            "family_graph_query_connectors_used": audit["family_graph_query_connectors_used"],
+            "family_graph_route_certified": audit["family_graph_route_certified"],
+            "family_graph_route_lambda_fixed": audit["family_graph_route_lambda_fixed"],
+            "family_graph_route_max_residual": audit["family_graph_route_max_residual"],
+            "family_graph_route_max_joint_step": audit["family_graph_route_max_joint_step"],
         },
     )
 
@@ -2341,10 +3006,29 @@ def save_ex65_cspace_debug_artifacts(audit: dict[str, object], *, output_root: P
         "final_route_dense_segments": audit["final_route_dense_segments"],
         "final_route_segment_source": audit["final_route_segment_source"],
         "final_route_taskspace_edges": audit["final_route_taskspace_edges"],
+        "family_segment_source": audit["family_segment_source"],
+        "family_graph_route_used_for_family_segment": audit["family_graph_route_used_for_family_segment"],
+        "family_graph_edges_used": audit["family_graph_edges_used"],
+        "family_graph_query_connectors_used": audit["family_graph_query_connectors_used"],
+        "selected_lambda_family_nodes": audit["selected_lambda_family_nodes"],
+        "selected_lambda_family_edges": audit["selected_lambda_family_edges"],
+        "family_graph_route_joint_length": audit["family_graph_route_joint_length"],
+        "family_graph_route_certified": audit["family_graph_route_certified"],
+        "family_graph_route_lambda_fixed": audit["family_graph_route_lambda_fixed"],
+        "family_graph_route_max_residual": audit["family_graph_route_max_residual"],
+        "family_graph_route_max_joint_step": audit["family_graph_route_max_joint_step"],
         "total_joint_path_length": audit["total_joint_path_length"],
         "total_task_fk_path_length": audit["total_task_fk_path_length"],
     }
     (base / "cspace_summary.json").write_text(json.dumps(_json_safe(summary), indent=2), encoding="utf-8")
+    (base / "family_graph_route_node_ids.json").write_text(
+        json.dumps(_json_safe(audit.get("family_graph_route_node_ids", [])), indent=2),
+        encoding="utf-8",
+    )
+    (base / "family_graph_route_edge_sources.json").write_text(
+        json.dumps(_json_safe(audit.get("family_graph_route_edge_sources", [])), indent=2),
+        encoding="utf-8",
+    )
 
     try:
         import matplotlib
@@ -2415,11 +3099,16 @@ def assert_ex65_jointspace_methodology(result, robot_execution, audit: dict[str,
         raise RuntimeError("IK waypoint fallback is forbidden in Example 65 full joint-space thesis mode.")
     if bool(audit["task_space_route_reconstruction"]):
         raise RuntimeError("Task-space route reconstruction is forbidden in Example 65 full joint-space thesis mode.")
-    if str(audit["execution_path_source"]) != "certified_projected_jointspace_continuation_segments":
+    allowed_execution_sources = {
+        "hybrid_left_right_continuation_family_graph",
+        "fallback_projected_jointspace_continuation",
+        "certified_projected_jointspace_continuation_segments",
+    }
+    if str(audit["execution_path_source"]) not in allowed_execution_sources:
         raise RuntimeError(f"Unexpected execution path source: {audit['execution_path_source']}")
-    if bool(audit["graph_route_used_for_execution"]):
-        raise RuntimeError("Example 65 full joint-space mode should not claim raw graph route execution.")
-    if str(audit["route_realization_source"]) != "certified_projected_jointspace_continuation_segments":
+    if bool(audit["graph_route_used_for_execution"]) and not bool(audit["family_graph_route_used_for_family_segment"]):
+        raise RuntimeError("Example 65 full joint-space mode may only use the graph for the certified family segment.")
+    if str(audit["route_realization_source"]) not in allowed_execution_sources:
         raise RuntimeError(f"Unexpected route realization source: {audit['route_realization_source']}")
     if str(audit["visual_trace_source"]) != "FK(dense_theta_path)":
         raise RuntimeError(f"Unexpected visual trace source: {audit['visual_trace_source']}")
@@ -2437,6 +3126,19 @@ def assert_ex65_jointspace_methodology(result, robot_execution, audit: dict[str,
         raise RuntimeError("Selected transition stack residuals are not certified.")
     if float(audit["max_transition_stack_residual"]) > 1.0e-3:
         raise RuntimeError("Selected transition stack residual exceeds thesis-mode tolerance.")
+    if str(audit["route_realization_source"]) == "hybrid_left_right_continuation_family_graph":
+        if str(audit["family_segment_source"]) != "selected_lambda_family_evidence_graph":
+            raise RuntimeError(f"Unexpected family segment source: {audit['family_segment_source']}")
+        if not bool(audit["family_graph_route_certified"]):
+            raise RuntimeError("Family graph route is not certified.")
+        if not bool(audit["family_graph_route_lambda_fixed"]):
+            raise RuntimeError("Family graph route did not keep lambda fixed.")
+        if int(audit["family_graph_edges_used"]) <= 0:
+            raise RuntimeError("Family graph route did not use stored family evidence edges.")
+        if float(audit["family_graph_route_max_residual"]) > 2.0e-3:
+            raise RuntimeError("Family graph route residual exceeds thesis-mode tolerance.")
+        if float(audit["family_graph_route_max_joint_step"]) > float(audit["max_joint_step"]) + 1.0e-9:
+            raise RuntimeError("Family graph route joint step exceeds dense path step limit.")
     if float(audit["display_vs_trace_max_error"]) > 1.0e-6:
         raise RuntimeError("Displayed route differs from FK(dense theta path).")
     if robot_execution is None or str(robot_execution.execution_source) != "certified_dense_joint_path":
@@ -2762,6 +3464,11 @@ def main() -> None:
     parser.add_argument("--obstacle-profile", type=str, default="none")
     parser.add_argument("--max-cartesian-step", type=float, default=0.025)
     parser.add_argument("--joint-max-step", type=float, default=0.12)
+    parser.add_argument(
+        "--allow-family-local-continuation-fallback",
+        action="store_true",
+        help="DEBUG ONLY: allow the old projected family continuation if selected-lambda family graph extraction fails.",
+    )
     parser.add_argument("--ik-tolerance", type=float, default=3.0e-3)
     parser.add_argument("--show-exploration", dest="show_exploration", action="store_true", default=True)
     parser.add_argument("--hide-exploration", dest="show_exploration", action="store_false")
@@ -2802,6 +3509,7 @@ def main() -> None:
                 top_k_assignments=args.top_k,
                 top_k_paths=args.top_k_paths,
                 obstacle_profile=args.obstacle_profile,
+                allow_family_local_continuation_fallback=bool(args.allow_family_local_continuation_fallback),
             )
         else:
             scene, result, robot, robot_execution = plan_continuous_transfer_jointspace_robot(
