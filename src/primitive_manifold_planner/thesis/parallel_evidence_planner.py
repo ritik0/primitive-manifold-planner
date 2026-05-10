@@ -126,6 +126,7 @@ class TransitionHypothesis:
     plane_node_id: int | None = None
     right_node_id: int | None = None
     q: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=float))
+    transition_theta: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=float))
     provenance: str = ""
     score: float = 0.0
 
@@ -155,6 +156,14 @@ class SequentialRouteCandidate:
     dense_joint_path_constraint_certified: bool = False
     dense_joint_path_joint_continuity_certified: bool = False
     dense_joint_path_message: str = ""
+    selected_left_plane_transition_theta: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=float))
+    selected_plane_right_transition_theta: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=float))
+    selected_left_plane_transition_index: int = -1
+    selected_plane_right_transition_index: int = -1
+    selected_left_plane_stack_residual: float = float("inf")
+    selected_plane_right_stack_residual: float = float("inf")
+    max_transition_stack_residual: float = float("inf")
+    transition_stack_certified: bool = False
 
 
 @dataclass
@@ -222,6 +231,14 @@ class FixedPlaneRoute:
     dense_joint_path_constraint_certified: bool = False
     dense_joint_path_joint_continuity_certified: bool = False
     dense_joint_path_message: str = ""
+    selected_left_plane_transition_theta: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=float))
+    selected_plane_right_transition_theta: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=float))
+    selected_left_plane_transition_index: int = -1
+    selected_plane_right_transition_index: int = -1
+    selected_left_plane_stack_residual: float = float("inf")
+    selected_plane_right_stack_residual: float = float("inf")
+    max_transition_stack_residual: float = float("inf")
+    transition_stack_certified: bool = False
 
 
 @dataclass

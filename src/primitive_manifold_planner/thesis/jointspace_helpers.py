@@ -937,66 +937,56 @@ def _add_left_plane_hypotheses_joint(
         transition_task = np.asarray(refined_task if refined_ok else ee_hit, dtype=float)
         if not bool(plane_geom.within_bounds(transition_task)):
             continue
-        use_shared = False
+        target_manifold = plane_store.manifold if source_stage == ex66.LEFT_STAGE else left_store.manifold
+        q_shared, _shared_diagnostics = solve_shared_transition_q(
+            robot=robot,
+            source_manifold=source_store.manifold,
+            target_manifold=target_manifold,
+            transition_task=transition_task,
+            source_hint=np.asarray(source_q_hit, dtype=float),
+            target_hint=np.asarray(target_q_hit, dtype=float),
+            collision_fn=collision_fn,
+            residual_tol=2.0e-3,
+            task_tol=1.2e-1,
+        )
+        if q_shared is None:
+            continue
         if source_stage == ex66.LEFT_STAGE:
-            if use_shared:
-                left_node_id, _left_path_nodes = _connect_source_to_transition_joint(
-                    store=left_store,
-                    source_node_id=int(source_node_id),
-                    path_node_ids=path_node_ids,
-                    target_q=q_shared,
-                    guide_point=guide_point,
-                    robot=robot,
-                    edge_kind=ex66.LEFT_MOTION,
-                    collision_fn=collision_fn,
-                )
-                if left_node_id is not None:
-                    plane_node_id = ex66.add_stage_node(plane_store, q_shared, seeded_from_proposal=True)
-                    _update_stage_frontier_joint(plane_store, [plane_node_id], guide_point, robot)
-                else:
-                    use_shared = False
-            if not use_shared:
-                if collision_fn is not None and (bool(collision_fn(source_q_hit)) or bool(collision_fn(target_q_hit))):
-                    continue
-                candidate_source_ids = [int(source_node_id)] + [int(node_id) for node_id in path_node_ids]
-                graph_source_id = _nearest_node_id(source_store, candidate_source_ids, source_q_hit)
-                if graph_source_id is None:
-                    continue
-                left_node_id = int(graph_source_id)
-                plane_node_id = ex66.add_stage_node(plane_store, target_q_hit, seeded_from_proposal=True)
-                _update_stage_frontier_joint(plane_store, [plane_node_id], guide_point, robot)
+            left_node_id, _left_path_nodes = _connect_source_to_transition_joint(
+                store=left_store,
+                source_node_id=int(source_node_id),
+                path_node_ids=path_node_ids,
+                target_q=np.asarray(q_shared, dtype=float),
+                guide_point=guide_point,
+                robot=robot,
+                edge_kind=ex66.LEFT_MOTION,
+                collision_fn=collision_fn,
+            )
+            if left_node_id is None:
+                continue
+            plane_node_id = ex66.add_stage_node(plane_store, np.asarray(q_shared, dtype=float), seeded_from_proposal=True)
+            _update_stage_frontier_joint(plane_store, [plane_node_id], guide_point, robot)
         else:
-            if use_shared:
-                plane_node_id, _plane_path_nodes = _connect_source_to_transition_joint(
-                    store=plane_store,
-                    source_node_id=int(source_node_id),
-                    path_node_ids=path_node_ids,
-                    target_q=q_shared,
-                    guide_point=guide_point,
-                    robot=robot,
-                    edge_kind=ex66.PLANE_MOTION,
-                    collision_fn=collision_fn,
-                )
-                if plane_node_id is not None:
-                    left_node_id = ex66.add_stage_node(left_store, q_shared, seeded_from_proposal=True)
-                    _update_stage_frontier_joint(left_store, [left_node_id], guide_point, robot)
-                else:
-                    use_shared = False
-            if not use_shared:
-                if collision_fn is not None and (bool(collision_fn(source_q_hit)) or bool(collision_fn(target_q_hit))):
-                    continue
-                candidate_source_ids = [int(source_node_id)] + [int(node_id) for node_id in path_node_ids]
-                graph_source_id = _nearest_node_id(source_store, candidate_source_ids, source_q_hit)
-                if graph_source_id is None:
-                    continue
-                plane_node_id = int(graph_source_id)
-                left_node_id = ex66.add_stage_node(left_store, target_q_hit, seeded_from_proposal=True)
-                _update_stage_frontier_joint(left_store, [left_node_id], guide_point, robot)
+            plane_node_id, _plane_path_nodes = _connect_source_to_transition_joint(
+                store=plane_store,
+                source_node_id=int(source_node_id),
+                path_node_ids=path_node_ids,
+                target_q=np.asarray(q_shared, dtype=float),
+                guide_point=guide_point,
+                robot=robot,
+                edge_kind=ex66.PLANE_MOTION,
+                collision_fn=collision_fn,
+            )
+            if plane_node_id is None:
+                continue
+            left_node_id = ex66.add_stage_node(left_store, np.asarray(q_shared, dtype=float), seeded_from_proposal=True)
+            _update_stage_frontier_joint(left_store, [left_node_id], guide_point, robot)
         hypotheses.append(
             ex66.TransitionHypothesis(
                 left_node_id=int(left_node_id),
                 plane_node_id=int(plane_node_id),
                 q=np.asarray(transition_task, dtype=float),
+                transition_theta=np.asarray(q_shared, dtype=float),
                 provenance=f"{source_stage}_jointspace",
                 score=float(np.linalg.norm(np.asarray(transition_task, dtype=float) - np.asarray(guide_point, dtype=float))),
             )
@@ -1077,66 +1067,56 @@ def _add_plane_right_hypotheses_joint(
         transition_task = np.asarray(refined_task if refined_ok else ee_hit, dtype=float)
         if source_stage == ex66.PLANE_STAGE and not bool(plane_geom.within_bounds(transition_task)):
             continue
-        use_shared = False
+        target_manifold = right_store.manifold if source_stage == ex66.PLANE_STAGE else plane_store.manifold
+        q_shared, _shared_diagnostics = solve_shared_transition_q(
+            robot=robot,
+            source_manifold=source_store.manifold,
+            target_manifold=target_manifold,
+            transition_task=transition_task,
+            source_hint=np.asarray(source_q_hit, dtype=float),
+            target_hint=np.asarray(target_q_hit, dtype=float),
+            collision_fn=collision_fn,
+            residual_tol=2.0e-3,
+            task_tol=1.2e-1,
+        )
+        if q_shared is None:
+            continue
         if source_stage == ex66.PLANE_STAGE:
-            if use_shared:
-                plane_node_id, _plane_path_nodes = _connect_source_to_transition_joint(
-                    store=plane_store,
-                    source_node_id=int(source_node_id),
-                    path_node_ids=path_node_ids,
-                    target_q=q_shared,
-                    guide_point=guide_point,
-                    robot=robot,
-                    edge_kind=ex66.PLANE_MOTION,
-                    collision_fn=collision_fn,
-                )
-                if plane_node_id is not None:
-                    right_node_id = ex66.add_stage_node(right_store, q_shared, seeded_from_proposal=True)
-                    _update_stage_frontier_joint(right_store, [right_node_id], guide_point, robot)
-                else:
-                    use_shared = False
-            if not use_shared:
-                if collision_fn is not None and (bool(collision_fn(source_q_hit)) or bool(collision_fn(target_q_hit))):
-                    continue
-                candidate_source_ids = [int(source_node_id)] + [int(node_id) for node_id in path_node_ids]
-                graph_source_id = _nearest_node_id(source_store, candidate_source_ids, source_q_hit)
-                if graph_source_id is None:
-                    continue
-                plane_node_id = int(graph_source_id)
-                right_node_id = ex66.add_stage_node(right_store, target_q_hit, seeded_from_proposal=True)
-                _update_stage_frontier_joint(right_store, [right_node_id], guide_point, robot)
+            plane_node_id, _plane_path_nodes = _connect_source_to_transition_joint(
+                store=plane_store,
+                source_node_id=int(source_node_id),
+                path_node_ids=path_node_ids,
+                target_q=np.asarray(q_shared, dtype=float),
+                guide_point=guide_point,
+                robot=robot,
+                edge_kind=ex66.PLANE_MOTION,
+                collision_fn=collision_fn,
+            )
+            if plane_node_id is None:
+                continue
+            right_node_id = ex66.add_stage_node(right_store, np.asarray(q_shared, dtype=float), seeded_from_proposal=True)
+            _update_stage_frontier_joint(right_store, [right_node_id], guide_point, robot)
         else:
-            if use_shared:
-                right_node_id, _right_path_nodes = _connect_source_to_transition_joint(
-                    store=right_store,
-                    source_node_id=int(source_node_id),
-                    path_node_ids=path_node_ids,
-                    target_q=q_shared,
-                    guide_point=guide_point,
-                    robot=robot,
-                    edge_kind=ex66.RIGHT_MOTION,
-                    collision_fn=collision_fn,
-                )
-                if right_node_id is not None:
-                    plane_node_id = ex66.add_stage_node(plane_store, q_shared, seeded_from_proposal=True)
-                    _update_stage_frontier_joint(plane_store, [plane_node_id], guide_point, robot)
-                else:
-                    use_shared = False
-            if not use_shared:
-                if collision_fn is not None and (bool(collision_fn(source_q_hit)) or bool(collision_fn(target_q_hit))):
-                    continue
-                candidate_source_ids = [int(source_node_id)] + [int(node_id) for node_id in path_node_ids]
-                graph_source_id = _nearest_node_id(source_store, candidate_source_ids, source_q_hit)
-                if graph_source_id is None:
-                    continue
-                right_node_id = int(graph_source_id)
-                plane_node_id = ex66.add_stage_node(plane_store, target_q_hit, seeded_from_proposal=True)
-                _update_stage_frontier_joint(plane_store, [plane_node_id], guide_point, robot)
+            right_node_id, _right_path_nodes = _connect_source_to_transition_joint(
+                store=right_store,
+                source_node_id=int(source_node_id),
+                path_node_ids=path_node_ids,
+                target_q=np.asarray(q_shared, dtype=float),
+                guide_point=guide_point,
+                robot=robot,
+                edge_kind=ex66.RIGHT_MOTION,
+                collision_fn=collision_fn,
+            )
+            if right_node_id is None:
+                continue
+            plane_node_id = ex66.add_stage_node(plane_store, np.asarray(q_shared, dtype=float), seeded_from_proposal=True)
+            _update_stage_frontier_joint(plane_store, [plane_node_id], guide_point, robot)
         hypotheses.append(
             ex66.TransitionHypothesis(
                 plane_node_id=int(plane_node_id),
                 right_node_id=int(right_node_id),
                 q=np.asarray(transition_task, dtype=float),
+                transition_theta=np.asarray(q_shared, dtype=float),
                 provenance=f"{source_stage}_jointspace",
                 score=float(np.linalg.norm(np.asarray(transition_task, dtype=float) - np.asarray(guide_point, dtype=float))),
             )
@@ -1415,6 +1395,24 @@ def _labeled_dense_joint_path(*stage_paths: tuple[str, np.ndarray]) -> tuple[np.
         if len(label_parts) < len(dense_path) and len(stage_paths) > 0:
             label_parts.extend([str(stage_paths[-1][0])] * (len(dense_path) - len(label_parts)))
     return np.asarray(dense_path, dtype=float), label_parts
+
+
+def _transition_theta_index(path: np.ndarray, theta: np.ndarray) -> int:
+    arr = np.asarray(path, dtype=float)
+    q = np.asarray(theta, dtype=float)
+    if len(arr) == 0 or q.size != 3:
+        return -1
+    distances = np.linalg.norm((arr - q.reshape(1, 3) + np.pi) % (2.0 * np.pi) - np.pi, axis=1)
+    return int(np.argmin(distances)) if len(distances) > 0 else -1
+
+
+def _stack_residual_norm(source_manifold, target_manifold, theta: np.ndarray) -> float:
+    q = np.asarray(theta, dtype=float)
+    if q.size != 3:
+        return float("inf")
+    source = float(np.linalg.norm(np.ravel(source_manifold.residual(q))))
+    target = float(np.linalg.norm(np.ravel(target_manifold.residual(q))))
+    return float(np.linalg.norm([source, target]))
 
 
 def _joint_step_statistics(joint_path: np.ndarray) -> tuple[np.ndarray, float, float, int]:
@@ -2024,15 +2022,31 @@ def _extract_committed_route_joint(
             )
             dense_residuals = np.asarray(certification["residuals"], dtype=float)
             dense_joint_steps = np.asarray(certification["joint_steps"], dtype=float)
+            entry_theta = np.asarray(getattr(entry_hyp, "transition_theta", np.zeros(0, dtype=float)), dtype=float)
+            exit_theta = np.asarray(getattr(exit_hyp, "transition_theta", np.zeros(0, dtype=float)), dtype=float)
+            left_plane_stack_residual = _stack_residual_norm(left_store.manifold, plane_store.manifold, entry_theta)
+            plane_right_stack_residual = _stack_residual_norm(plane_store.manifold, right_store.manifold, exit_theta)
+            max_transition_stack_residual = float(max(left_plane_stack_residual, plane_right_stack_residual))
+            transition_stack_certified = bool(max_transition_stack_residual <= 1.0e-3)
+            selected_left_plane_transition_index = _transition_theta_index(dense_joint_path, entry_theta)
+            selected_plane_right_transition_index = _transition_theta_index(dense_joint_path, exit_theta)
+            execution_certified = bool(certification["execution_certified"] and transition_stack_certified)
             route_stats["route_candidates_evaluated"] += 1
             if bool(certification["constraint_certified"]):
                 route_stats["route_candidates_constraint_certified"] += 1
-            if bool(certification["execution_certified"]):
+            if bool(execution_certified):
                 route_stats["route_candidates_execution_certified"] += 1
             elif bool(certification["constraint_certified"]) and not bool(certification["joint_continuity_certified"]):
                 route_stats["route_candidates_rejected_joint_jump"] += 1
 
             total_cost = ex66.path_cost(raw_path)
+            dense_message = str(certification["message"])
+            if not transition_stack_certified:
+                dense_message += (
+                    "; transition stack not certified: "
+                    f"left_plane={left_plane_stack_residual:.4g}, "
+                    f"plane_right={plane_right_stack_residual:.4g}"
+                )
             candidate = ex66.SequentialRouteCandidate(
                 total_cost=float(total_cost),
                 left_node_path=left_node_path,
@@ -2057,10 +2071,18 @@ def _extract_committed_route_joint(
                 dense_joint_path_max_joint_step=float(certification["max_joint_step"]),
                 dense_joint_path_mean_joint_step=float(certification["mean_joint_step"]),
                 dense_joint_path_worst_joint_step_index=int(certification["worst_joint_step_index"]),
-                dense_joint_path_execution_certified=bool(certification["execution_certified"]),
+                dense_joint_path_execution_certified=bool(execution_certified),
                 dense_joint_path_constraint_certified=bool(certification["constraint_certified"]),
                 dense_joint_path_joint_continuity_certified=bool(certification["joint_continuity_certified"]),
-                dense_joint_path_message=str(certification["message"]),
+                dense_joint_path_message=dense_message,
+                selected_left_plane_transition_theta=np.asarray(entry_theta, dtype=float),
+                selected_plane_right_transition_theta=np.asarray(exit_theta, dtype=float),
+                selected_left_plane_transition_index=int(selected_left_plane_transition_index),
+                selected_plane_right_transition_index=int(selected_plane_right_transition_index),
+                selected_left_plane_stack_residual=float(left_plane_stack_residual),
+                selected_plane_right_stack_residual=float(plane_right_stack_residual),
+                max_transition_stack_residual=float(max_transition_stack_residual),
+                transition_stack_certified=bool(transition_stack_certified),
             )
             candidate_key = _joint_route_candidate_rank_key(candidate)
             built_candidates.append((candidate_key, candidate))
@@ -2620,7 +2642,7 @@ def plan_fixed_manifold_multimodal_route_jointspace(
             stage_transition_gains[stage].append(int(round_transition_gain[stage]))
             stage_route_gains[stage].append(int(route_improved_this_round))
 
-    success = best_candidate is not None
+    success = bool(best_candidate is not None and best_candidate.dense_joint_path_execution_certified)
     committed_nodes = {stage: set() for stage in ex66.STAGES}
     raw_path = np.asarray([np.asarray(start_q, dtype=float)], dtype=float)
     display_path = np.asarray([np.asarray(start_q, dtype=float)], dtype=float)
@@ -2637,6 +2659,14 @@ def plan_fixed_manifold_multimodal_route_jointspace(
     dense_joint_path_constraint_certified = False
     dense_joint_path_joint_continuity_certified = False
     dense_joint_path_message = "joint-space route has sparse nodes only; dense constrained local edges not stored yet"
+    selected_left_plane_transition_theta = np.zeros(0, dtype=float)
+    selected_plane_right_transition_theta = np.zeros(0, dtype=float)
+    selected_left_plane_transition_index = -1
+    selected_plane_right_transition_index = -1
+    selected_left_plane_stack_residual = float("inf")
+    selected_plane_right_stack_residual = float("inf")
+    max_transition_stack_residual = float("inf")
+    transition_stack_certified = False
     route_cost_raw = 0.0
     route_cost_display = 0.0
     graph_route_edges = 0
@@ -2665,6 +2695,14 @@ def plan_fixed_manifold_multimodal_route_jointspace(
         dense_joint_path_constraint_certified = bool(best_candidate.dense_joint_path_constraint_certified)
         dense_joint_path_joint_continuity_certified = bool(best_candidate.dense_joint_path_joint_continuity_certified)
         dense_joint_path_message = str(best_candidate.dense_joint_path_message)
+        selected_left_plane_transition_theta = np.asarray(best_candidate.selected_left_plane_transition_theta, dtype=float)
+        selected_plane_right_transition_theta = np.asarray(best_candidate.selected_plane_right_transition_theta, dtype=float)
+        selected_left_plane_transition_index = int(best_candidate.selected_left_plane_transition_index)
+        selected_plane_right_transition_index = int(best_candidate.selected_plane_right_transition_index)
+        selected_left_plane_stack_residual = float(best_candidate.selected_left_plane_stack_residual)
+        selected_plane_right_stack_residual = float(best_candidate.selected_plane_right_stack_residual)
+        max_transition_stack_residual = float(best_candidate.max_transition_stack_residual)
+        transition_stack_certified = bool(best_candidate.transition_stack_certified)
         route_cost_raw = ex66.path_cost(raw_path)
         route_cost_display = ex66.path_cost(display_path)
         graph_route_edges = (
@@ -2810,4 +2848,12 @@ def plan_fixed_manifold_multimodal_route_jointspace(
         dense_joint_path_constraint_certified=bool(dense_joint_path_constraint_certified),
         dense_joint_path_joint_continuity_certified=bool(dense_joint_path_joint_continuity_certified),
         dense_joint_path_message=str(dense_joint_path_message),
+        selected_left_plane_transition_theta=np.asarray(selected_left_plane_transition_theta, dtype=float),
+        selected_plane_right_transition_theta=np.asarray(selected_plane_right_transition_theta, dtype=float),
+        selected_left_plane_transition_index=int(selected_left_plane_transition_index),
+        selected_plane_right_transition_index=int(selected_plane_right_transition_index),
+        selected_left_plane_stack_residual=float(selected_left_plane_stack_residual),
+        selected_plane_right_stack_residual=float(selected_plane_right_stack_residual),
+        max_transition_stack_residual=float(max_transition_stack_residual),
+        transition_stack_certified=bool(transition_stack_certified),
     )

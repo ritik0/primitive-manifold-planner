@@ -12,7 +12,12 @@ Legacy task-space IK tracking is kept only behind an explicit debug flag.
 
 import argparse
 from dataclasses import dataclass
+from datetime import datetime
+import json
 import math
+import os
+from pathlib import Path
+import sys
 import time
 
 import numpy as np
@@ -25,6 +30,7 @@ from primitive_manifold_planner.examplesupport.spatial_robot import SpatialRobot
 from primitive_manifold_planner.manifolds.robot import RobotPlaneManifold, RobotSphereManifold
 from primitive_manifold_planner.thesis import parallel_evidence_planner as ex66
 from primitive_manifold_planner.visualization import pyvista_available
+from primitive_manifold_planner.visualization.cspace_robot import show_cspace_robot_planning
 from primitive_manifold_planner.visualization.robot import show_pyvista_robot_demo
 
 try:
@@ -801,6 +807,149 @@ def _stage_manifolds_for_robot(families, robot: SpatialRobot3DOF):
     }
 
 
+def _stage_order_is_monotone(labels: list[str]) -> bool:
+    order = {ex66.LEFT_STAGE: 0, ex66.PLANE_STAGE: 1, ex66.RIGHT_STAGE: 2}
+    sequence = [order.get(str(label), -1) for label in labels]
+    if any(value < 0 for value in sequence):
+        return False
+    return all(b >= a for a, b in zip(sequence[:-1], sequence[1:]))
+
+
+def _transition_stack_residuals(
+    q_path: np.ndarray,
+    labels: list[str],
+    manifolds: dict[str, object],
+    *,
+    selected_left_plane_theta: np.ndarray | None = None,
+    selected_plane_right_theta: np.ndarray | None = None,
+) -> dict[str, object]:
+    q_arr = np.asarray(q_path, dtype=float)
+
+    def stack_at(q: np.ndarray, source: str, target: str) -> float:
+        source_res = float(np.linalg.norm(manifolds[source].residual(q)))
+        target_res = float(np.linalg.norm(manifolds[target].residual(q)))
+        return float(np.linalg.norm([source_res, target_res]))
+
+    def best_boundary_stack(source: str, target: str) -> tuple[float, int]:
+        best = float("inf")
+        best_idx = -1
+        for idx in range(len(labels) - 1):
+            if labels[idx] != source or labels[idx + 1] != target:
+                continue
+            window_start = max(0, idx - 3)
+            window_stop = min(len(labels), idx + 5)
+            for candidate_idx in range(window_start, window_stop):
+                q = q_arr[candidate_idx]
+                value = stack_at(q, source, target)
+                if value < best:
+                    best = value
+                    best_idx = int(candidate_idx)
+        return best, best_idx
+
+    left_plane, left_plane_idx = best_boundary_stack(ex66.LEFT_STAGE, ex66.PLANE_STAGE)
+    plane_right, plane_right_idx = best_boundary_stack(ex66.PLANE_STAGE, ex66.RIGHT_STAGE)
+    if selected_left_plane_theta is not None and np.asarray(selected_left_plane_theta, dtype=float).size == 3:
+        left_plane = stack_at(np.asarray(selected_left_plane_theta, dtype=float), ex66.LEFT_STAGE, ex66.PLANE_STAGE)
+        left_plane_idx = -2
+    if selected_plane_right_theta is not None and np.asarray(selected_plane_right_theta, dtype=float).size == 3:
+        plane_right = stack_at(np.asarray(selected_plane_right_theta, dtype=float), ex66.PLANE_STAGE, ex66.RIGHT_STAGE)
+        plane_right_idx = -2
+    values = [value for value in (left_plane, plane_right) if np.isfinite(value)]
+    return {
+        "selected_left_plane_stack_residual": float(left_plane) if np.isfinite(left_plane) else float("inf"),
+        "selected_left_plane_transition_index": int(left_plane_idx),
+        "selected_plane_right_stack_residual": float(plane_right) if np.isfinite(plane_right) else float("inf"),
+        "selected_plane_right_transition_index": int(plane_right_idx),
+        "max_transition_stack_residual": float(max(values)) if values else float("inf"),
+    }
+
+
+def compute_cspace_trajectory_audit(
+    result: ex66.FixedPlaneRoute,
+    robot: SpatialRobot3DOF,
+    families,
+) -> dict[str, object]:
+    theta_path = np.asarray(getattr(result, "dense_joint_path", np.zeros((0, 3), dtype=float)), dtype=float)
+    labels = list(getattr(result, "dense_joint_path_stage_labels", []))
+    residuals = np.asarray(getattr(result, "dense_joint_path_constraint_residuals", np.zeros(0, dtype=float)), dtype=float)
+    joint_steps = np.asarray(getattr(result, "dense_joint_path_joint_steps", np.zeros(0, dtype=float)), dtype=float)
+    if len(joint_steps) == 0 and len(theta_path) >= 2:
+        joint_steps, _max_step, _mean_step, _worst = joint_step_statistics(theta_path)
+    fk_trace = (
+        np.asarray([robot.forward_kinematics_3d(theta)[-1] for theta in theta_path], dtype=float)
+        if len(theta_path) > 0
+        else np.zeros((0, 3), dtype=float)
+    )
+    manifolds = _stage_manifolds_for_robot(families, robot)
+    stage_residuals: dict[str, list[float]] = {ex66.LEFT_STAGE: [], ex66.PLANE_STAGE: [], ex66.RIGHT_STAGE: []}
+    for idx, theta in enumerate(theta_path):
+        stage = labels[idx] if idx < len(labels) else ""
+        if stage in manifolds:
+            stage_residuals[stage].append(float(np.linalg.norm(manifolds[stage].residual(theta))))
+    theta_min = np.min(theta_path, axis=0) if len(theta_path) > 0 else np.zeros(3, dtype=float)
+    theta_max = np.max(theta_path, axis=0) if len(theta_path) > 0 else np.zeros(3, dtype=float)
+    theta_span = theta_max - theta_min
+    label_counts = {
+        ex66.LEFT_STAGE: int(sum(1 for label in labels if label == ex66.LEFT_STAGE)),
+        ex66.PLANE_STAGE: int(sum(1 for label in labels if label == ex66.PLANE_STAGE)),
+        ex66.RIGHT_STAGE: int(sum(1 for label in labels if label == ex66.RIGHT_STAGE)),
+    }
+    selected_left_plane_theta = np.asarray(getattr(result, "selected_left_plane_transition_theta", np.zeros(0, dtype=float)), dtype=float)
+    selected_plane_right_theta = np.asarray(getattr(result, "selected_plane_right_transition_theta", np.zeros(0, dtype=float)), dtype=float)
+    transition = _transition_stack_residuals(
+        theta_path,
+        labels,
+        manifolds,
+        selected_left_plane_theta=selected_left_plane_theta,
+        selected_plane_right_theta=selected_plane_right_theta,
+    ) if len(theta_path) > 0 else {
+        "selected_left_plane_stack_residual": float("inf"),
+        "selected_left_plane_transition_index": -1,
+        "selected_plane_right_stack_residual": float("inf"),
+        "selected_plane_right_transition_index": -1,
+        "max_transition_stack_residual": float("inf"),
+    }
+    return {
+        "theta_path": theta_path,
+        "fk_trace": fk_trace,
+        "stage_labels": labels,
+        "constraint_residuals": residuals,
+        "joint_steps": np.asarray(joint_steps, dtype=float),
+        "theta_path_points": int(len(theta_path)),
+        "theta0_min": float(theta_min[0]),
+        "theta0_max": float(theta_max[0]),
+        "theta0_span": float(theta_span[0]),
+        "theta1_min": float(theta_min[1]),
+        "theta1_max": float(theta_max[1]),
+        "theta1_span": float(theta_span[1]),
+        "theta2_min": float(theta_min[2]),
+        "theta2_max": float(theta_max[2]),
+        "theta2_span": float(theta_span[2]),
+        "total_joint_path_length": float(np.sum(joint_steps)) if len(joint_steps) > 0 else 0.0,
+        "total_task_fk_path_length": float(ex66.path_cost(fk_trace)) if len(fk_trace) >= 2 else 0.0,
+        "max_joint_step": float(np.max(joint_steps)) if len(joint_steps) > 0 else 0.0,
+        "mean_joint_step": float(np.mean(joint_steps)) if len(joint_steps) > 0 else 0.0,
+        "max_constraint_residual": float(np.max(residuals)) if len(residuals) > 0 else 0.0,
+        "mean_constraint_residual": float(np.mean(residuals)) if len(residuals) > 0 else 0.0,
+        "left_count": label_counts[ex66.LEFT_STAGE],
+        "plane_count": label_counts[ex66.PLANE_STAGE],
+        "right_count": label_counts[ex66.RIGHT_STAGE],
+        "left_stage_max_residual": float(max(stage_residuals[ex66.LEFT_STAGE])) if stage_residuals[ex66.LEFT_STAGE] else 0.0,
+        "plane_stage_max_residual": float(max(stage_residuals[ex66.PLANE_STAGE])) if stage_residuals[ex66.PLANE_STAGE] else 0.0,
+        "right_stage_max_residual": float(max(stage_residuals[ex66.RIGHT_STAGE])) if stage_residuals[ex66.RIGHT_STAGE] else 0.0,
+        "stage_order_valid": bool(_stage_order_is_monotone(labels)),
+        "cspace_path_source": "dense_theta_path",
+        "taskspace_trace_source": "FK(dense_theta_path)",
+        "final_route_stored_evidence_edges": int(result.graph_route_edges),
+        "final_route_projected_jointspace_edges": 0,
+        "final_route_taskspace_edges": 0,
+        **transition,
+        "selected_left_plane_transition_index": int(getattr(result, "selected_left_plane_transition_index", transition["selected_left_plane_transition_index"])),
+        "selected_plane_right_transition_index": int(getattr(result, "selected_plane_right_transition_index", transition["selected_plane_right_transition_index"])),
+        "transition_stack_certified": bool(getattr(result, "transition_stack_certified", transition["max_transition_stack_residual"] <= 1.0e-3)),
+    }
+
+
 def _certify_joint_path_with_labels(
     joint_path: np.ndarray,
     labels: list[str],
@@ -1356,13 +1505,22 @@ def print_taskspace_execution_block(robot_execution: RobotExecutionResult | None
     )
 
 
-def print_jointspace_methodology_block(result: ex66.FixedPlaneRoute, robot_execution: RobotExecutionResult | None) -> None:
+def print_jointspace_methodology_block(
+    result: ex66.FixedPlaneRoute,
+    robot_execution: RobotExecutionResult | None,
+    cspace_audit: dict[str, object] | None = None,
+) -> None:
     residuals = np.asarray(getattr(result, "dense_joint_path_constraint_residuals", np.zeros(0, dtype=float)), dtype=float)
     stack_values = [
         float(value)
         for key, value in result.mode_counts.items()
         if "best_stacked" in str(key) and "residual" in str(key) and np.isfinite(float(value))
     ]
+    transition_stack_residual = (
+        float(cspace_audit["max_transition_stack_residual"])
+        if cspace_audit is not None and np.isfinite(float(cspace_audit["max_transition_stack_residual"]))
+        else (max(stack_values) if stack_values else "not_recorded")
+    )
     graph_route_used = bool(result.mode_counts.get("graph_route_used_for_execution", 1))
     dense_path = np.asarray(getattr(result, "dense_joint_path", np.zeros((0, 3), dtype=float)), dtype=float)
     print_block(
@@ -1381,11 +1539,208 @@ def print_jointspace_methodology_block(result: ex66.FixedPlaneRoute, robot_execu
             "dense_theta_points": int(len(dense_path)),
             "max_joint_step": 0.0 if robot_execution is None else float(robot_execution.max_joint_step),
             "max_active_constraint_residual": float(np.max(residuals)) if len(residuals) > 0 else 0.0,
-            "max_transition_stack_residual": max(stack_values) if stack_values else "not_recorded",
+            "max_transition_stack_residual": transition_stack_residual,
             "left_plane_transition_count": int(result.transition_hypotheses_left_plane),
             "plane_right_transition_count": int(result.transition_hypotheses_plane_right),
         },
     )
+
+
+def print_cspace_trajectory_audit(audit: dict[str, object]) -> None:
+    print_block(
+        "C-space trajectory audit",
+        {
+            "cspace_path_source": audit["cspace_path_source"],
+            "taskspace_trace_source": audit["taskspace_trace_source"],
+            "theta_path_points": audit["theta_path_points"],
+            "theta0_min": audit["theta0_min"],
+            "theta0_max": audit["theta0_max"],
+            "theta0_span": audit["theta0_span"],
+            "theta1_min": audit["theta1_min"],
+            "theta1_max": audit["theta1_max"],
+            "theta1_span": audit["theta1_span"],
+            "theta2_min": audit["theta2_min"],
+            "theta2_max": audit["theta2_max"],
+            "theta2_span": audit["theta2_span"],
+            "total_joint_path_length": audit["total_joint_path_length"],
+            "total_task_fk_path_length": audit["total_task_fk_path_length"],
+            "max_joint_step": audit["max_joint_step"],
+            "mean_joint_step": audit["mean_joint_step"],
+            "max_constraint_residual": audit["max_constraint_residual"],
+            "mean_constraint_residual": audit["mean_constraint_residual"],
+            "left_count": audit["left_count"],
+            "plane_count": audit["plane_count"],
+            "right_count": audit["right_count"],
+            "left_stage_max_residual": audit["left_stage_max_residual"],
+            "plane_stage_max_residual": audit["plane_stage_max_residual"],
+            "right_stage_max_residual": audit["right_stage_max_residual"],
+            "stage_order_valid": audit["stage_order_valid"],
+            "selected_left_plane_transition_index": audit["selected_left_plane_transition_index"],
+            "selected_plane_right_transition_index": audit["selected_plane_right_transition_index"],
+            "selected_left_plane_stack_residual": audit["selected_left_plane_stack_residual"],
+            "selected_plane_right_stack_residual": audit["selected_plane_right_stack_residual"],
+            "max_transition_stack_residual": audit["max_transition_stack_residual"],
+            "transition_stack_certified": audit["transition_stack_certified"],
+            "final_route_stored_evidence_edges": audit["final_route_stored_evidence_edges"],
+            "final_route_projected_jointspace_edges": audit["final_route_projected_jointspace_edges"],
+            "final_route_taskspace_edges": audit["final_route_taskspace_edges"],
+        },
+    )
+
+
+def _json_safe(value):
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (np.floating, np.integer)):
+        return value.item()
+    if isinstance(value, (float, int, str, bool)) or value is None:
+        return value
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    return str(value)
+
+
+def save_cspace_debug_artifacts(
+    audit: dict[str, object],
+    *,
+    result: ex66.FixedPlaneRoute,
+    output_root: Path | None = None,
+) -> Path:
+    base = output_root or Path("outputs") / "ex66_jointspace_debug" / "latest"
+    base.mkdir(parents=True, exist_ok=True)
+    theta_path = np.asarray(audit["theta_path"], dtype=float)
+    fk_trace = np.asarray(audit["fk_trace"], dtype=float)
+    residuals = np.asarray(audit["constraint_residuals"], dtype=float)
+    joint_steps = np.asarray(audit["joint_steps"], dtype=float)
+    labels = list(audit["stage_labels"])
+
+    np.save(base / "dense_theta_path.npy", theta_path)
+    np.save(base / "dense_fk_trace.npy", fk_trace)
+    np.save(base / "constraint_residuals.npy", residuals)
+    np.save(base / "joint_steps.npy", joint_steps)
+    (base / "dense_stage_labels.txt").write_text("\n".join(labels), encoding="utf-8")
+    (base / "dense_stage_labels.json").write_text(json.dumps(labels, indent=2), encoding="utf-8")
+
+    summary = {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "planning_space": "joint_space",
+        "state_variable": "theta=[yaw, shoulder, elbow]",
+        "execution_path_source": "stored_dense_joint_edges",
+        "visual_trace_source": "FK(dense_theta_path)",
+        "task_space_planner_used": False,
+        "ik_waypoint_fallback_used": False,
+        "task_space_route_reconstruction": False,
+        "dense_joint_path_execution_certified": bool(getattr(result, "dense_joint_path_execution_certified", False)),
+        "max_constraint_residual": audit["max_constraint_residual"],
+        "max_joint_step": audit["max_joint_step"],
+        "total_joint_path_length": audit["total_joint_path_length"],
+        "total_task_fk_path_length": audit["total_task_fk_path_length"],
+        "left_stage_max_residual": audit["left_stage_max_residual"],
+        "plane_stage_max_residual": audit["plane_stage_max_residual"],
+        "right_stage_max_residual": audit["right_stage_max_residual"],
+        "selected_left_plane_stack_residual": audit["selected_left_plane_stack_residual"],
+        "selected_plane_right_stack_residual": audit["selected_plane_right_stack_residual"],
+        "max_transition_stack_residual": audit["max_transition_stack_residual"],
+        "transition_stack_certified": audit["transition_stack_certified"],
+        "selected_left_plane_transition_index": audit["selected_left_plane_transition_index"],
+        "selected_plane_right_transition_index": audit["selected_plane_right_transition_index"],
+        "final_route_taskspace_edges": audit["final_route_taskspace_edges"],
+    }
+    (base / "cspace_summary.json").write_text(json.dumps(_json_safe(summary), indent=2), encoding="utf-8")
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        if len(theta_path) > 0:
+            fig, ax = plt.subplots(figsize=(8, 4.5))
+            ax.plot(theta_path[:, 0], label="theta0")
+            ax.plot(theta_path[:, 1], label="theta1")
+            ax.plot(theta_path[:, 2], label="theta2")
+            ax.set_xlabel("waypoint index")
+            ax.set_ylabel("theta [rad]")
+            ax.set_title("Dense theta trajectory")
+            ax.legend()
+            fig.tight_layout()
+            fig.savefig(base / "theta_vs_index.png", dpi=160)
+            plt.close(fig)
+
+            fig = plt.figure(figsize=(6, 5.5))
+            ax3 = fig.add_subplot(111, projection="3d")
+            ax3.plot(theta_path[:, 0], theta_path[:, 1], theta_path[:, 2], color="#d32f2f", linewidth=2.0)
+            ax3.scatter(theta_path[0, 0], theta_path[0, 1], theta_path[0, 2], color="black", s=40, label="start")
+            ax3.scatter(theta_path[-1, 0], theta_path[-1, 1], theta_path[-1, 2], color="gold", s=50, label="goal")
+            for key, color, label in (
+                ("selected_left_plane_transition_index", "#ff7043", "left-plane transition"),
+                ("selected_plane_right_transition_index", "#26a69a", "plane-right transition"),
+            ):
+                idx = int(audit.get(key, -1))
+                if 0 <= idx < len(theta_path):
+                    ax3.scatter(theta_path[idx, 0], theta_path[idx, 1], theta_path[idx, 2], color=color, s=45, label=label)
+            ax3.set_xlabel("theta0")
+            ax3.set_ylabel("theta1")
+            ax3.set_zlabel("theta2")
+            ax3.set_title("C-space dense path")
+            ax3.legend()
+            fig.tight_layout()
+            fig.savefig(base / "cspace_3d_path.png", dpi=160)
+            plt.close(fig)
+
+        if len(residuals) > 0:
+            fig, ax = plt.subplots(figsize=(8, 4.2))
+            ax.plot(residuals, color="#455a64")
+            ax.set_xlabel("waypoint index")
+            ax.set_ylabel("active constraint residual")
+            ax.set_title("Constraint residual along dense theta path")
+            fig.tight_layout()
+            fig.savefig(base / "residual_vs_index.png", dpi=160)
+            plt.close(fig)
+    except Exception as exc:
+        (base / "plot_error.txt").write_text(str(exc), encoding="utf-8")
+
+    return base
+
+
+def assert_jointspace_methodology(
+    *,
+    result: ex66.FixedPlaneRoute,
+    robot_execution: RobotExecutionResult | None,
+    route_source: str,
+    path_audit: dict[str, object],
+    cspace_audit: dict[str, object],
+) -> None:
+    if result.success and not bool(getattr(result, "dense_joint_path_execution_certified", False)):
+        raise RuntimeError("Planner reported success without an execution-certified dense theta path.")
+    if robot_execution is not None and robot_execution.execution_source in {"taskspace_fallback", "taskspace_ik_tracking"}:
+        raise RuntimeError("Task-space IK fallback/execution is forbidden in joint-space thesis mode.")
+    if result.success and (robot_execution is None or robot_execution.execution_source != "certified_dense_joint_path"):
+        raise RuntimeError("Successful joint-space thesis mode must execute the certified dense theta path.")
+    if result.success and robot_execution is not None and not bool(robot_execution.planner_joint_path_used_directly):
+        raise RuntimeError("Successful joint-space thesis mode must animate the dense theta path directly.")
+    if result.success and robot_execution is not None and bool(robot_execution.planner_path_resampled_for_robot):
+        raise RuntimeError("Successful joint-space thesis mode may not resample a task-space path for robot execution.")
+    if route_source != "FK(result.dense_joint_path)" and result.success:
+        raise RuntimeError(f"Unexpected visual route source in joint-space mode: {route_source}")
+    if str(path_audit.get("display_route_source")) != "FK(result.dense_joint_path)" and result.success:
+        raise RuntimeError("Display route is not the FK trace of the dense theta path.")
+    if str(path_audit.get("robot_execution_source")) != "certified_dense_joint_path" and result.success:
+        raise RuntimeError("Robot execution is not sourced from the certified dense theta path.")
+    if float(path_audit.get("display_vs_trace_max_error", 0.0)) > 1.0e-6:
+        raise RuntimeError("Displayed route and FK execution trace diverge.")
+    if not bool(cspace_audit.get("stage_order_valid", False)) and result.success:
+        raise RuntimeError("Dense theta path stage labels are not monotone left->plane->right.")
+    if int(cspace_audit.get("final_route_taskspace_edges", 0)) != 0:
+        raise RuntimeError("Final route contains task-space edges in joint-space thesis mode.")
+    if result.success and float(cspace_audit.get("max_constraint_residual", 0.0)) > 2.0e-3:
+        raise RuntimeError("Dense theta path exceeds active constraint residual tolerance.")
+    if result.success and float(cspace_audit.get("max_transition_stack_residual", float("inf"))) > 1.0e-3:
+        raise RuntimeError("Selected transition theta stack residual exceeds thesis tolerance.")
+    if result.success and not bool(cspace_audit.get("transition_stack_certified", False)):
+        raise RuntimeError("Selected transition theta configurations are not stack-certified.")
 
 
 def print_jointspace_exploration_block(result: ex66.FixedPlaneRoute) -> None:
@@ -1738,6 +2093,22 @@ def main():
     parser.add_argument("--smoothing-cost-task-weight", type=float, default=0.25)
     parser.add_argument("--smoothing-cost-curvature-weight", type=float, default=0.05)
     parser.add_argument("--route-selection-top-k-for-smoothing", type=int, default=3)
+    parser.add_argument(
+        "--save-cspace-debug",
+        action="store_true",
+        help="Save dense theta path, FK trace, residuals, joint steps, summary JSON, and C-space plots.",
+    )
+    parser.add_argument(
+        "--show-cspace",
+        action="store_true",
+        help="Show an additional theta-space PyVista view of the FK-pulled-back constraint surfaces.",
+    )
+    parser.add_argument(
+        "--cspace-grid-res",
+        type=int,
+        default=55,
+        help="Grid resolution per joint axis for C-space implicit constraint surfaces.",
+    )
     parser.add_argument("--no-viz", action="store_true")
     args = parser.parse_args()
 
@@ -1868,8 +2239,19 @@ def main():
         planner_mode_label = "joint_space" if args.planning_mode == "jointspace_constrained_planning" else "task_space"
 
     route, route_source = primary_display_route_for_mode(result, robot, planner_mode_label)
+    path_audit = path_source_audit(result, robot_execution, robot, planner_mode_label)
+    cspace_audit: dict[str, object] | None = None
+    if planner_mode_label == "joint_space":
+        cspace_audit = compute_cspace_trajectory_audit(result, robot, families)
+        assert_jointspace_methodology(
+            result=result,
+            robot_execution=robot_execution,
+            route_source=route_source,
+            path_audit=path_audit,
+            cspace_audit=cspace_audit,
+        )
 
-    print("\nExample 66.1: 3DOF PyVista robot tracing selected multimodal path")
+    print("\nExample 66.1: robot executing certified dense joint-space trajectory")
     print(
         "planner_mode = "
         + (
@@ -1936,11 +2318,24 @@ def main():
         },
     )
     if planner_mode_label == "joint_space":
-        print_jointspace_methodology_block(result, robot_execution)
+        print_jointspace_methodology_block(result, robot_execution, cspace_audit)
         print_jointspace_exploration_block(result)
         print_dense_joint_certification_block(result, robot_execution)
         print_jointspace_smoothing_block(smoothing_summary)
-        print_block("Path source audit", path_source_audit(result, robot_execution, robot, planner_mode_label))
+        print_block("Path source audit", path_audit)
+        if cspace_audit is not None:
+            print_cspace_trajectory_audit(cspace_audit)
+            if args.save_cspace_debug and result.success:
+                debug_dir = save_cspace_debug_artifacts(cspace_audit, result=result)
+                print_block(
+                    "C-space debug artifacts",
+                    {
+                        "cspace_debug_dir": str(debug_dir),
+                        "dense_theta_path_npy": str(debug_dir / "dense_theta_path.npy"),
+                        "dense_fk_trace_npy": str(debug_dir / "dense_fk_trace.npy"),
+                        "cspace_summary_json": str(debug_dir / "cspace_summary.json"),
+                    },
+                )
         print_block(
             "Joint-space execution validation",
             {
@@ -1975,6 +2370,39 @@ def main():
             else "disabled"
         )
     )
+    cspace_debug_dir = Path("outputs") / "ex66_jointspace_debug" / "latest"
+    should_render_cspace = bool(args.show_cspace and planner_mode_label == "joint_space" and result.success)
+    should_save_cspace = bool(args.save_cspace_debug and planner_mode_label == "joint_space" and result.success)
+    print_block(
+        "C-space visualization",
+        {
+            "cspace_visualization_requested": bool(args.show_cspace),
+            "cspace_axes": "theta0, theta1, theta2",
+            "cspace_grid_res": int(args.cspace_grid_res),
+            "cspace_route_source": "result.dense_joint_path" if planner_mode_label == "joint_space" else "none",
+            "cspace_surface_source": "FK-pulled-back residual(theta)=0" if planner_mode_label == "joint_space" else "none",
+            "cspace_interactive_view": bool(should_render_cspace and not args.no_viz),
+            "cspace_screenshot": str(cspace_debug_dir / "cspace_environment.png") if should_save_cspace else "disabled",
+        },
+    )
+
+    if should_render_cspace and (not args.no_viz or should_save_cspace):
+        cspace_output_dir = cspace_debug_dir if should_save_cspace else None
+        screenshot_path = show_cspace_robot_planning(
+            result=result,
+            manifolds=_stage_manifolds_for_robot(families, robot),
+            cspace_audit=cspace_audit,
+            grid_res=int(args.cspace_grid_res),
+            output_dir=cspace_output_dir,
+            show=not bool(args.no_viz),
+        )
+        if screenshot_path is not None:
+            print(f"cspace_environment_screenshot = {screenshot_path}")
+
+    if args.no_viz:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
     if not args.no_viz:
         if not pyvista_available() or pv is None:
