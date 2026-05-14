@@ -1,0 +1,4422 @@
+from __future__ import annotations
+
+"""Continuous-transfer planner with 3DOF robot execution experiments.
+
+The thesis-facing robot claim should use full joint-space exploration
+(`--jointspace-planning --full-jointspace-exploration`). The task-space IK mode
+and selected-lambda realization mode are retained as legacy/debug comparisons:
+they may use task-space route/lambda/transition selection before robot
+realization and must not be described as full joint-space planning.
+
+Planner evidence is diagnostic context. Robot motion is not allowed to follow
+raw exploration branches.
+"""
+
+import argparse
+from dataclasses import dataclass
+from datetime import datetime
+import heapq
+import json
+import os
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+from ompl import util as ou
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+EXAMPLES = ROOT / "examples"
+for path in (ROOT, SRC, EXAMPLES):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
+
+from primitive_manifold_planner.examplesupport.intrinsic_multimodal_helpers import build_segment_polydata
+from primitive_manifold_planner.examplesupport.jointspace_planner_utils import (
+    end_effector_point,
+    explore_joint_manifold,
+    generate_joint_proposals,
+    inverse_kinematics_start,
+    joint_path_to_task_path,
+    joint_step_statistics,
+    wrap_joint_angles,
+)
+from primitive_manifold_planner.experiments.continuous_transfer import (
+    build_continuous_transfer_scene,
+    default_example_65_scene_description,
+    plan_continuous_transfer_route,
+    print_continuous_route_summary,
+)
+from primitive_manifold_planner.experiments.continuous_transfer.config import DEFAULT_POST_ROUTE_EVIDENCE_ROUNDS
+from primitive_manifold_planner.experiments.continuous_transfer.family_definition import plane_leaf_patch
+from primitive_manifold_planner.manifolds.robot import RobotPlaneManifold, RobotSphereManifold
+from primitive_manifold_planner.visualization import add_manifold, add_points, pyvista_available
+from primitive_manifold_planner.visualization.cspace_robot import show_cspace_robot_planning
+from primitive_manifold_planner.visualization.robot import (
+    add_robot_pedestal,
+    make_robot_actor_bundle,
+    update_robot_actor_bundle,
+)
+
+from three_dof_robot_pyvista_demo import (
+    RobotExecutionResult,
+    build_continuous_robot_execution_path,
+    choose_robot_for_route,
+)
+
+try:
+    import pyvista as pv
+except Exception:
+    pv = None
+
+try:
+    from scipy.optimize import least_squares
+except Exception:
+    least_squares = None
+
+
+LEFT_STAGE = "left"
+FAMILY_STAGE = "family"
+RIGHT_STAGE = "right"
+
+
+def _polyline_error(reference: np.ndarray, trace: np.ndarray) -> tuple[float, float]:
+    ref = np.asarray(reference, dtype=float)
+    pts = np.asarray(trace, dtype=float)
+    if len(ref) == 0 or len(pts) == 0:
+        return float("inf"), float("inf")
+    if len(ref) == len(pts):
+        errors = np.linalg.norm(ref - pts, axis=1)
+    else:
+        errors = np.asarray([float(np.min(np.linalg.norm(ref - p, axis=1))) for p in pts], dtype=float)
+    return float(np.max(errors)), float(np.mean(errors))
+
+
+def _downsample_points(points: np.ndarray, max_points: int) -> np.ndarray:
+    pts = np.asarray(points, dtype=float).reshape((-1, 3)) if len(points) else np.zeros((0, 3), dtype=float)
+    limit = int(max_points)
+    if limit <= 0 or len(pts) <= limit:
+        return pts
+    indices = np.linspace(0, len(pts) - 1, num=limit, dtype=int)
+    return pts[indices]
+
+
+def _print_key_value_block(title: str, values: dict[str, object]) -> None:
+    print(f"\n=== {title} ===")
+    width = max((len(str(key)) for key in values), default=1)
+    for key, value in values.items():
+        print(f"{key.ljust(width)} : {value}")
+
+
+class RobotPlaneLeafManifold(RobotPlaneManifold):
+    """Robot configuration-space constraint for one locked continuous-transfer leaf.
+
+    The planner state is q, but the leaf parameter is interpreted in task
+    space: FK(q) must lie on the selected plane leaf and inside that leaf's
+    validity patch. This is the first reusable brick for the later full
+    robot-side leaf-store manager.
+    """
+
+    def __init__(
+        self,
+        *,
+        robot,
+        transfer_family,
+        lambda_value: float,
+        name: str = "robot_transfer_family_leaf",
+        joint_lower: np.ndarray | None = None,
+        joint_upper: np.ndarray | None = None,
+    ) -> None:
+        self.transfer_family = transfer_family
+        self.lambda_value = float(lambda_value)
+        super().__init__(
+            robot=robot,
+            point=transfer_family.point_on_leaf(float(lambda_value)),
+            normal=transfer_family.normal,
+            name=f"{name}_lambda_{float(lambda_value):.6f}",
+            joint_lower=joint_lower,
+            joint_upper=joint_upper,
+            task_space_validity_fn=lambda ee, family=transfer_family, lam=float(lambda_value): bool(
+                family.within_patch(lam, np.asarray(ee, dtype=float), tol=2.0e-3)
+            ),
+        )
+
+    def infer_lambda(self, theta: np.ndarray) -> float:
+        return float(self.transfer_family.infer_lambda(end_effector_point(self.robot, theta)))
+
+
+@dataclass
+class JointspaceRouteRealization:
+    success: bool
+    dense_joint_path: np.ndarray
+    stage_labels: list[str]
+    lambda_labels: np.ndarray
+    task_path: np.ndarray
+    residuals: np.ndarray
+    joint_steps: np.ndarray
+    max_constraint_residual: float
+    mean_constraint_residual: float
+    max_joint_step: float
+    mean_joint_step: float
+    collision_free: bool
+    message: str
+    segment_messages: dict[str, str]
+    selected_lambda: float = float("nan")
+    selected_left_family_transition_theta: np.ndarray = None
+    selected_family_right_transition_theta: np.ndarray = None
+    selected_left_family_transition_index: int = -1
+    selected_family_right_transition_index: int = -1
+    selected_left_family_stack_residual: float = float("inf")
+    selected_family_right_stack_residual: float = float("inf")
+    max_transition_stack_residual: float = float("inf")
+    transition_stack_certified: bool = False
+    stage_order_valid: bool = False
+    lambda_fixed_during_transfer: bool = False
+    lambda_variation_transfer: float = float("inf")
+    final_route_stored_evidence_edges: int = 0
+    final_route_evidence_edges: int = 0
+    final_route_query_connectors: int = 0
+    final_route_projected_fallback_edges: int = 0
+    final_route_dense_segments: int = 0
+    final_route_segment_source: str = ""
+    final_route_projected_jointspace_edges: int = 0
+    final_route_taskspace_edges: int = 0
+    left_segment_source: str = ""
+    right_segment_source: str = ""
+    left_graph_route_used_for_segment: bool = False
+    right_graph_route_used_for_segment: bool = False
+    left_graph_edges_used: int = 0
+    right_graph_edges_used: int = 0
+    left_graph_query_connectors_used: int = 0
+    right_graph_query_connectors_used: int = 0
+    left_graph_route_failure_reason: str = ""
+    right_graph_route_failure_reason: str = ""
+    family_segment_source: str = ""
+    family_graph_route_used_for_family_segment: bool = False
+    family_graph_edges_used: int = 0
+    family_graph_query_connectors_used: int = 0
+    family_graph_path_joint_length: float = 0.0
+    family_graph_route_certified: bool = False
+    family_graph_route_lambda_fixed: bool = False
+    family_graph_route_max_residual: float = float("inf")
+    family_graph_route_max_joint_step: float = float("inf")
+    family_graph_route_failure_reason: str = ""
+    family_graph_route_node_ids: list[int] = None
+    family_graph_route_edge_sources: list[str] = None
+    selected_lambda_family_nodes: int = 0
+    selected_lambda_family_edges: int = 0
+    lambda_match_tol: float = 0.0
+
+
+@dataclass
+class RobotFamilyEvidenceEdge:
+    src_node_id: int
+    dst_node_id: int
+    lambda_value: float
+    dense_theta_path: np.ndarray
+    residuals: np.ndarray
+    joint_steps: np.ndarray
+    cost: float
+    certified: bool
+    source: str = "family_evidence_edge"
+    max_residual: float = float("inf")
+    max_joint_step: float = float("inf")
+    collision_free: bool = True
+    message: str = ""
+
+
+@dataclass
+class RobotStageEvidenceEdge:
+    stage: str
+    src_node_id: int
+    dst_node_id: int
+    dense_theta_path: np.ndarray
+    residuals: np.ndarray
+    joint_steps: np.ndarray
+    cost: float
+    certified: bool
+    source: str
+    max_residual: float = float("inf")
+    max_joint_step: float = float("inf")
+    collision_free: bool = True
+    message: str = ""
+
+
+@dataclass
+class RobotFamilyLeafStore:
+    lambda_value: float
+    manifold: RobotPlaneLeafManifold
+    nodes: list[np.ndarray]
+    edges: list[RobotFamilyEvidenceEdge]
+    frontier_ids: list[int]
+
+    def add_node(self, q: np.ndarray, dedup_tol: float = 1.0e-4) -> int:
+        q_arr = np.asarray(q, dtype=float).reshape(3)
+        for idx, existing in enumerate(self.nodes):
+            if float(np.linalg.norm(wrap_joint_angles(q_arr - existing))) <= float(dedup_tol):
+                return int(idx)
+        self.nodes.append(q_arr)
+        node_id = len(self.nodes) - 1
+        self.frontier_ids.append(node_id)
+        self.frontier_ids = self.frontier_ids[-72:]
+        return int(node_id)
+
+
+@dataclass
+class RobotStageEvidenceStore:
+    name: str
+    manifold: object
+    nodes: list[np.ndarray]
+    edges: list[RobotStageEvidenceEdge]
+    frontier_ids: list[int]
+
+    def add_node(self, q: np.ndarray, dedup_tol: float = 1.0e-4) -> int:
+        q_arr = np.asarray(q, dtype=float).reshape(3)
+        for idx, existing in enumerate(self.nodes):
+            if float(np.linalg.norm(wrap_joint_angles(q_arr - existing))) <= float(dedup_tol):
+                return int(idx)
+        self.nodes.append(q_arr)
+        node_id = len(self.nodes) - 1
+        self.frontier_ids.append(node_id)
+        self.frontier_ids = self.frontier_ids[-72:]
+        return int(node_id)
+
+
+@dataclass
+class RobotJointspaceContinuousEvidence:
+    left_store: RobotStageEvidenceStore
+    right_store: RobotStageEvidenceStore
+    family_leaf_stores: dict[float, RobotFamilyLeafStore]
+    counters: dict[str, int]
+
+    def get_or_create_family_store(self, robot, transfer_family, lam: float) -> RobotFamilyLeafStore:
+        key = _lambda_key(float(lam))
+        existing = self.family_leaf_stores.get(key)
+        if existing is not None:
+            return existing
+        manifold = RobotPlaneLeafManifold(
+            robot=robot,
+            transfer_family=transfer_family,
+            lambda_value=float(key),
+            name="full_jointspace_family_leaf",
+        )
+        store = RobotFamilyLeafStore(
+            lambda_value=float(key),
+            manifold=manifold,
+            nodes=[],
+            edges=[],
+            frontier_ids=[],
+        )
+        self.family_leaf_stores[key] = store
+        return store
+
+
+@dataclass
+class RobotContinuousTransitionHypothesis:
+    q: np.ndarray
+    task_point: np.ndarray
+    lambda_value: float
+    source_stage: str
+    target_stage: str
+    source_node_id: int
+    target_node_id: int
+    provenance: str
+    residual_norm: float
+    score: float
+
+
+@dataclass
+class FullJointspaceRouteCandidate:
+    entry: RobotContinuousTransitionHypothesis
+    exit: RobotContinuousTransitionHypothesis
+    selected_lambda: float
+    score: float
+    lambda_reconciliation: str
+
+
+@dataclass
+class FamilyGraphRouteResult:
+    success: bool
+    dense_theta_path: np.ndarray
+    edge_sources: list[str]
+    node_ids: list[int]
+    family_graph_edges_used: int
+    query_connectors_used: int
+    joint_length: float
+    max_residual: float
+    max_joint_step: float
+    certified: bool
+    lambda_fixed: bool
+    selected_lambda_family_nodes: int
+    selected_lambda_family_edges: int
+    lambda_match_tol: float
+    failure_reason: str = ""
+
+
+@dataclass
+class StageGraphRouteResult:
+    success: bool
+    dense_theta_path: np.ndarray
+    edge_sources: list[str]
+    node_ids: list[int]
+    graph_edges_used: int
+    query_connectors_used: int
+    joint_length: float
+    max_residual: float
+    max_joint_step: float
+    certified: bool
+    failure_reason: str = ""
+
+
+def _lambda_key(lam: float, digits: int = 6) -> float:
+    return round(float(lam), int(digits))
+
+
+def _scene_candidate_lambdas(scene_description: dict[str, object], transfer_family) -> list[float]:
+    transfer_spec = dict(scene_description.get("transfer_family", {})) if isinstance(scene_description, dict) else {}
+    values = transfer_spec.get("plane_offsets", None)
+    if values is None:
+        values = list(transfer_family.sample_lambdas({"count": 10}))
+    result: list[float] = []
+    for value in values:
+        lam = float(value)
+        if transfer_family.lambda_in_range(lam, tol=1.0e-9):
+            result.append(_lambda_key(lam))
+    return sorted(set(result))
+
+
+def candidate_lambdas_for_joint_proposal(
+    q: np.ndarray,
+    robot,
+    transfer_family,
+    active_lambdas: list[float],
+    scene_lambdas: list[float],
+) -> list[float]:
+    ee = end_effector_point(robot, q)
+    candidates: list[float] = []
+    inferred = float(transfer_family.infer_lambda(ee))
+    if transfer_family.lambda_in_range(inferred, tol=5.0e-2):
+        candidates.append(float(np.clip(inferred, transfer_family.lambda_min, transfer_family.lambda_max)))
+    combined = sorted(set(float(v) for v in [*scene_lambdas, *active_lambdas]))
+    if combined:
+        nearest = sorted(combined, key=lambda lam: abs(lam - inferred))[:3]
+        candidates.extend(nearest)
+    candidates.extend(active_lambdas[-4:])
+    deduped: list[float] = []
+    for lam in candidates:
+        clamped = _lambda_key(float(np.clip(lam, transfer_family.lambda_min, transfer_family.lambda_max)))
+        if transfer_family.lambda_in_range(clamped, tol=1.0e-9) and all(abs(clamped - prev) > 1.0e-4 for prev in deduped):
+            deduped.append(clamped)
+    return deduped
+
+
+def _family_edge_exists(store: RobotFamilyLeafStore, src_node_id: int, dst_node_id: int) -> bool:
+    src = int(src_node_id)
+    dst = int(dst_node_id)
+    return any(
+        {int(edge.src_node_id), int(edge.dst_node_id)} == {src, dst}
+        for edge in store.edges
+    )
+
+
+def _stage_edge_exists(store: RobotStageEvidenceStore, src_node_id: int, dst_node_id: int) -> bool:
+    src = int(src_node_id)
+    dst = int(dst_node_id)
+    return any(
+        {int(edge.src_node_id), int(edge.dst_node_id)} == {src, dst}
+        for edge in store.edges
+    )
+
+
+def _certify_stage_edge_path(
+    *,
+    store: RobotStageEvidenceStore,
+    stage: str,
+    src_node_id: int,
+    dst_node_id: int,
+    dense_theta_path: np.ndarray,
+    joint_max_step: float,
+    collision_fn=None,
+    source: str,
+    constraint_tol: float = 2.0e-3,
+) -> RobotStageEvidenceEdge:
+    path = np.asarray(dense_theta_path, dtype=float).reshape((-1, 3))
+    residual_values: list[float] = []
+    collision_free = True
+    stage_ok = bool(len(path) >= 2)
+    for theta in path:
+        residual = float(np.linalg.norm(store.manifold.residual(theta)))
+        within = bool(store.manifold.within_bounds(theta, tol=float(constraint_tol)))
+        if not within:
+            residual = max(residual, 10.0 * float(constraint_tol))
+            stage_ok = False
+        if collision_fn is not None and bool(collision_fn(theta)):
+            residual = max(residual, 100.0 * float(constraint_tol))
+            collision_free = False
+        residual_values.append(float(residual))
+    residuals = np.asarray(residual_values, dtype=float)
+    joint_steps, max_step, _mean_step, _worst_step = joint_step_statistics(path)
+    max_residual = float(np.max(residuals)) if len(residuals) else float("inf")
+    cost = float(np.sum(joint_steps)) if len(joint_steps) else 0.0
+    certified = bool(
+        stage_ok
+        and collision_free
+        and max_residual <= float(constraint_tol)
+        and float(max_step) <= float(joint_max_step) + 1.0e-9
+    )
+    return RobotStageEvidenceEdge(
+        stage=str(stage),
+        src_node_id=int(src_node_id),
+        dst_node_id=int(dst_node_id),
+        dense_theta_path=path,
+        residuals=residuals,
+        joint_steps=np.asarray(joint_steps, dtype=float),
+        cost=cost,
+        certified=bool(certified),
+        source=str(source),
+        max_residual=max_residual,
+        max_joint_step=float(max_step),
+        collision_free=bool(collision_free),
+        message="certified" if certified else f"{stage} evidence edge certification failed",
+    )
+
+
+def _certify_family_edge_path(
+    *,
+    store: RobotFamilyLeafStore,
+    src_node_id: int,
+    dst_node_id: int,
+    dense_theta_path: np.ndarray,
+    joint_max_step: float,
+    collision_fn=None,
+    source: str = "family_evidence_edge",
+    constraint_tol: float = 2.0e-3,
+) -> RobotFamilyEvidenceEdge:
+    path = np.asarray(dense_theta_path, dtype=float).reshape((-1, 3))
+    residual_values: list[float] = []
+    collision_free = True
+    leaf_ok = bool(len(path) >= 2)
+    for theta in path:
+        residual = float(np.linalg.norm(store.manifold.residual(theta)))
+        within = bool(store.manifold.within_bounds(theta, tol=float(constraint_tol)))
+        if not within:
+            residual = max(residual, 10.0 * float(constraint_tol))
+            leaf_ok = False
+        if collision_fn is not None and bool(collision_fn(theta)):
+            residual = max(residual, 100.0 * float(constraint_tol))
+            collision_free = False
+        residual_values.append(float(residual))
+    residuals = np.asarray(residual_values, dtype=float)
+    joint_steps, max_step, _mean_step, _worst_step = joint_step_statistics(path)
+    max_residual = float(np.max(residuals)) if len(residuals) else float("inf")
+    cost = float(np.sum(joint_steps)) if len(joint_steps) else 0.0
+    certified = bool(
+        leaf_ok
+        and collision_free
+        and max_residual <= float(constraint_tol)
+        and float(max_step) <= float(joint_max_step) + 1.0e-9
+    )
+    return RobotFamilyEvidenceEdge(
+        src_node_id=int(src_node_id),
+        dst_node_id=int(dst_node_id),
+        lambda_value=float(store.lambda_value),
+        dense_theta_path=path,
+        residuals=residuals,
+        joint_steps=np.asarray(joint_steps, dtype=float),
+        cost=cost,
+        certified=bool(certified),
+        source=str(source),
+        max_residual=max_residual,
+        max_joint_step=float(max_step),
+        collision_free=bool(collision_free),
+        message="certified" if certified else "family edge certification failed",
+    )
+
+
+def _try_store_stage_evidence_edges(
+    *,
+    store: RobotStageEvidenceStore,
+    stage: str,
+    node_id: int,
+    previous_nodes: list[np.ndarray],
+    joint_max_step: float,
+    counters: dict[str, int],
+    collision_fn=None,
+    max_neighbors: int = 3,
+) -> None:
+    if int(node_id) < 0 or int(node_id) >= len(store.nodes) or not previous_nodes:
+        return
+    q_new = np.asarray(store.nodes[int(node_id)], dtype=float)
+    distances = [
+        (float(np.linalg.norm(wrap_joint_angles(q_new - np.asarray(q, dtype=float)))), int(idx))
+        for idx, q in enumerate(previous_nodes)
+    ]
+    distances.sort(key=lambda item: item[0])
+    for _distance, src_id in distances[: max(1, int(max_neighbors))]:
+        if int(src_id) == int(node_id) or _stage_edge_exists(store, int(src_id), int(node_id)):
+            continue
+        result = explore_joint_manifold(
+            store.manifold,
+            np.asarray(store.nodes[int(src_id)], dtype=float),
+            q_new,
+            max_step=float(joint_max_step),
+            projection_tol=1.0e-6,
+            collision_fn=collision_fn,
+            local_max_joint_step=float(joint_max_step),
+        )
+        if not result.success:
+            counters[f"{stage}_evidence_edges_rejected"] = int(counters.get(f"{stage}_evidence_edges_rejected", 0)) + 1
+            continue
+        edge = _certify_stage_edge_path(
+            store=store,
+            stage=str(stage),
+            src_node_id=int(src_id),
+            dst_node_id=int(node_id),
+            dense_theta_path=np.asarray(result.path, dtype=float),
+            joint_max_step=float(joint_max_step),
+            collision_fn=collision_fn,
+            source=f"{stage}_evidence_edge",
+        )
+        if edge.certified:
+            store.edges.append(edge)
+            counters[f"{stage}_evidence_edges_certified"] = int(counters.get(f"{stage}_evidence_edges_certified", 0)) + 1
+        else:
+            counters[f"{stage}_evidence_edges_rejected"] = int(counters.get(f"{stage}_evidence_edges_rejected", 0)) + 1
+
+
+def _try_store_family_evidence_edges(
+    *,
+    store: RobotFamilyLeafStore,
+    node_id: int,
+    previous_nodes: list[np.ndarray],
+    joint_max_step: float,
+    counters: dict[str, int],
+    collision_fn=None,
+    max_neighbors: int = 3,
+) -> None:
+    if int(node_id) < 0 or int(node_id) >= len(store.nodes) or not previous_nodes:
+        return
+    q_new = np.asarray(store.nodes[int(node_id)], dtype=float)
+    distances = [
+        (float(np.linalg.norm(wrap_joint_angles(q_new - np.asarray(q, dtype=float)))), int(idx))
+        for idx, q in enumerate(previous_nodes)
+    ]
+    distances.sort(key=lambda item: item[0])
+    for _distance, src_id in distances[: max(1, int(max_neighbors))]:
+        if int(src_id) == int(node_id) or _family_edge_exists(store, int(src_id), int(node_id)):
+            continue
+        result = explore_joint_manifold(
+            store.manifold,
+            np.asarray(store.nodes[int(src_id)], dtype=float),
+            q_new,
+            max_step=float(joint_max_step),
+            projection_tol=1.0e-6,
+            collision_fn=collision_fn,
+            local_max_joint_step=float(joint_max_step),
+        )
+        if not result.success:
+            counters["family_evidence_edges_rejected"] = int(counters.get("family_evidence_edges_rejected", 0)) + 1
+            continue
+        edge = _certify_family_edge_path(
+            store=store,
+            src_node_id=int(src_id),
+            dst_node_id=int(node_id),
+            dense_theta_path=np.asarray(result.path, dtype=float),
+            joint_max_step=float(joint_max_step),
+            collision_fn=collision_fn,
+            source="family_evidence_edge",
+        )
+        if edge.certified:
+            store.edges.append(edge)
+            counters["family_evidence_edges_certified"] = int(counters.get("family_evidence_edges_certified", 0)) + 1
+        else:
+            counters["family_evidence_edges_rejected"] = int(counters.get("family_evidence_edges_rejected", 0)) + 1
+
+
+def _project_joint_to_store(
+    store,
+    q: np.ndarray,
+    counter_prefix: str,
+    counters: dict[str, int],
+    *,
+    joint_max_step: float | None = None,
+    collision_fn=None,
+) -> bool:
+    projection = store.manifold.project(q, tol=1.0e-6, max_iters=100)
+    if projection.success and bool(store.manifold.within_bounds(projection.x_projected, tol=2.0e-3)):
+        previous_nodes = [np.asarray(node, dtype=float) for node in getattr(store, "nodes", [])]
+        node_id = store.add_node(np.asarray(projection.x_projected, dtype=float))
+        if isinstance(store, RobotFamilyLeafStore) and joint_max_step is not None:
+            _try_store_family_evidence_edges(
+                store=store,
+                node_id=int(node_id),
+                previous_nodes=previous_nodes,
+                joint_max_step=float(joint_max_step),
+                counters=counters,
+                collision_fn=collision_fn,
+            )
+        elif isinstance(store, RobotStageEvidenceStore) and joint_max_step is not None and counter_prefix in {LEFT_STAGE, RIGHT_STAGE}:
+            _try_store_stage_evidence_edges(
+                store=store,
+                stage=str(counter_prefix),
+                node_id=int(node_id),
+                previous_nodes=previous_nodes,
+                joint_max_step=float(joint_max_step),
+                counters=counters,
+                collision_fn=collision_fn,
+            )
+        counters[f"projected_to_{counter_prefix}_count"] = int(counters.get(f"projected_to_{counter_prefix}_count", 0)) + 1
+        return True
+    counters[f"{counter_prefix}_projection_failure_count"] = int(counters.get(f"{counter_prefix}_projection_failure_count", 0)) + 1
+    return False
+
+
+def project_joint_proposal_to_supports(
+    q_proposal: np.ndarray,
+    evidence: RobotJointspaceContinuousEvidence,
+    robot,
+    families,
+    scene_lambdas: list[float],
+    *,
+    joint_max_step: float | None = None,
+    collision_fn=None,
+) -> None:
+    _left_family, transfer_family, _right_family = families
+    counters = evidence.counters
+    q = np.asarray(q_proposal, dtype=float).reshape(3)
+    _project_joint_to_store(
+        evidence.left_store,
+        q,
+        LEFT_STAGE,
+        counters,
+        joint_max_step=joint_max_step,
+        collision_fn=collision_fn,
+    )
+    _project_joint_to_store(
+        evidence.right_store,
+        q,
+        RIGHT_STAGE,
+        counters,
+        joint_max_step=joint_max_step,
+        collision_fn=collision_fn,
+    )
+    active_lambdas = sorted(evidence.family_leaf_stores.keys())
+    candidate_lambdas = candidate_lambdas_for_joint_proposal(q, robot, transfer_family, active_lambdas, scene_lambdas)
+    counters["candidate_lambdas_evaluated"] = int(counters.get("candidate_lambdas_evaluated", 0)) + len(candidate_lambdas)
+    if not candidate_lambdas:
+        counters["family_projection_failure_count"] = int(counters.get("family_projection_failure_count", 0)) + 1
+    for lam in candidate_lambdas:
+        store = evidence.get_or_create_family_store(robot, transfer_family, float(lam))
+        _project_joint_to_store(
+            store,
+            q,
+            "family",
+            counters,
+            joint_max_step=joint_max_step,
+            collision_fn=collision_fn,
+        )
+
+
+def _record_failure(reasons: dict[str, int], message: str) -> None:
+    key = str(message).split(":", 1)[0].strip()
+    reasons[key] = int(reasons.get(key, 0)) + 1
+
+
+def solve_shared_robot_transition_q(
+    *,
+    robot,
+    source_manifold,
+    target_manifold,
+    source_hint: np.ndarray,
+    target_hint: np.ndarray,
+    transition_task_hint: np.ndarray | None = None,
+    collision_fn=None,
+    residual_tol: float = 2.0e-3,
+    task_tol: float = 1.2e-1,
+) -> tuple[np.ndarray | None, dict[str, object]]:
+    source = np.asarray(source_hint, dtype=float).reshape(3)
+    target = np.asarray(target_hint, dtype=float).reshape(3)
+    midpoint = wrap_joint_angles(source + 0.5 * wrap_joint_angles(target - source))
+    task_anchor = (
+        np.asarray(transition_task_hint, dtype=float).reshape(3)
+        if transition_task_hint is not None
+        else 0.5 * (end_effector_point(robot, source) + end_effector_point(robot, target))
+    )
+    joint_lower = getattr(source_manifold, "joint_lower", -np.pi * np.ones(3, dtype=float))
+    joint_upper = getattr(source_manifold, "joint_upper", np.pi * np.ones(3, dtype=float))
+    guesses: list[np.ndarray] = [source, target, midpoint]
+    for alpha in (0.25, 0.5, 0.75):
+        guesses.append(wrap_joint_angles(source + float(alpha) * wrap_joint_angles(target - source)))
+    for scale in (0.03, -0.03, 0.06, -0.06):
+        guesses.append(wrap_joint_angles(midpoint + np.asarray([scale, -0.5 * scale, 0.35 * scale], dtype=float)))
+
+    best: dict[str, object] = {
+        "message": "no_candidate",
+        "score": float("inf"),
+        "residual_norm": float("inf"),
+        "task_error": float("inf"),
+    }
+
+    def evaluate(q: np.ndarray) -> tuple[bool, dict[str, object]]:
+        q_arr = np.asarray(q, dtype=float).reshape(3)
+        source_res = float(np.linalg.norm(source_manifold.residual(q_arr)))
+        target_res = float(np.linalg.norm(target_manifold.residual(q_arr)))
+        residual_norm = max(source_res, target_res)
+        task_error = float(np.linalg.norm(end_effector_point(robot, q_arr) - task_anchor))
+        source_bounds = bool(source_manifold.within_bounds(q_arr, tol=residual_tol))
+        target_bounds = bool(target_manifold.within_bounds(q_arr, tol=residual_tol))
+        collision_free = True if collision_fn is None else not bool(collision_fn(q_arr))
+        score = float(residual_norm + 0.15 * task_error + 0.02 * np.linalg.norm(wrap_joint_angles(q_arr - midpoint)))
+        detail = {
+            "message": "ok",
+            "score": score,
+            "residual_norm": residual_norm,
+            "task_error": task_error,
+            "source_residual": source_res,
+            "target_residual": target_res,
+            "source_bounds": source_bounds,
+            "target_bounds": target_bounds,
+            "collision_free": collision_free,
+        }
+        if residual_norm > residual_tol:
+            detail["message"] = "residual_too_large"
+            if score < float(best["score"]):
+                best.update(detail)
+            return False, detail
+        if task_error > task_tol:
+            detail["message"] = "task_anchor_too_far"
+            if score < float(best["score"]):
+                best.update(detail)
+            return False, detail
+        if not source_bounds or not target_bounds:
+            detail["message"] = "bounds_or_leaf_mask_failed"
+            if score < float(best["score"]):
+                best.update(detail)
+            return False, detail
+        if not collision_free:
+            detail["message"] = "collision"
+            if score < float(best["score"]):
+                best.update(detail)
+            return False, detail
+        if score < float(best["score"]):
+            best.update(detail)
+        return True, detail
+
+    for guess in guesses:
+        q0 = np.clip(wrap_joint_angles(np.asarray(guess, dtype=float).reshape(3)), joint_lower, joint_upper)
+        candidates = [q0]
+        if least_squares is not None:
+
+            def objective(q: np.ndarray) -> np.ndarray:
+                q_arr = np.asarray(q, dtype=float)
+                return np.concatenate(
+                    [
+                        np.asarray(source_manifold.residual(q_arr), dtype=float).reshape(-1),
+                        np.asarray(target_manifold.residual(q_arr), dtype=float).reshape(-1),
+                        0.35 * (end_effector_point(robot, q_arr) - task_anchor),
+                        2.0e-3 * wrap_joint_angles(q_arr - q0),
+                    ]
+                )
+
+            try:
+                solved = least_squares(
+                    objective,
+                    q0,
+                    bounds=(joint_lower, joint_upper),
+                    max_nfev=120,
+                    xtol=1.0e-9,
+                    ftol=1.0e-9,
+                    gtol=1.0e-9,
+                )
+                candidates.insert(0, wrap_joint_angles(np.asarray(solved.x, dtype=float)))
+            except Exception:
+                pass
+        for candidate in candidates:
+            ok, detail = evaluate(candidate)
+            if ok:
+                return np.asarray(candidate, dtype=float), detail
+    best["message"] = str(best.get("message", "solve_failed"))
+    return None, best
+
+
+def _task_points_for_nodes(robot, nodes: list[np.ndarray]) -> np.ndarray:
+    if not nodes:
+        return np.zeros((0, 3), dtype=float)
+    return np.asarray([end_effector_point(robot, q) for q in nodes], dtype=float)
+
+
+def _nearest_index(points: np.ndarray, point: np.ndarray) -> int:
+    if len(points) == 0:
+        return -1
+    distances = np.linalg.norm(points - np.asarray(point, dtype=float).reshape(1, 3), axis=1)
+    return int(np.argmin(distances))
+
+
+def _dedup_transition(
+    transitions: list[RobotContinuousTransitionHypothesis],
+    q: np.ndarray,
+    task_point: np.ndarray,
+    lam: float,
+    task_tol: float = 7.5e-2,
+    joint_tol: float = 1.8e-1,
+) -> bool:
+    for existing in transitions:
+        if abs(float(existing.lambda_value) - float(lam)) > 1.0e-4:
+            continue
+        if float(np.linalg.norm(existing.task_point - task_point)) <= float(task_tol):
+            return True
+        if float(np.linalg.norm(wrap_joint_angles(existing.q - q))) <= float(joint_tol):
+            return True
+    return False
+
+
+def _candidate_pairs_for_transition(
+    *,
+    robot,
+    source_nodes: list[np.ndarray],
+    target_nodes: list[np.ndarray],
+    source_manifold,
+    target_manifold,
+    max_pairs: int = 4,
+) -> list[tuple[int, int]]:
+    if not source_nodes or not target_nodes:
+        return []
+    source_tasks = _task_points_for_nodes(robot, source_nodes)
+    target_tasks = _task_points_for_nodes(robot, target_nodes)
+    pairs: list[tuple[int, int]] = []
+
+    target_residual_on_source = np.asarray(
+        [float(np.linalg.norm(target_manifold.residual(q))) for q in source_nodes],
+        dtype=float,
+    )
+    source_residual_on_target = np.asarray(
+        [float(np.linalg.norm(source_manifold.residual(q))) for q in target_nodes],
+        dtype=float,
+    )
+    for source_idx in np.argsort(target_residual_on_source)[: max(1, max_pairs)]:
+        target_idx = _nearest_index(target_tasks, source_tasks[int(source_idx)])
+        if target_idx >= 0:
+            pairs.append((int(source_idx), int(target_idx)))
+    for target_idx in np.argsort(source_residual_on_target)[: max(1, max_pairs)]:
+        source_idx = _nearest_index(source_tasks, target_tasks[int(target_idx)])
+        if source_idx >= 0:
+            pairs.append((int(source_idx), int(target_idx)))
+
+    unique: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for pair in pairs:
+        if pair in seen:
+            continue
+        seen.add(pair)
+        unique.append(pair)
+        if len(unique) >= max_pairs:
+            break
+    return unique
+
+
+def discover_full_jointspace_transitions(
+    *,
+    evidence: RobotJointspaceContinuousEvidence,
+    robot,
+    max_pairs_per_leaf: int = 4,
+) -> tuple[list[RobotContinuousTransitionHypothesis], list[RobotContinuousTransitionHypothesis], dict[str, object]]:
+    entry: list[RobotContinuousTransitionHypothesis] = []
+    exit: list[RobotContinuousTransitionHypothesis] = []
+    diagnostics: dict[str, object] = {
+        "entry_transition_attempts": 0,
+        "exit_transition_attempts": 0,
+        "entry_transition_failure_reasons": {},
+        "exit_transition_failure_reasons": {},
+        "best_entry_residual": float("inf"),
+        "best_exit_residual": float("inf"),
+    }
+    left_store = evidence.left_store
+    right_store = evidence.right_store
+
+    for lam, family_store in sorted(evidence.family_leaf_stores.items()):
+        entry_pairs = _candidate_pairs_for_transition(
+            robot=robot,
+            source_nodes=left_store.nodes,
+            target_nodes=family_store.nodes,
+            source_manifold=left_store.manifold,
+            target_manifold=family_store.manifold,
+            max_pairs=max_pairs_per_leaf,
+        )
+        for left_idx, family_idx in entry_pairs:
+            diagnostics["entry_transition_attempts"] = int(diagnostics["entry_transition_attempts"]) + 1
+            source_q = left_store.nodes[left_idx]
+            target_q = family_store.nodes[family_idx]
+            task_hint = 0.5 * (end_effector_point(robot, source_q) + end_effector_point(robot, target_q))
+            q, detail = solve_shared_robot_transition_q(
+                robot=robot,
+                source_manifold=left_store.manifold,
+                target_manifold=family_store.manifold,
+                source_hint=source_q,
+                target_hint=target_q,
+                transition_task_hint=task_hint,
+            )
+            diagnostics["best_entry_residual"] = min(
+                float(diagnostics["best_entry_residual"]),
+                float(detail.get("residual_norm", float("inf"))),
+            )
+            if q is None:
+                _record_failure(diagnostics["entry_transition_failure_reasons"], str(detail.get("message", "solve_failed")))
+                continue
+            task_point = end_effector_point(robot, q)
+            if _dedup_transition(entry, q, task_point, float(lam)):
+                _record_failure(diagnostics["entry_transition_failure_reasons"], "duplicate_rejected")
+                continue
+            residual_norm = float(detail.get("residual_norm", 0.0))
+            score = float(detail.get("score", residual_norm))
+            entry.append(
+                RobotContinuousTransitionHypothesis(
+                    q=np.asarray(q, dtype=float),
+                    task_point=np.asarray(task_point, dtype=float),
+                    lambda_value=float(lam),
+                    source_stage=LEFT_STAGE,
+                    target_stage=FAMILY_STAGE,
+                    source_node_id=int(left_idx),
+                    target_node_id=int(family_idx),
+                    provenance="phase3b_node_pair_left_family",
+                    residual_norm=residual_norm,
+                    score=score,
+                )
+            )
+
+        exit_pairs = _candidate_pairs_for_transition(
+            robot=robot,
+            source_nodes=family_store.nodes,
+            target_nodes=right_store.nodes,
+            source_manifold=family_store.manifold,
+            target_manifold=right_store.manifold,
+            max_pairs=max_pairs_per_leaf,
+        )
+        for family_idx, right_idx in exit_pairs:
+            diagnostics["exit_transition_attempts"] = int(diagnostics["exit_transition_attempts"]) + 1
+            source_q = family_store.nodes[family_idx]
+            target_q = right_store.nodes[right_idx]
+            task_hint = 0.5 * (end_effector_point(robot, source_q) + end_effector_point(robot, target_q))
+            q, detail = solve_shared_robot_transition_q(
+                robot=robot,
+                source_manifold=family_store.manifold,
+                target_manifold=right_store.manifold,
+                source_hint=source_q,
+                target_hint=target_q,
+                transition_task_hint=task_hint,
+            )
+            diagnostics["best_exit_residual"] = min(
+                float(diagnostics["best_exit_residual"]),
+                float(detail.get("residual_norm", float("inf"))),
+            )
+            if q is None:
+                _record_failure(diagnostics["exit_transition_failure_reasons"], str(detail.get("message", "solve_failed")))
+                continue
+            task_point = end_effector_point(robot, q)
+            if _dedup_transition(exit, q, task_point, float(lam)):
+                _record_failure(diagnostics["exit_transition_failure_reasons"], "duplicate_rejected")
+                continue
+            residual_norm = float(detail.get("residual_norm", 0.0))
+            score = float(detail.get("score", residual_norm))
+            exit.append(
+                RobotContinuousTransitionHypothesis(
+                    q=np.asarray(q, dtype=float),
+                    task_point=np.asarray(task_point, dtype=float),
+                    lambda_value=float(lam),
+                    source_stage=FAMILY_STAGE,
+                    target_stage=RIGHT_STAGE,
+                    source_node_id=int(family_idx),
+                    target_node_id=int(right_idx),
+                    provenance="phase3b_node_pair_family_right",
+                    residual_norm=residual_norm,
+                    score=score,
+                )
+            )
+
+    diagnostics["entry_transitions_found"] = len(entry)
+    diagnostics["exit_transitions_found"] = len(exit)
+    diagnostics["certified_entry_transitions"] = len(entry)
+    diagnostics["certified_exit_transitions"] = len(exit)
+    diagnostics["entry_transition_lambdas"] = sorted(set(round(float(t.lambda_value), 6) for t in entry))
+    diagnostics["exit_transition_lambdas"] = sorted(set(round(float(t.lambda_value), 6) for t in exit))
+    diagnostics["transition_lambdas"] = sorted(
+        set([*diagnostics["entry_transition_lambdas"], *diagnostics["exit_transition_lambdas"]])
+    )
+    diagnostics["family_regions_with_entry"] = len(set(round(float(t.lambda_value), 6) for t in entry))
+    diagnostics["family_regions_with_exit"] = len(set(round(float(t.lambda_value), 6) for t in exit))
+    return entry, exit, diagnostics
+
+
+def build_robot_manifolds_for_selected_lambda(robot, families, selected_lambda: float) -> dict[str, object]:
+    left_family, transfer_family, right_family = families
+    left_geom = left_family.manifold(float(left_family.sample_lambdas()[0]))
+    right_geom = right_family.manifold(float(right_family.sample_lambdas()[0]))
+    joint_lower = -np.pi * np.ones(3, dtype=float)
+    joint_upper = np.pi * np.ones(3, dtype=float)
+    return {
+        LEFT_STAGE: RobotSphereManifold(
+            robot=robot,
+            center=np.asarray(left_geom.center, dtype=float),
+            radius=float(left_geom.radius),
+            name="continuous_robot_left_sphere",
+            joint_lower=joint_lower,
+            joint_upper=joint_upper,
+        ),
+        FAMILY_STAGE: RobotPlaneLeafManifold(
+            robot=robot,
+            transfer_family=transfer_family,
+            lambda_value=float(selected_lambda),
+            name="continuous_robot_family_leaf",
+            joint_lower=joint_lower,
+            joint_upper=joint_upper,
+        ),
+        RIGHT_STAGE: RobotSphereManifold(
+            robot=robot,
+            center=np.asarray(right_geom.center, dtype=float),
+            radius=float(right_geom.radius),
+            name="continuous_robot_right_sphere",
+            joint_lower=joint_lower,
+            joint_upper=joint_upper,
+        ),
+    }
+
+
+def _project_to_manifold(manifold, q: np.ndarray, *, local: bool = True):
+    if local and hasattr(manifold, "project_local"):
+        projection = manifold.project_local(q, tol=1.0e-7, max_iters=120, regularization=2.0e-3)
+        if projection.success:
+            return np.asarray(projection.x_projected, dtype=float)
+    projection = manifold.project(q, tol=1.0e-7, max_iters=120)
+    if not projection.success:
+        return None
+    return np.asarray(projection.x_projected, dtype=float)
+
+
+def _solve_shared_task_handoff(
+    *,
+    robot,
+    target_task: np.ndarray,
+    manifolds: list[object],
+    warm_starts: list[np.ndarray | None],
+    collision_fn=None,
+    task_tol: float = 8.0e-2,
+    residual_tol: float = 2.0e-3,
+) -> tuple[np.ndarray | None, str]:
+    target = np.asarray(target_task, dtype=float).reshape(3)
+    joint_lower = -np.pi * np.ones(3, dtype=float)
+    joint_upper = np.pi * np.ones(3, dtype=float)
+    guesses: list[np.ndarray] = []
+    for warm in warm_starts:
+        q = inverse_kinematics_start(
+            robot,
+            target,
+            warm_start=warm,
+            joint_lower=joint_lower,
+            joint_upper=joint_upper,
+            tol=max(float(task_tol), 8.0e-2),
+        )
+        if q is not None:
+            guesses.append(np.asarray(q, dtype=float))
+    if len(guesses) >= 2:
+        guesses.append(wrap_joint_angles(0.5 * (guesses[0] + guesses[-1])))
+    guesses.extend(
+        [
+            np.asarray([0.0, 0.55, -0.85], dtype=float),
+            np.asarray([0.0, 0.85, -0.65], dtype=float),
+            np.asarray([0.0, 0.20, 0.35], dtype=float),
+        ]
+    )
+
+    best_q: np.ndarray | None = None
+    best_score = float("inf")
+    best_detail = "no candidate evaluated"
+
+    def candidate_score(q: np.ndarray) -> tuple[float, float, float, bool]:
+        ee = end_effector_point(robot, q)
+        task_error = float(np.linalg.norm(ee - target))
+        residual = max(float(np.linalg.norm(manifold.residual(q))) for manifold in manifolds)
+        bounds_ok = all(bool(manifold.within_bounds(q, tol=residual_tol)) for manifold in manifolds)
+        collision_ok = True if collision_fn is None else not bool(collision_fn(q))
+        score = task_error + 10.0 * residual + (0.0 if bounds_ok and collision_ok else 100.0)
+        return score, task_error, residual, bool(bounds_ok and collision_ok)
+
+    for guess in guesses:
+        q0 = np.clip(wrap_joint_angles(np.asarray(guess, dtype=float).reshape(3)), joint_lower, joint_upper)
+        candidates = [q0]
+        if least_squares is not None:
+
+            def objective(q: np.ndarray) -> np.ndarray:
+                q_arr = np.asarray(q, dtype=float)
+                residual_parts = [end_effector_point(robot, q_arr) - target]
+                residual_parts.extend(np.asarray(manifold.residual(q_arr), dtype=float).reshape(-1) for manifold in manifolds)
+                residual_parts.append(2.0e-3 * wrap_joint_angles(q_arr - q0))
+                return np.concatenate(residual_parts)
+
+            try:
+                solve = least_squares(
+                    objective,
+                    q0,
+                    bounds=(joint_lower, joint_upper),
+                    max_nfev=160,
+                    xtol=1.0e-9,
+                    ftol=1.0e-9,
+                    gtol=1.0e-9,
+                )
+                candidates.insert(0, wrap_joint_angles(np.asarray(solve.x, dtype=float)))
+            except Exception:
+                pass
+        for q_candidate in candidates:
+            q = np.asarray(q_candidate, dtype=float)
+            # Polish each candidate on all active manifolds. This keeps the
+            # handoff shared while using branch-preserving projection locally.
+            for manifold in manifolds:
+                polished = _project_to_manifold(manifold, q, local=True)
+                if polished is not None:
+                    q = polished
+            score, task_error, residual, ok = candidate_score(q)
+            if score < best_score:
+                best_score = float(score)
+                best_q = np.asarray(q, dtype=float)
+                best_detail = f"task_error={task_error:.4g}, max_residual={residual:.4g}, bounds_collision_ok={ok}"
+            if ok and task_error <= float(task_tol) and residual <= float(residual_tol):
+                return np.asarray(q, dtype=float), f"shared handoff solved ({best_detail})"
+
+    return None, f"shared handoff failed ({best_detail})"
+
+
+def _connect_joint_segment(stage: str, manifold, q0: np.ndarray, q1: np.ndarray, joint_max_step: float, collision_fn=None):
+    result = explore_joint_manifold(
+        manifold,
+        np.asarray(q0, dtype=float),
+        np.asarray(q1, dtype=float),
+        max_step=float(joint_max_step),
+        projection_tol=1.0e-6,
+        collision_fn=collision_fn,
+        local_max_joint_step=float(joint_max_step),
+    )
+    if not result.success:
+        return None, f"{stage} segment failed: {result.message}"
+    return np.asarray(result.path, dtype=float), f"{stage} segment succeeded: {result.message}, points={len(result.path)}"
+
+
+def _sphere_task_arc(center: np.ndarray, radius: float, start: np.ndarray, goal: np.ndarray, step: float = 0.035) -> np.ndarray:
+    c = np.asarray(center, dtype=float)
+    r = float(radius)
+    a = (np.asarray(start, dtype=float) - c) / max(r, 1.0e-12)
+    b = (np.asarray(goal, dtype=float) - c) / max(r, 1.0e-12)
+    a = a / max(float(np.linalg.norm(a)), 1.0e-12)
+    b = b / max(float(np.linalg.norm(b)), 1.0e-12)
+    omega = float(np.arccos(np.clip(np.dot(a, b), -1.0, 1.0)))
+    count = max(2, int(np.ceil((r * omega) / max(float(step), 1.0e-6))) + 1)
+    if omega <= 1.0e-9:
+        return np.asarray([np.asarray(start, dtype=float), np.asarray(goal, dtype=float)], dtype=float)
+    points = []
+    for alpha in np.linspace(0.0, 1.0, count):
+        u = (
+            np.sin((1.0 - alpha) * omega) / np.sin(omega) * a
+            + np.sin(alpha * omega) / np.sin(omega) * b
+        )
+        points.append(c + r * u)
+    return np.asarray(points, dtype=float)
+
+
+def _linear_task_path(start: np.ndarray, goal: np.ndarray, step: float = 0.035) -> np.ndarray:
+    a = np.asarray(start, dtype=float)
+    b = np.asarray(goal, dtype=float)
+    distance = float(np.linalg.norm(b - a))
+    count = max(2, int(np.ceil(distance / max(float(step), 1.0e-6))) + 1)
+    return np.asarray([(1.0 - alpha) * a + alpha * b for alpha in np.linspace(0.0, 1.0, count)], dtype=float)
+
+
+def _stage_task_waypoints(stage: str, manifold, task0: np.ndarray, task1: np.ndarray) -> np.ndarray:
+    if stage in {LEFT_STAGE, RIGHT_STAGE} and hasattr(manifold, "center") and hasattr(manifold, "radius"):
+        return _sphere_task_arc(manifold.center, manifold.radius, task0, task1)
+    return _linear_task_path(task0, task1)
+
+
+def _connect_joint_segment_by_task_waypoints(
+    stage: str,
+    manifold,
+    q0: np.ndarray,
+    q1: np.ndarray,
+    task0: np.ndarray,
+    task1: np.ndarray,
+    joint_max_step: float,
+    collision_fn=None,
+) -> tuple[np.ndarray | None, str]:
+    waypoints = _stage_task_waypoints(stage, manifold, task0, task1)
+    path: list[np.ndarray] = [np.asarray(q0, dtype=float)]
+    current = np.asarray(q0, dtype=float)
+    for idx, target in enumerate(waypoints[1:], start=1):
+        q_ik = inverse_kinematics_start(
+            manifold.robot,
+            np.asarray(target, dtype=float),
+            warm_start=current,
+            joint_lower=getattr(manifold, "joint_lower", None),
+            joint_upper=getattr(manifold, "joint_upper", None),
+            tol=6.0e-2,
+        )
+        if q_ik is None:
+            return None, f"{stage} task-waypoint connector failed: IK failed at waypoint {idx}/{len(waypoints)-1}"
+        q_next = _project_to_manifold(manifold, q_ik, local=True)
+        if q_next is None:
+            return None, f"{stage} task-waypoint connector failed: projection failed at waypoint {idx}/{len(waypoints)-1}"
+        if not bool(manifold.within_bounds(q_next, tol=2.0e-3)):
+            return None, f"{stage} task-waypoint connector failed: bounds/patch violation at waypoint {idx}/{len(waypoints)-1}"
+        if collision_fn is not None and bool(collision_fn(q_next)):
+            return None, f"{stage} task-waypoint connector failed: collision at waypoint {idx}/{len(waypoints)-1}"
+        local_step = float(np.linalg.norm(wrap_joint_angles(q_next - current)))
+        task_error = float(np.linalg.norm(end_effector_point(manifold.robot, q_next) - np.asarray(target, dtype=float)))
+        residual = float(np.linalg.norm(manifold.residual(q_next)))
+        if local_step > float(joint_max_step) + 1.0e-9:
+            return None, (
+                f"{stage} task-waypoint connector failed: joint step {local_step:.4g} "
+                f"exceeds limit {float(joint_max_step):.4g} at waypoint {idx}/{len(waypoints)-1}"
+            )
+        if task_error > 8.0e-2 or residual > 2.0e-3:
+            return None, (
+                f"{stage} task-waypoint connector failed: task_error={task_error:.4g}, "
+                f"residual={residual:.4g} at waypoint {idx}/{len(waypoints)-1}"
+            )
+        path.append(np.asarray(q_next, dtype=float))
+        current = np.asarray(q_next, dtype=float)
+
+    if float(np.linalg.norm(wrap_joint_angles(path[-1] - np.asarray(q1, dtype=float)))) <= float(joint_max_step) + 1.0e-9:
+        path[-1] = np.asarray(q1, dtype=float)
+    else:
+        return None, f"{stage} task-waypoint connector failed: final q is not continuous with solved endpoint"
+    return np.asarray(path, dtype=float), f"{stage} task-waypoint connector succeeded, points={len(path)}"
+
+
+def _concatenate_labeled_segments(segments: list[tuple[str, np.ndarray]]) -> tuple[np.ndarray, list[str]]:
+    path_parts: list[np.ndarray] = []
+    labels: list[str] = []
+    for segment_index, (stage, segment) in enumerate(segments):
+        arr = np.asarray(segment, dtype=float)
+        if len(arr) == 0:
+            continue
+        if segment_index > 0:
+            arr = arr[1:]
+        path_parts.append(arr)
+        labels.extend([stage] * len(arr))
+    if not path_parts:
+        return np.zeros((0, 3), dtype=float), []
+    return np.vstack(path_parts), labels
+
+
+def _certify_labeled_joint_path(
+    *,
+    robot,
+    joint_path: np.ndarray,
+    stage_labels: list[str],
+    manifolds: dict[str, object],
+    joint_max_step: float,
+    collision_fn=None,
+    constraint_tol: float = 2.0e-3,
+) -> dict[str, object]:
+    q_path = np.asarray(joint_path, dtype=float)
+    residuals: list[float] = []
+    collision_free = True
+    for idx, q in enumerate(q_path):
+        stage = stage_labels[idx] if idx < len(stage_labels) else ""
+        manifold = manifolds.get(stage)
+        residual = float("inf") if manifold is None else float(np.linalg.norm(manifold.residual(q)))
+        if manifold is None or not bool(manifold.within_bounds(q, tol=constraint_tol)):
+            residual = max(residual, 10.0 * float(constraint_tol))
+        if collision_fn is not None and bool(collision_fn(q)):
+            collision_free = False
+            residual = max(residual, 100.0 * float(constraint_tol))
+        residuals.append(float(residual))
+    residual_arr = np.asarray(residuals, dtype=float)
+    joint_steps, max_step, mean_step, worst_step = joint_step_statistics(q_path)
+    max_residual = float(np.max(residual_arr)) if len(residual_arr) > 0 else float("inf")
+    mean_residual = float(np.mean(residual_arr)) if len(residual_arr) > 0 else float("inf")
+    constraint_ok = bool(collision_free and max_residual <= float(constraint_tol))
+    joint_ok = bool(max_step <= float(joint_max_step) + 1.0e-9)
+    return {
+        "certified": bool(constraint_ok and joint_ok),
+        "constraint_certified": bool(constraint_ok),
+        "joint_continuity_certified": bool(joint_ok),
+        "collision_free": bool(collision_free),
+        "residuals": residual_arr,
+        "joint_steps": np.asarray(joint_steps, dtype=float),
+        "max_constraint_residual": max_residual,
+        "mean_constraint_residual": mean_residual,
+        "max_joint_step": float(max_step),
+        "mean_joint_step": float(mean_step),
+        "worst_joint_step_index": int(worst_step),
+    }
+
+
+def _stage_order_valid(labels: list[str]) -> bool:
+    order = {LEFT_STAGE: 0, FAMILY_STAGE: 1, RIGHT_STAGE: 2}
+    values = [order.get(str(label), -1) for label in labels]
+    return bool(values and all(value >= 0 for value in values) and all(b >= a for a, b in zip(values[:-1], values[1:])))
+
+
+def _lambda_labels_for_stages(labels: list[str], selected_lambda: float) -> np.ndarray:
+    lam = float(selected_lambda)
+    return np.asarray([lam if str(label) == FAMILY_STAGE else np.nan for label in labels], dtype=float)
+
+
+def _lambda_fixed_audit(lambda_labels: np.ndarray) -> tuple[float, float, float, bool, int]:
+    arr = np.asarray(lambda_labels, dtype=float)
+    family = arr[np.isfinite(arr)]
+    if len(family) == 0:
+        return float("nan"), float("nan"), float("inf"), False, 0
+    lam_min = float(np.min(family))
+    lam_max = float(np.max(family))
+    variation = float(lam_max - lam_min)
+    return lam_min, lam_max, variation, bool(variation <= 1.0e-6), int(len(family))
+
+
+def _transition_index(theta_path: np.ndarray, theta: np.ndarray) -> int:
+    path = np.asarray(theta_path, dtype=float)
+    q = np.asarray(theta, dtype=float)
+    if len(path) == 0 or q.size != 3:
+        return -1
+    distances = np.linalg.norm(wrap_joint_angles(path - q.reshape(1, 3)), axis=1)
+    return int(np.argmin(distances))
+
+
+def _stack_residual(source_manifold, target_manifold, theta: np.ndarray) -> float:
+    q = np.asarray(theta, dtype=float)
+    if q.size != 3:
+        return float("inf")
+    source = float(np.linalg.norm(source_manifold.residual(q)))
+    target = float(np.linalg.norm(target_manifold.residual(q)))
+    return float(np.linalg.norm([source, target]))
+
+
+def realize_selected_continuous_transfer_route_jointspace(
+    *,
+    robot,
+    families,
+    start_task: np.ndarray,
+    selected_entry_point: np.ndarray,
+    selected_exit_point: np.ndarray,
+    goal_task: np.ndarray,
+    selected_lambda: float,
+    joint_max_step: float,
+    obstacles=None,
+) -> tuple[JointspaceRouteRealization, dict[str, object]]:
+    manifolds = build_robot_manifolds_for_selected_lambda(robot, families, float(selected_lambda))
+    collision_fn = None
+    if obstacles:
+        # Continuous-transfer Phase 2B currently has no robot obstacle model.
+        # Keep the hook explicit so obstacle-aware certification can be added
+        # without changing route semantics.
+        collision_fn = None
+
+    segment_messages: dict[str, str] = {}
+    q_start, msg = _solve_shared_task_handoff(
+        robot=robot,
+        target_task=start_task,
+        manifolds=[manifolds[LEFT_STAGE]],
+        warm_starts=[None],
+        collision_fn=collision_fn,
+    )
+    segment_messages["start_ik"] = msg
+    q_entry, msg = _solve_shared_task_handoff(
+        robot=robot,
+        target_task=selected_entry_point,
+        manifolds=[manifolds[LEFT_STAGE], manifolds[FAMILY_STAGE]],
+        warm_starts=[q_start, None],
+        collision_fn=collision_fn,
+    )
+    segment_messages["entry_handoff"] = msg
+    q_goal_seed, msg = _solve_shared_task_handoff(
+        robot=robot,
+        target_task=goal_task,
+        manifolds=[manifolds[RIGHT_STAGE]],
+        warm_starts=[q_entry, None],
+        collision_fn=collision_fn,
+    )
+    segment_messages["goal_ik_seed"] = msg
+    q_exit, msg = _solve_shared_task_handoff(
+        robot=robot,
+        target_task=selected_exit_point,
+        manifolds=[manifolds[FAMILY_STAGE], manifolds[RIGHT_STAGE]],
+        warm_starts=[q_entry, q_goal_seed, q_start, None],
+        collision_fn=collision_fn,
+    )
+    segment_messages["exit_handoff"] = msg
+    q_goal, msg = _solve_shared_task_handoff(
+        robot=robot,
+        target_task=goal_task,
+        manifolds=[manifolds[RIGHT_STAGE]],
+        warm_starts=[q_exit, q_goal_seed, None],
+        collision_fn=collision_fn,
+    )
+    segment_messages["goal_ik"] = msg
+
+    missing = [
+        name
+        for name, q in (
+            ("start_q", q_start),
+            ("entry_q", q_entry),
+            ("exit_q", q_exit),
+            ("goal_q", q_goal),
+        )
+        if q is None
+    ]
+    if missing:
+        message = "joint-space realization failed before local planning: missing " + ", ".join(missing)
+        return (
+            JointspaceRouteRealization(
+                success=False,
+                dense_joint_path=np.zeros((0, 3), dtype=float),
+                stage_labels=[],
+                lambda_labels=np.zeros(0, dtype=float),
+                task_path=np.zeros((0, 3), dtype=float),
+                residuals=np.zeros(0, dtype=float),
+                joint_steps=np.zeros(0, dtype=float),
+                max_constraint_residual=float("inf"),
+                mean_constraint_residual=float("inf"),
+                max_joint_step=float("inf"),
+                mean_joint_step=float("inf"),
+                collision_free=False,
+                message=message,
+                segment_messages=segment_messages,
+            ),
+            manifolds,
+        )
+
+    left_path, segment_messages["left_segment"] = _connect_joint_segment(
+        LEFT_STAGE, manifolds[LEFT_STAGE], q_start, q_entry, float(joint_max_step), collision_fn=collision_fn
+    )
+    if left_path is None:
+        left_path, segment_messages["left_segment_task_waypoint_fallback"] = _connect_joint_segment_by_task_waypoints(
+            LEFT_STAGE,
+            manifolds[LEFT_STAGE],
+            q_start,
+            q_entry,
+            start_task,
+            selected_entry_point,
+            float(joint_max_step),
+            collision_fn=collision_fn,
+        )
+    family_path, segment_messages["family_segment"] = _connect_joint_segment(
+        FAMILY_STAGE, manifolds[FAMILY_STAGE], q_entry, q_exit, float(joint_max_step), collision_fn=collision_fn
+    )
+    if family_path is None:
+        family_path, segment_messages["family_segment_task_waypoint_fallback"] = _connect_joint_segment_by_task_waypoints(
+            FAMILY_STAGE,
+            manifolds[FAMILY_STAGE],
+            q_entry,
+            q_exit,
+            selected_entry_point,
+            selected_exit_point,
+            float(joint_max_step),
+            collision_fn=collision_fn,
+        )
+    right_path, segment_messages["right_segment"] = _connect_joint_segment(
+        RIGHT_STAGE, manifolds[RIGHT_STAGE], q_exit, q_goal, float(joint_max_step), collision_fn=collision_fn
+    )
+    if right_path is None:
+        right_path, segment_messages["right_segment_task_waypoint_fallback"] = _connect_joint_segment_by_task_waypoints(
+            RIGHT_STAGE,
+            manifolds[RIGHT_STAGE],
+            q_exit,
+            q_goal,
+            selected_exit_point,
+            goal_task,
+            float(joint_max_step),
+            collision_fn=collision_fn,
+        )
+    if left_path is None or family_path is None or right_path is None:
+        message = "joint-space realization failed during local segment planning"
+        return (
+            JointspaceRouteRealization(
+                success=False,
+                dense_joint_path=np.zeros((0, 3), dtype=float),
+                stage_labels=[],
+                lambda_labels=np.zeros(0, dtype=float),
+                task_path=np.zeros((0, 3), dtype=float),
+                residuals=np.zeros(0, dtype=float),
+                joint_steps=np.zeros(0, dtype=float),
+                max_constraint_residual=float("inf"),
+                mean_constraint_residual=float("inf"),
+                max_joint_step=float("inf"),
+                mean_joint_step=float("inf"),
+                collision_free=False,
+                message=message,
+                segment_messages=segment_messages,
+            ),
+            manifolds,
+        )
+
+    dense_joint_path, labels = _concatenate_labeled_segments(
+        [(LEFT_STAGE, left_path), (FAMILY_STAGE, family_path), (RIGHT_STAGE, right_path)]
+    )
+    cert = _certify_labeled_joint_path(
+        robot=robot,
+        joint_path=dense_joint_path,
+        stage_labels=labels,
+        manifolds=manifolds,
+        joint_max_step=float(joint_max_step),
+        collision_fn=collision_fn,
+    )
+    task_path = joint_path_to_task_path(robot, dense_joint_path)
+    message = (
+        "selected-lambda joint-space local replan certified"
+        if bool(cert["certified"])
+        else "selected-lambda joint-space local replan failed certification"
+    )
+    return (
+        JointspaceRouteRealization(
+            success=bool(cert["certified"]),
+            dense_joint_path=np.asarray(dense_joint_path, dtype=float),
+            stage_labels=list(labels),
+            lambda_labels=_lambda_labels_for_stages(list(labels), float(selected_lambda)),
+            task_path=np.asarray(task_path, dtype=float),
+            residuals=np.asarray(cert["residuals"], dtype=float),
+            joint_steps=np.asarray(cert["joint_steps"], dtype=float),
+            max_constraint_residual=float(cert["max_constraint_residual"]),
+            mean_constraint_residual=float(cert["mean_constraint_residual"]),
+            max_joint_step=float(cert["max_joint_step"]),
+            mean_joint_step=float(cert["mean_joint_step"]),
+            collision_free=bool(cert["collision_free"]),
+            message=message,
+            segment_messages=segment_messages,
+        ),
+        manifolds,
+    )
+
+
+def _task_route_length(points: list[np.ndarray]) -> float:
+    if len(points) < 2:
+        return 0.0
+    return float(
+        sum(
+            np.linalg.norm(np.asarray(b, dtype=float) - np.asarray(a, dtype=float))
+            for a, b in zip(points[:-1], points[1:])
+        )
+    )
+
+
+def _build_full_jointspace_route_candidates(
+    *,
+    entry_transitions: list[RobotContinuousTransitionHypothesis],
+    exit_transitions: list[RobotContinuousTransitionHypothesis],
+    start_task: np.ndarray,
+    goal_task: np.ndarray,
+    lambda_tol: float = 1.0e-4,
+    reconcile_tol: float = 3.0e-2,
+) -> tuple[list[FullJointspaceRouteCandidate], dict[str, int]]:
+    counters = {
+        "route_candidates_evaluated": int(len(entry_transitions) * len(exit_transitions)),
+        "route_candidates_built": 0,
+        "route_candidates_rejected_lambda_mismatch": 0,
+    }
+    exact_candidates: list[FullJointspaceRouteCandidate] = []
+    reconciled_candidates: list[FullJointspaceRouteCandidate] = []
+    for entry in entry_transitions:
+        for exit in exit_transitions:
+            lambda_gap = abs(float(entry.lambda_value) - float(exit.lambda_value))
+            task_cost = _task_route_length(
+                [
+                    np.asarray(start_task, dtype=float),
+                    np.asarray(entry.task_point, dtype=float),
+                    np.asarray(exit.task_point, dtype=float),
+                    np.asarray(goal_task, dtype=float),
+                ]
+            )
+            joint_cost = float(np.linalg.norm(wrap_joint_angles(entry.q - exit.q)))
+            residual_cost = float(entry.residual_norm + exit.residual_norm)
+            score = (
+                task_cost
+                + 0.20 * joint_cost
+                + 200.0 * residual_cost
+                + 50.0 * lambda_gap
+                + 0.01 * float(entry.score + exit.score)
+            )
+            if lambda_gap <= float(lambda_tol):
+                exact_candidates.append(
+                    FullJointspaceRouteCandidate(
+                        entry=entry,
+                        exit=exit,
+                        selected_lambda=float(entry.lambda_value),
+                        score=float(score),
+                        lambda_reconciliation="exact_same_lambda",
+                    )
+                )
+            elif lambda_gap <= float(reconcile_tol):
+                reconciled_candidates.append(
+                    FullJointspaceRouteCandidate(
+                        entry=entry,
+                        exit=exit,
+                        selected_lambda=float(entry.lambda_value),
+                        score=float(score + 5.0 * lambda_gap),
+                        lambda_reconciliation="reconciled_to_entry_lambda",
+                    )
+                )
+            else:
+                counters["route_candidates_rejected_lambda_mismatch"] += 1
+    candidates = exact_candidates if exact_candidates else reconciled_candidates
+    candidates.sort(key=lambda candidate: float(candidate.score))
+    counters["route_candidates_built"] = len(candidates)
+    if exact_candidates:
+        counters["route_candidates_rejected_lambda_mismatch"] += len(reconciled_candidates)
+    return candidates, counters
+
+
+def _selected_lambda_family_store(
+    evidence: RobotJointspaceContinuousEvidence,
+    selected_lambda: float,
+    lambda_match_tol: float,
+) -> RobotFamilyLeafStore | None:
+    compatible = [
+        store
+        for lam, store in evidence.family_leaf_stores.items()
+        if abs(float(lam) - float(selected_lambda)) <= float(lambda_match_tol)
+    ]
+    if not compatible:
+        return None
+    compatible.sort(key=lambda store: abs(float(store.lambda_value) - float(selected_lambda)))
+    return compatible[0]
+
+
+def _nearest_family_node_ids(store: RobotFamilyLeafStore, q: np.ndarray, *, preferred: int = -1, limit: int = 12) -> list[int]:
+    query = np.asarray(q, dtype=float).reshape(3)
+    ranked = [
+        (float(np.linalg.norm(wrap_joint_angles(query - np.asarray(node, dtype=float)))), int(idx))
+        for idx, node in enumerate(store.nodes)
+    ]
+    ranked.sort(key=lambda item: item[0])
+    ids: list[int] = []
+    if 0 <= int(preferred) < len(store.nodes):
+        ids.append(int(preferred))
+    for _distance, node_id in ranked:
+        if int(node_id) not in ids:
+            ids.append(int(node_id))
+        if len(ids) >= int(limit):
+            break
+    return ids
+
+
+def _build_family_query_connectors(
+    *,
+    store: RobotFamilyLeafStore,
+    query_q: np.ndarray,
+    query_node_id: int,
+    neighbor_ids: list[int],
+    joint_max_step: float,
+    direction: str,
+    collision_fn=None,
+) -> list[RobotFamilyEvidenceEdge]:
+    connectors: list[RobotFamilyEvidenceEdge] = []
+    for node_id in neighbor_ids:
+        node_q = np.asarray(store.nodes[int(node_id)], dtype=float)
+        if str(direction) == "entry":
+            src_id, dst_id = int(query_node_id), int(node_id)
+            q0, q1 = np.asarray(query_q, dtype=float), node_q
+        else:
+            src_id, dst_id = int(node_id), int(query_node_id)
+            q0, q1 = node_q, np.asarray(query_q, dtype=float)
+        result = explore_joint_manifold(
+            store.manifold,
+            q0,
+            q1,
+            max_step=float(joint_max_step),
+            projection_tol=1.0e-6,
+            collision_fn=collision_fn,
+            local_max_joint_step=float(joint_max_step),
+        )
+        if not result.success:
+            continue
+        edge = _certify_family_edge_path(
+            store=store,
+            src_node_id=src_id,
+            dst_node_id=dst_id,
+            dense_theta_path=np.asarray(result.path, dtype=float),
+            joint_max_step=float(joint_max_step),
+            collision_fn=collision_fn,
+            source="family_graph_query_connector",
+        )
+        if edge.certified:
+            connectors.append(edge)
+    return connectors
+
+
+def _dijkstra_family_edges(
+    *,
+    node_count: int,
+    edges: list[RobotFamilyEvidenceEdge],
+    start_node_id: int,
+    goal_node_id: int,
+) -> tuple[list[int], list[tuple[RobotFamilyEvidenceEdge, bool]]]:
+    adjacency: dict[int, list[tuple[int, float, int, bool]]] = {idx: [] for idx in range(int(node_count))}
+    for edge_idx, edge in enumerate(edges):
+        src = int(edge.src_node_id)
+        dst = int(edge.dst_node_id)
+        if src not in adjacency or dst not in adjacency:
+            continue
+        cost = float(edge.cost)
+        adjacency[src].append((dst, cost, int(edge_idx), False))
+        adjacency[dst].append((src, cost, int(edge_idx), True))
+    heap: list[tuple[float, int]] = [(0.0, int(start_node_id))]
+    distances = {int(start_node_id): 0.0}
+    parent: dict[int, tuple[int, int, bool]] = {}
+    visited: set[int] = set()
+    while heap:
+        cost, node = heapq.heappop(heap)
+        if node in visited:
+            continue
+        visited.add(node)
+        if node == int(goal_node_id):
+            break
+        for next_node, edge_cost, edge_idx, reversed_edge in adjacency.get(node, []):
+            new_cost = float(cost) + float(edge_cost)
+            if new_cost + 1.0e-12 < float(distances.get(int(next_node), float("inf"))):
+                distances[int(next_node)] = new_cost
+                parent[int(next_node)] = (int(node), int(edge_idx), bool(reversed_edge))
+                heapq.heappush(heap, (new_cost, int(next_node)))
+    if int(goal_node_id) not in distances:
+        return [], []
+    nodes = [int(goal_node_id)]
+    edge_refs: list[tuple[RobotFamilyEvidenceEdge, bool]] = []
+    current = int(goal_node_id)
+    while current != int(start_node_id):
+        prev, edge_idx, reversed_edge = parent[current]
+        edge_refs.append((edges[int(edge_idx)], bool(reversed_edge)))
+        nodes.append(int(prev))
+        current = int(prev)
+    nodes.reverse()
+    edge_refs.reverse()
+    return nodes, edge_refs
+
+
+def _nearest_stage_node_ids(store: RobotStageEvidenceStore, q: np.ndarray, *, preferred: int = -1, limit: int = 24) -> list[int]:
+    query = np.asarray(q, dtype=float).reshape(3)
+    ranked = [
+        (float(np.linalg.norm(wrap_joint_angles(query - np.asarray(node, dtype=float)))), int(idx))
+        for idx, node in enumerate(store.nodes)
+    ]
+    ranked.sort(key=lambda item: item[0])
+    ids: list[int] = []
+    if 0 <= int(preferred) < len(store.nodes):
+        ids.append(int(preferred))
+    for _distance, node_id in ranked:
+        if int(node_id) not in ids:
+            ids.append(int(node_id))
+        if len(ids) >= int(limit):
+            break
+    return ids
+
+
+def _build_stage_query_connectors(
+    *,
+    store: RobotStageEvidenceStore,
+    stage: str,
+    query_q: np.ndarray,
+    query_node_id: int,
+    neighbor_ids: list[int],
+    joint_max_step: float,
+    direction: str,
+    collision_fn=None,
+) -> list[RobotStageEvidenceEdge]:
+    connectors: list[RobotStageEvidenceEdge] = []
+    for node_id in neighbor_ids:
+        node_q = np.asarray(store.nodes[int(node_id)], dtype=float)
+        if str(direction) == "from_query":
+            src_id, dst_id = int(query_node_id), int(node_id)
+            q0, q1 = np.asarray(query_q, dtype=float), node_q
+        else:
+            src_id, dst_id = int(node_id), int(query_node_id)
+            q0, q1 = node_q, np.asarray(query_q, dtype=float)
+        result = explore_joint_manifold(
+            store.manifold,
+            q0,
+            q1,
+            max_step=float(joint_max_step),
+            projection_tol=1.0e-6,
+            collision_fn=collision_fn,
+            local_max_joint_step=float(joint_max_step),
+        )
+        if not result.success:
+            continue
+        edge = _certify_stage_edge_path(
+            store=store,
+            stage=str(stage),
+            src_node_id=src_id,
+            dst_node_id=dst_id,
+            dense_theta_path=np.asarray(result.path, dtype=float),
+            joint_max_step=float(joint_max_step),
+            collision_fn=collision_fn,
+            source=f"{stage}_graph_query_connector",
+        )
+        if edge.certified:
+            connectors.append(edge)
+    return connectors
+
+
+def extract_stage_graph_route(
+    *,
+    store: RobotStageEvidenceStore,
+    stage: str,
+    q_start: np.ndarray,
+    q_goal: np.ndarray,
+    joint_max_step: float,
+    start_preferred_node_id: int = -1,
+    goal_preferred_node_id: int = -1,
+    collision_fn=None,
+) -> StageGraphRouteResult:
+    evidence_edges = [edge for edge in store.edges if bool(edge.certified) and str(edge.stage) == str(stage)]
+    if len(store.nodes) == 0 or len(evidence_edges) == 0:
+        return StageGraphRouteResult(
+            success=False,
+            dense_theta_path=np.zeros((0, 3), dtype=float),
+            edge_sources=[],
+            node_ids=[],
+            graph_edges_used=0,
+            query_connectors_used=0,
+            joint_length=0.0,
+            max_residual=float("inf"),
+            max_joint_step=float("inf"),
+            certified=False,
+            failure_reason=f"{stage}_graph_no_evidence_edges",
+        )
+    start_query_id = len(store.nodes)
+    goal_query_id = len(store.nodes) + 1
+    start_neighbors = _nearest_stage_node_ids(
+        store,
+        q_start,
+        preferred=int(start_preferred_node_id),
+        limit=24,
+    )
+    goal_neighbors = _nearest_stage_node_ids(
+        store,
+        q_goal,
+        preferred=int(goal_preferred_node_id),
+        limit=24,
+    )
+    start_connectors = _build_stage_query_connectors(
+        store=store,
+        stage=str(stage),
+        query_q=np.asarray(q_start, dtype=float),
+        query_node_id=int(start_query_id),
+        neighbor_ids=start_neighbors,
+        joint_max_step=float(joint_max_step),
+        direction="from_query",
+        collision_fn=collision_fn,
+    )
+    goal_connectors = _build_stage_query_connectors(
+        store=store,
+        stage=str(stage),
+        query_q=np.asarray(q_goal, dtype=float),
+        query_node_id=int(goal_query_id),
+        neighbor_ids=goal_neighbors,
+        joint_max_step=float(joint_max_step),
+        direction="to_query",
+        collision_fn=collision_fn,
+    )
+    if not start_connectors or not goal_connectors:
+        return StageGraphRouteResult(
+            success=False,
+            dense_theta_path=np.zeros((0, 3), dtype=float),
+            edge_sources=[],
+            node_ids=[],
+            graph_edges_used=0,
+            query_connectors_used=0,
+            joint_length=0.0,
+            max_residual=float("inf"),
+            max_joint_step=float("inf"),
+            certified=False,
+            failure_reason=f"{stage}_graph_query_connection_failed",
+        )
+    graph_edges = [*evidence_edges, *start_connectors, *goal_connectors]
+    node_ids, edge_refs = _dijkstra_family_edges(
+        node_count=len(store.nodes) + 2,
+        edges=graph_edges,
+        start_node_id=int(start_query_id),
+        goal_node_id=int(goal_query_id),
+    )
+    if not edge_refs:
+        return StageGraphRouteResult(
+            success=False,
+            dense_theta_path=np.zeros((0, 3), dtype=float),
+            edge_sources=[],
+            node_ids=node_ids,
+            graph_edges_used=0,
+            query_connectors_used=0,
+            joint_length=0.0,
+            max_residual=float("inf"),
+            max_joint_step=float("inf"),
+            certified=False,
+            failure_reason=f"{stage}_graph_search_failed",
+        )
+    path_parts: list[np.ndarray] = []
+    edge_sources: list[str] = []
+    for idx, (edge, reversed_edge) in enumerate(edge_refs):
+        segment = np.asarray(edge.dense_theta_path, dtype=float)
+        if bool(reversed_edge):
+            segment = segment[::-1]
+        if idx > 0:
+            segment = segment[1:]
+        path_parts.append(segment)
+        edge_sources.append(str(edge.source))
+    dense_path = np.vstack(path_parts) if path_parts else np.zeros((0, 3), dtype=float)
+    route_cert = _certify_stage_edge_path(
+        store=store,
+        stage=str(stage),
+        src_node_id=int(start_query_id),
+        dst_node_id=int(goal_query_id),
+        dense_theta_path=dense_path,
+        joint_max_step=float(joint_max_step),
+        collision_fn=collision_fn,
+        source=f"{stage}_evidence_graph_route",
+    )
+    graph_edges_used = int(sum(1 for source in edge_sources if source == f"{stage}_evidence_edge"))
+    query_connectors_used = int(sum(1 for source in edge_sources if source == f"{stage}_graph_query_connector"))
+    if not route_cert.certified or graph_edges_used <= 0:
+        return StageGraphRouteResult(
+            success=False,
+            dense_theta_path=dense_path,
+            edge_sources=edge_sources,
+            node_ids=node_ids,
+            graph_edges_used=graph_edges_used,
+            query_connectors_used=query_connectors_used,
+            joint_length=float(route_cert.cost),
+            max_residual=float(route_cert.max_residual),
+            max_joint_step=float(route_cert.max_joint_step),
+            certified=bool(route_cert.certified),
+            failure_reason=f"{stage}_graph_route_certification_failed",
+        )
+    return StageGraphRouteResult(
+        success=True,
+        dense_theta_path=dense_path,
+        edge_sources=edge_sources,
+        node_ids=node_ids,
+        graph_edges_used=graph_edges_used,
+        query_connectors_used=query_connectors_used,
+        joint_length=float(route_cert.cost),
+        max_residual=float(route_cert.max_residual),
+        max_joint_step=float(route_cert.max_joint_step),
+        certified=True,
+        failure_reason="",
+    )
+
+
+def extract_selected_lambda_family_graph_route(
+    *,
+    evidence: RobotJointspaceContinuousEvidence,
+    candidate: FullJointspaceRouteCandidate,
+    joint_max_step: float,
+    lambda_match_tol: float = 1.0e-6,
+    collision_fn=None,
+) -> FamilyGraphRouteResult:
+    selected_lambda = float(candidate.selected_lambda)
+    store = _selected_lambda_family_store(evidence, selected_lambda, float(lambda_match_tol))
+    if store is None:
+        return FamilyGraphRouteResult(
+            success=False,
+            dense_theta_path=np.zeros((0, 3), dtype=float),
+            edge_sources=[],
+            node_ids=[],
+            family_graph_edges_used=0,
+            query_connectors_used=0,
+            joint_length=0.0,
+            max_residual=float("inf"),
+            max_joint_step=float("inf"),
+            certified=False,
+            lambda_fixed=False,
+            selected_lambda_family_nodes=0,
+            selected_lambda_family_edges=0,
+            lambda_match_tol=float(lambda_match_tol),
+            failure_reason="family_graph_no_selected_lambda_edges",
+        )
+    evidence_edges = [
+        edge
+        for edge in store.edges
+        if bool(edge.certified) and abs(float(edge.lambda_value) - selected_lambda) <= float(lambda_match_tol)
+    ]
+    selected_nodes = int(len(store.nodes))
+    selected_edges = int(len(evidence_edges))
+    if selected_nodes == 0 or selected_edges == 0:
+        return FamilyGraphRouteResult(
+            success=False,
+            dense_theta_path=np.zeros((0, 3), dtype=float),
+            edge_sources=[],
+            node_ids=[],
+            family_graph_edges_used=0,
+            query_connectors_used=0,
+            joint_length=0.0,
+            max_residual=float("inf"),
+            max_joint_step=float("inf"),
+            certified=False,
+            lambda_fixed=False,
+            selected_lambda_family_nodes=selected_nodes,
+            selected_lambda_family_edges=selected_edges,
+            lambda_match_tol=float(lambda_match_tol),
+            failure_reason="family_graph_no_selected_lambda_edges",
+        )
+
+    entry_query_id = selected_nodes
+    exit_query_id = selected_nodes + 1
+    entry_neighbors = _nearest_family_node_ids(
+        store,
+        candidate.entry.q,
+        preferred=int(candidate.entry.target_node_id),
+        limit=14,
+    )
+    exit_neighbors = _nearest_family_node_ids(
+        store,
+        candidate.exit.q,
+        preferred=int(candidate.exit.source_node_id),
+        limit=14,
+    )
+    entry_connectors = _build_family_query_connectors(
+        store=store,
+        query_q=np.asarray(candidate.entry.q, dtype=float),
+        query_node_id=int(entry_query_id),
+        neighbor_ids=entry_neighbors,
+        joint_max_step=float(joint_max_step),
+        direction="entry",
+        collision_fn=collision_fn,
+    )
+    exit_connectors = _build_family_query_connectors(
+        store=store,
+        query_q=np.asarray(candidate.exit.q, dtype=float),
+        query_node_id=int(exit_query_id),
+        neighbor_ids=exit_neighbors,
+        joint_max_step=float(joint_max_step),
+        direction="exit",
+        collision_fn=collision_fn,
+    )
+    if not entry_connectors or not exit_connectors:
+        return FamilyGraphRouteResult(
+            success=False,
+            dense_theta_path=np.zeros((0, 3), dtype=float),
+            edge_sources=[],
+            node_ids=[],
+            family_graph_edges_used=0,
+            query_connectors_used=0,
+            joint_length=0.0,
+            max_residual=float("inf"),
+            max_joint_step=float("inf"),
+            certified=False,
+            lambda_fixed=False,
+            selected_lambda_family_nodes=selected_nodes,
+            selected_lambda_family_edges=selected_edges,
+            lambda_match_tol=float(lambda_match_tol),
+            failure_reason="family_graph_query_connection_failed",
+        )
+
+    graph_edges = [*evidence_edges, *entry_connectors, *exit_connectors]
+    node_ids, edge_refs = _dijkstra_family_edges(
+        node_count=selected_nodes + 2,
+        edges=graph_edges,
+        start_node_id=int(entry_query_id),
+        goal_node_id=int(exit_query_id),
+    )
+    if not edge_refs:
+        return FamilyGraphRouteResult(
+            success=False,
+            dense_theta_path=np.zeros((0, 3), dtype=float),
+            edge_sources=[],
+            node_ids=node_ids,
+            family_graph_edges_used=0,
+            query_connectors_used=0,
+            joint_length=0.0,
+            max_residual=float("inf"),
+            max_joint_step=float("inf"),
+            certified=False,
+            lambda_fixed=False,
+            selected_lambda_family_nodes=selected_nodes,
+            selected_lambda_family_edges=selected_edges,
+            lambda_match_tol=float(lambda_match_tol),
+            failure_reason="family_graph_search_failed",
+        )
+
+    path_parts: list[np.ndarray] = []
+    edge_sources: list[str] = []
+    for idx, (edge, reversed_edge) in enumerate(edge_refs):
+        segment = np.asarray(edge.dense_theta_path, dtype=float)
+        if bool(reversed_edge):
+            segment = segment[::-1]
+        if idx > 0:
+            segment = segment[1:]
+        path_parts.append(segment)
+        edge_sources.append(str(edge.source))
+    dense_path = np.vstack(path_parts) if path_parts else np.zeros((0, 3), dtype=float)
+    route_cert = _certify_family_edge_path(
+        store=store,
+        src_node_id=int(entry_query_id),
+        dst_node_id=int(exit_query_id),
+        dense_theta_path=dense_path,
+        joint_max_step=float(joint_max_step),
+        collision_fn=collision_fn,
+        source="selected_lambda_family_evidence_graph_route",
+    )
+    family_edges_used = int(sum(1 for source in edge_sources if source == "family_evidence_edge"))
+    query_connectors_used = int(sum(1 for source in edge_sources if source == "family_graph_query_connector"))
+    lambda_fixed = bool(abs(float(store.lambda_value) - selected_lambda) <= float(lambda_match_tol))
+    if not route_cert.certified or not lambda_fixed or family_edges_used <= 0:
+        return FamilyGraphRouteResult(
+            success=False,
+            dense_theta_path=dense_path,
+            edge_sources=edge_sources,
+            node_ids=node_ids,
+            family_graph_edges_used=family_edges_used,
+            query_connectors_used=query_connectors_used,
+            joint_length=float(route_cert.cost),
+            max_residual=float(route_cert.max_residual),
+            max_joint_step=float(route_cert.max_joint_step),
+            certified=bool(route_cert.certified),
+            lambda_fixed=bool(lambda_fixed),
+            selected_lambda_family_nodes=selected_nodes,
+            selected_lambda_family_edges=selected_edges,
+            lambda_match_tol=float(lambda_match_tol),
+            failure_reason="family_graph_route_certification_failed",
+        )
+    return FamilyGraphRouteResult(
+        success=True,
+        dense_theta_path=dense_path,
+        edge_sources=edge_sources,
+        node_ids=node_ids,
+        family_graph_edges_used=family_edges_used,
+        query_connectors_used=query_connectors_used,
+        joint_length=float(route_cert.cost),
+        max_residual=float(route_cert.max_residual),
+        max_joint_step=float(route_cert.max_joint_step),
+        certified=True,
+        lambda_fixed=bool(lambda_fixed),
+        selected_lambda_family_nodes=selected_nodes,
+        selected_lambda_family_edges=selected_edges,
+        lambda_match_tol=float(lambda_match_tol),
+        failure_reason="",
+    )
+
+
+def realize_full_jointspace_candidate_route(
+    *,
+    robot,
+    families,
+    evidence: RobotJointspaceContinuousEvidence,
+    start_q: np.ndarray,
+    goal_q: np.ndarray,
+    start_task: np.ndarray,
+    goal_task: np.ndarray,
+    candidate: FullJointspaceRouteCandidate,
+    joint_max_step: float,
+    allow_family_local_continuation_fallback: bool = False,
+    allow_closure_local_continuation_fallback: bool = False,
+    lambda_match_tol: float = 1.0e-6,
+) -> tuple[JointspaceRouteRealization, dict[str, object], str]:
+    manifolds = build_robot_manifolds_for_selected_lambda(robot, families, float(candidate.selected_lambda))
+    collision_fn = None
+    segment_messages: dict[str, str] = {}
+    q_entry = np.asarray(candidate.entry.q, dtype=float)
+    q_exit = np.asarray(candidate.exit.q, dtype=float)
+    lambda_reconciliation = str(candidate.lambda_reconciliation)
+
+    if lambda_reconciliation != "exact_same_lambda":
+        q_entry_new, detail = solve_shared_robot_transition_q(
+            robot=robot,
+            source_manifold=manifolds[LEFT_STAGE],
+            target_manifold=manifolds[FAMILY_STAGE],
+            source_hint=q_entry,
+            target_hint=q_entry,
+            transition_task_hint=candidate.entry.task_point,
+            collision_fn=collision_fn,
+        )
+        segment_messages["entry_lambda_reconciliation"] = str(detail)
+        q_exit_new, detail = solve_shared_robot_transition_q(
+            robot=robot,
+            source_manifold=manifolds[FAMILY_STAGE],
+            target_manifold=manifolds[RIGHT_STAGE],
+            source_hint=q_exit,
+            target_hint=q_exit,
+            transition_task_hint=candidate.exit.task_point,
+            collision_fn=collision_fn,
+        )
+        segment_messages["exit_lambda_reconciliation"] = str(detail)
+        if q_entry_new is None or q_exit_new is None:
+            return (
+                JointspaceRouteRealization(
+                    success=False,
+                    dense_joint_path=np.zeros((0, 3), dtype=float),
+                    stage_labels=[],
+                    lambda_labels=np.zeros(0, dtype=float),
+                    task_path=np.zeros((0, 3), dtype=float),
+                    residuals=np.zeros(0, dtype=float),
+                    joint_steps=np.zeros(0, dtype=float),
+                    max_constraint_residual=float("inf"),
+                    mean_constraint_residual=float("inf"),
+                    max_joint_step=float("inf"),
+                    mean_joint_step=float("inf"),
+                    collision_free=False,
+                    message="lambda reconciliation failed",
+                    segment_messages=segment_messages,
+                ),
+                manifolds,
+                lambda_reconciliation,
+            )
+        q_entry = np.asarray(q_entry_new, dtype=float)
+        q_exit = np.asarray(q_exit_new, dtype=float)
+
+    left_graph_route = extract_stage_graph_route(
+        store=evidence.left_store,
+        stage=LEFT_STAGE,
+        q_start=np.asarray(start_q, dtype=float),
+        q_goal=q_entry,
+        joint_max_step=float(joint_max_step),
+        start_preferred_node_id=0,
+        goal_preferred_node_id=int(candidate.entry.source_node_id),
+        collision_fn=collision_fn,
+    )
+    if left_graph_route.success:
+        left_path = np.asarray(left_graph_route.dense_theta_path, dtype=float)
+        left_segment_source = "left_evidence_graph"
+        segment_messages["left_segment"] = (
+            "left evidence graph route succeeded: "
+            f"left_edges={left_graph_route.graph_edges_used}, "
+            f"query_connectors={left_graph_route.query_connectors_used}"
+        )
+    elif bool(allow_closure_local_continuation_fallback):
+        left_path, segment_messages["left_segment"] = _connect_joint_segment(
+            LEFT_STAGE, manifolds[LEFT_STAGE], start_q, q_entry, float(joint_max_step), collision_fn=collision_fn
+        )
+        left_segment_source = "fallback_projected_jointspace_continuation"
+        segment_messages["left_graph_route_failure"] = str(left_graph_route.failure_reason)
+    else:
+        left_path = None
+        left_segment_source = "left_evidence_graph_failed"
+        segment_messages["left_segment"] = f"left evidence graph route failed: {left_graph_route.failure_reason}"
+
+    family_graph_route = extract_selected_lambda_family_graph_route(
+        evidence=evidence,
+        candidate=candidate,
+        joint_max_step=float(joint_max_step),
+        lambda_match_tol=float(lambda_match_tol),
+        collision_fn=collision_fn,
+    )
+    if family_graph_route.success:
+        family_path = np.asarray(family_graph_route.dense_theta_path, dtype=float)
+        segment_messages["family_segment"] = (
+            "selected-lambda family evidence graph route succeeded: "
+            f"family_edges={family_graph_route.family_graph_edges_used}, "
+            f"query_connectors={family_graph_route.query_connectors_used}"
+        )
+        family_segment_source = "selected_lambda_family_evidence_graph"
+    elif bool(allow_family_local_continuation_fallback):
+        family_path, segment_messages["family_segment"] = _connect_joint_segment(
+            FAMILY_STAGE, manifolds[FAMILY_STAGE], q_entry, q_exit, float(joint_max_step), collision_fn=collision_fn
+        )
+        family_segment_source = "fallback_projected_jointspace_continuation"
+        segment_messages["family_graph_route_failure"] = str(family_graph_route.failure_reason)
+    else:
+        family_path = None
+        family_segment_source = "selected_lambda_family_evidence_graph_failed"
+        segment_messages["family_segment"] = (
+            "selected-lambda family evidence graph route failed: "
+            f"{family_graph_route.failure_reason}"
+        )
+    right_graph_route = extract_stage_graph_route(
+        store=evidence.right_store,
+        stage=RIGHT_STAGE,
+        q_start=q_exit,
+        q_goal=np.asarray(goal_q, dtype=float),
+        joint_max_step=float(joint_max_step),
+        start_preferred_node_id=int(candidate.exit.target_node_id),
+        goal_preferred_node_id=0,
+        collision_fn=collision_fn,
+    )
+    if right_graph_route.success:
+        right_path = np.asarray(right_graph_route.dense_theta_path, dtype=float)
+        right_segment_source = "right_evidence_graph"
+        segment_messages["right_segment"] = (
+            "right evidence graph route succeeded: "
+            f"right_edges={right_graph_route.graph_edges_used}, "
+            f"query_connectors={right_graph_route.query_connectors_used}"
+        )
+    elif bool(allow_closure_local_continuation_fallback):
+        right_path, segment_messages["right_segment"] = _connect_joint_segment(
+            RIGHT_STAGE, manifolds[RIGHT_STAGE], q_exit, goal_q, float(joint_max_step), collision_fn=collision_fn
+        )
+        right_segment_source = "fallback_projected_jointspace_continuation"
+        segment_messages["right_graph_route_failure"] = str(right_graph_route.failure_reason)
+    else:
+        right_path = None
+        right_segment_source = "right_evidence_graph_failed"
+        segment_messages["right_segment"] = f"right evidence graph route failed: {right_graph_route.failure_reason}"
+
+    if left_path is None or family_path is None or right_path is None:
+        if left_path is None and left_graph_route.failure_reason:
+            failure = str(left_graph_route.failure_reason)
+        elif family_path is None and family_graph_route.failure_reason:
+            failure = str(family_graph_route.failure_reason)
+        elif right_path is None and right_graph_route.failure_reason:
+            failure = str(right_graph_route.failure_reason)
+        else:
+            failure = "full joint-space graph route failed during segment planning"
+        return (
+            JointspaceRouteRealization(
+                success=False,
+                dense_joint_path=np.zeros((0, 3), dtype=float),
+                stage_labels=[],
+                lambda_labels=np.zeros(0, dtype=float),
+                task_path=np.zeros((0, 3), dtype=float),
+                residuals=np.zeros(0, dtype=float),
+                joint_steps=np.zeros(0, dtype=float),
+                max_constraint_residual=float("inf"),
+                mean_constraint_residual=float("inf"),
+                max_joint_step=float("inf"),
+                mean_joint_step=float("inf"),
+                collision_free=False,
+                message=failure,
+                segment_messages=segment_messages,
+                selected_lambda=float(candidate.selected_lambda),
+                left_segment_source=left_segment_source,
+                right_segment_source=right_segment_source,
+                left_graph_route_used_for_segment=False,
+                right_graph_route_used_for_segment=False,
+                left_graph_edges_used=int(left_graph_route.graph_edges_used),
+                right_graph_edges_used=int(right_graph_route.graph_edges_used),
+                left_graph_query_connectors_used=int(left_graph_route.query_connectors_used),
+                right_graph_query_connectors_used=int(right_graph_route.query_connectors_used),
+                left_graph_route_failure_reason=str(left_graph_route.failure_reason),
+                right_graph_route_failure_reason=str(right_graph_route.failure_reason),
+                family_segment_source=family_segment_source,
+                family_graph_route_used_for_family_segment=False,
+                family_graph_edges_used=int(family_graph_route.family_graph_edges_used),
+                family_graph_query_connectors_used=int(family_graph_route.query_connectors_used),
+                family_graph_path_joint_length=float(family_graph_route.joint_length),
+                family_graph_route_certified=bool(family_graph_route.certified),
+                family_graph_route_lambda_fixed=bool(family_graph_route.lambda_fixed),
+                family_graph_route_max_residual=float(family_graph_route.max_residual),
+                family_graph_route_max_joint_step=float(family_graph_route.max_joint_step),
+                family_graph_route_failure_reason=str(family_graph_route.failure_reason),
+                family_graph_route_node_ids=list(family_graph_route.node_ids),
+                family_graph_route_edge_sources=list(family_graph_route.edge_sources),
+                selected_lambda_family_nodes=int(family_graph_route.selected_lambda_family_nodes),
+                selected_lambda_family_edges=int(family_graph_route.selected_lambda_family_edges),
+                lambda_match_tol=float(family_graph_route.lambda_match_tol),
+            ),
+            manifolds,
+            lambda_reconciliation,
+        )
+
+    dense_joint_path, labels = _concatenate_labeled_segments(
+        [(LEFT_STAGE, left_path), (FAMILY_STAGE, family_path), (RIGHT_STAGE, right_path)]
+    )
+    cert = _certify_labeled_joint_path(
+        robot=robot,
+        joint_path=dense_joint_path,
+        stage_labels=labels,
+        manifolds=manifolds,
+        joint_max_step=float(joint_max_step),
+        collision_fn=collision_fn,
+    )
+    lambda_labels = _lambda_labels_for_stages(list(labels), float(candidate.selected_lambda))
+    _family_lambda_min, _family_lambda_max, lambda_variation, lambda_fixed, _family_count = _lambda_fixed_audit(lambda_labels)
+    left_family_stack = _stack_residual(manifolds[LEFT_STAGE], manifolds[FAMILY_STAGE], q_entry)
+    family_right_stack = _stack_residual(manifolds[FAMILY_STAGE], manifolds[RIGHT_STAGE], q_exit)
+    max_transition_stack = float(max(left_family_stack, family_right_stack))
+    transition_stack_certified = bool(max_transition_stack <= 1.0e-3)
+    stage_order_valid = _stage_order_valid(list(labels))
+    route_certified = bool(cert["certified"] and transition_stack_certified and lambda_fixed and stage_order_valid)
+    task_path = joint_path_to_task_path(robot, dense_joint_path)
+    family_graph_used = bool(family_graph_route.success)
+    left_graph_used = bool(left_graph_route.success)
+    right_graph_used = bool(right_graph_route.success)
+    closure_fallback_edges = int((0 if left_graph_used else 1) + (0 if right_graph_used else 1))
+    left_graph_edges_used = int(left_graph_route.graph_edges_used) if left_graph_used else 0
+    right_graph_edges_used = int(right_graph_route.graph_edges_used) if right_graph_used else 0
+    left_query_connectors_used = int(left_graph_route.query_connectors_used) if left_graph_used else 0
+    right_query_connectors_used = int(right_graph_route.query_connectors_used) if right_graph_used else 0
+    stored_family_edges_used = int(family_graph_route.family_graph_edges_used) if family_graph_used else 0
+    family_query_connectors_used = int(family_graph_route.query_connectors_used) if family_graph_used else 0
+    final_evidence_edges = int(left_graph_edges_used + stored_family_edges_used + right_graph_edges_used)
+    final_query_connectors = int(left_query_connectors_used + family_query_connectors_used + right_query_connectors_used)
+    projected_jointspace_edges = int(final_query_connectors + closure_fallback_edges)
+    dense_segment_count = int(final_evidence_edges + final_query_connectors + closure_fallback_edges)
+    message = (
+        "full joint-space evidence-graph route certified"
+        if route_certified and left_graph_used and family_graph_used and right_graph_used
+        else "full joint-space fixed-lambda fallback projected route certified"
+        if route_certified
+        else (
+            "full joint-space fixed-lambda family-graph route failed certification: "
+            f"local_certified={bool(cert['certified'])}, "
+            f"transition_stack_certified={transition_stack_certified}, "
+            f"lambda_fixed={lambda_fixed}, stage_order_valid={stage_order_valid}"
+        )
+    )
+    return (
+        JointspaceRouteRealization(
+            success=bool(route_certified),
+            dense_joint_path=np.asarray(dense_joint_path, dtype=float),
+            stage_labels=list(labels),
+            lambda_labels=np.asarray(lambda_labels, dtype=float),
+            task_path=np.asarray(task_path, dtype=float),
+            residuals=np.asarray(cert["residuals"], dtype=float),
+            joint_steps=np.asarray(cert["joint_steps"], dtype=float),
+            max_constraint_residual=float(cert["max_constraint_residual"]),
+            mean_constraint_residual=float(cert["mean_constraint_residual"]),
+            max_joint_step=float(cert["max_joint_step"]),
+            mean_joint_step=float(cert["mean_joint_step"]),
+            collision_free=bool(cert["collision_free"]),
+            message=message,
+            segment_messages=segment_messages,
+            selected_lambda=float(candidate.selected_lambda),
+            selected_left_family_transition_theta=np.asarray(q_entry, dtype=float),
+            selected_family_right_transition_theta=np.asarray(q_exit, dtype=float),
+            selected_left_family_transition_index=_transition_index(dense_joint_path, q_entry),
+            selected_family_right_transition_index=_transition_index(dense_joint_path, q_exit),
+            selected_left_family_stack_residual=float(left_family_stack),
+            selected_family_right_stack_residual=float(family_right_stack),
+            max_transition_stack_residual=float(max_transition_stack),
+            transition_stack_certified=bool(transition_stack_certified),
+            stage_order_valid=bool(stage_order_valid),
+            lambda_fixed_during_transfer=bool(lambda_fixed),
+            lambda_variation_transfer=float(lambda_variation),
+            final_route_stored_evidence_edges=int(final_evidence_edges),
+            final_route_evidence_edges=int(final_evidence_edges),
+            final_route_query_connectors=int(final_query_connectors),
+            final_route_projected_fallback_edges=int(closure_fallback_edges),
+            final_route_dense_segments=int(dense_segment_count),
+            final_route_segment_source=str(family_segment_source),
+            final_route_projected_jointspace_edges=int(projected_jointspace_edges),
+            final_route_taskspace_edges=0,
+            left_segment_source=str(left_segment_source),
+            right_segment_source=str(right_segment_source),
+            left_graph_route_used_for_segment=bool(left_graph_used),
+            right_graph_route_used_for_segment=bool(right_graph_used),
+            left_graph_edges_used=int(left_graph_edges_used),
+            right_graph_edges_used=int(right_graph_edges_used),
+            left_graph_query_connectors_used=int(left_query_connectors_used),
+            right_graph_query_connectors_used=int(right_query_connectors_used),
+            left_graph_route_failure_reason=str(left_graph_route.failure_reason),
+            right_graph_route_failure_reason=str(right_graph_route.failure_reason),
+            family_segment_source=str(family_segment_source),
+            family_graph_route_used_for_family_segment=bool(family_graph_used),
+            family_graph_edges_used=int(stored_family_edges_used),
+            family_graph_query_connectors_used=int(family_query_connectors_used),
+            family_graph_path_joint_length=float(family_graph_route.joint_length),
+            family_graph_route_certified=bool(family_graph_route.certified),
+            family_graph_route_lambda_fixed=bool(family_graph_route.lambda_fixed),
+            family_graph_route_max_residual=float(family_graph_route.max_residual),
+            family_graph_route_max_joint_step=float(family_graph_route.max_joint_step),
+            family_graph_route_failure_reason=str(family_graph_route.failure_reason),
+            family_graph_route_node_ids=list(family_graph_route.node_ids),
+            family_graph_route_edge_sources=list(family_graph_route.edge_sources),
+            selected_lambda_family_nodes=int(family_graph_route.selected_lambda_family_nodes),
+            selected_lambda_family_edges=int(family_graph_route.selected_lambda_family_edges),
+            lambda_match_tol=float(family_graph_route.lambda_match_tol),
+        ),
+        manifolds,
+        lambda_reconciliation,
+    )
+
+
+def plan_continuous_transfer_jointspace_robot(*, scene_description, seed: int, joint_max_step: float, **planner_kwargs):
+    """Phase 2B selected-lambda robot realization bridge.
+
+    The task-space mode in this file is complete: the foliation planner selects
+    entry/exit/lambda structure. This bridge mode then realizes that selected
+    structure in robot joint space. It is intentionally not full joint-space
+    exploration over continuous lambda yet.
+
+    - state: q = [theta0, theta1, theta2]
+    - task point: FK(q)
+    - left leaf: RobotSphereManifold(FK(q) on the left support sphere)
+    - right leaf: RobotSphereManifold(FK(q) on the right support sphere)
+    - transfer leaf: RobotPlaneLeafManifold / RobotFamilyLeafManifold
+
+    RobotPlaneLeafManifold design notes:
+    - stores a locked lambda value and a reference to the continuous transfer
+      family;
+    - residual(q) evaluates the active plane-leaf constraint at FK(q);
+    - within_bounds(q) checks the family patch/obstacle mask at FK(q);
+    - project(q) remains permissive enough for exploration, like the existing
+      RobotConstraintBase.project();
+    - project_local(q) may preserve IK branch for final selected-transition
+      realization;
+    - infer_lambda(q) delegates to family.infer_lambda(FK(q)) and candidate
+      lambdas are managed by a robot leaf-store manager.
+
+    Final execution rule for the future implementation:
+    the evidence graph discovers candidate lambdas and transitions only. After
+    selecting entry/exit/lambda, the executable robot route must be locally
+    replanned as start_q -> entry_q on the left robot sphere, entry_q -> exit_q
+    on the selected robot family leaf, and exit_q -> goal_q on the right robot
+    sphere. The displayed route must be FK(result.dense_joint_path), and robot
+    animation must use that exact dense_joint_path.
+    """
+
+    np.random.seed(int(seed))
+    ou.RNG.setSeed(int(seed))
+    ou.setLogLevel(ou.LOG_ERROR)
+    scene = build_continuous_transfer_scene(scene_description)
+    result = plan_continuous_transfer_route(
+        max_ambient_probes=planner_kwargs.get("max_ambient_probes"),
+        continue_after_first_solution=bool(planner_kwargs.get("continue_after_first_solution", True)),
+        max_extra_rounds_after_first_solution=int(
+            planner_kwargs.get("max_extra_rounds_after_first_solution", DEFAULT_POST_ROUTE_EVIDENCE_ROUNDS)
+        ),
+        top_k_assignments=int(planner_kwargs.get("top_k_assignments", 3)),
+        top_k_paths=int(planner_kwargs.get("top_k_paths", 1)),
+        seed=int(seed),
+        obstacle_profile=str(planner_kwargs.get("obstacle_profile", "none")),
+        scene_description=scene_description,
+    )
+
+    selected_lambda = (
+        float(result.selected_lambda_for_realization)
+        if result.selected_lambda_for_realization is not None
+        else float(result.selected_lambda)
+        if result.selected_lambda is not None
+        else float(scene.transfer_family.nominal_lambda)
+    )
+    entry = np.asarray(result.selected_entry_point, dtype=float)
+    exit_point = np.asarray(result.selected_exit_point, dtype=float)
+    if entry.size != 3 or exit_point.size != 3 or not bool(result.success):
+        _print_key_value_block(
+            "Continuous-Transfer Joint-Space Realization",
+            {
+                "planning_mode": "selected_lambda_jointspace_realization",
+                "full_jointspace_exploration": False,
+                "planner_success": bool(result.success),
+                "jointspace_realization_success": False,
+                "message": "task-space planner did not provide selected entry/exit/lambda for realization",
+            },
+        )
+        return scene, result, None, None
+
+    robot = choose_robot_for_route(np.asarray(result.path, dtype=float))
+    realization, _manifolds = realize_selected_continuous_transfer_route_jointspace(
+        robot=robot,
+        families=(scene.left_support, scene.transfer_family, scene.right_support),
+        start_task=scene.start_q,
+        selected_entry_point=entry,
+        selected_exit_point=exit_point,
+        goal_task=scene.goal_q,
+        selected_lambda=selected_lambda,
+        joint_max_step=float(joint_max_step),
+        obstacles=None,
+    )
+
+    if realization.success:
+        result.dense_joint_path = np.asarray(realization.dense_joint_path, dtype=float)
+        result.dense_joint_path_stage_labels = list(realization.stage_labels)
+        result.dense_joint_path_constraint_residuals = np.asarray(realization.residuals, dtype=float)
+        result.dense_joint_path_is_certified = True
+        result.dense_joint_path_execution_certified = True
+        result.dense_joint_path_constraint_certified = True
+        result.dense_joint_path_joint_continuity_certified = True
+        result.dense_joint_path_joint_steps = np.asarray(realization.joint_steps, dtype=float)
+        result.dense_joint_path_max_joint_step = float(realization.max_joint_step)
+        result.dense_joint_path_mean_joint_step = float(realization.mean_joint_step)
+        result.dense_joint_path_worst_joint_step_index = int(np.argmax(realization.joint_steps)) if len(realization.joint_steps) > 0 else -1
+        result.dense_joint_path_message = realization.message
+        result.path = np.asarray(realization.task_path, dtype=float)
+        result.raw_path = np.asarray(realization.task_path, dtype=float)
+        result.display_path = np.asarray(realization.task_path, dtype=float)
+        result.final_route_realization = "selected_lambda_jointspace_local_replan"
+        result.graph_route_used_for_execution = False
+
+    robot_execution = None
+    if len(realization.dense_joint_path) > 0:
+        task_path = joint_path_to_task_path(robot, realization.dense_joint_path)
+        robot_execution = RobotExecutionResult(
+            target_task_points_3d=np.asarray(task_path, dtype=float),
+            joint_path=np.asarray(realization.dense_joint_path, dtype=float),
+            end_effector_points_3d=np.asarray(task_path, dtype=float),
+            ik_success_count=int(len(realization.dense_joint_path)),
+            ik_failure_count=0,
+            max_tracking_error=0.0,
+            mean_tracking_error=0.0,
+            max_joint_step=float(realization.max_joint_step),
+            execution_success=bool(realization.success),
+            diagnostics=str(realization.message),
+            animation_enabled=bool(realization.success),
+            planner_path_resampled_for_robot=False,
+            planner_joint_path_used_directly=True,
+            max_constraint_residual=float(realization.max_constraint_residual),
+            mean_constraint_residual=float(realization.mean_constraint_residual),
+            constraint_validation_success=bool(realization.success),
+            worst_constraint_stage="selected_lambda_jointspace",
+            worst_constraint_index=-1,
+            execution_source="certified_dense_joint_path" if realization.success else "disabled_uncertified_jointspace_realization",
+        )
+
+    display_vs_trace_max_error, display_vs_trace_mean_error = (
+        _polyline_error(np.asarray(result.path, dtype=float), np.asarray(robot_execution.end_effector_points_3d, dtype=float))
+        if robot_execution is not None
+        else (float("inf"), float("inf"))
+    )
+
+    print_continuous_route_summary(result)
+    _print_key_value_block(
+        "Continuous-Transfer Joint-Space Realization",
+        {
+            "planning_mode": "selected_lambda_jointspace_realization",
+            "full_jointspace_exploration": False,
+            "lambda_entry_exit_selection_space": "task_space_continuous_transfer_planner",
+            "full_jointspace_planner_claim": False,
+            "ik_waypoint_fallback_used": any(
+                bool(realization.segment_messages.get(key, ""))
+                for key in (
+                    "left_segment_task_waypoint_fallback",
+                    "family_segment_task_waypoint_fallback",
+                    "right_segment_task_waypoint_fallback",
+                )
+            ),
+            "planner_success": bool(result.success),
+            "selected_lambda_for_realization": round(float(selected_lambda), 6),
+            "selected_entry_point": np.round(entry, 6).tolist(),
+            "selected_exit_point": np.round(exit_point, 6).tolist(),
+            "taskspace_final_route_realization": result.final_route_realization,
+            "graph_route_used_for_execution": bool(result.graph_route_used_for_execution),
+            "strict_validation_success": bool(result.strict_validation_success),
+            "jointspace_realization_success": bool(realization.success),
+            "dense_joint_path_execution_certified": bool(realization.success),
+            "dense_joint_path_points": int(len(realization.dense_joint_path)),
+            "max_dense_constraint_residual": round(float(realization.max_constraint_residual), 8)
+            if np.isfinite(realization.max_constraint_residual)
+            else float("inf"),
+            "mean_dense_constraint_residual": round(float(realization.mean_constraint_residual), 8)
+            if np.isfinite(realization.mean_constraint_residual)
+            else float("inf"),
+            "dense_joint_path_max_joint_step": round(float(realization.max_joint_step), 6)
+            if np.isfinite(realization.max_joint_step)
+            else float("inf"),
+            "collision_free": bool(realization.collision_free),
+            "execution_source": "none" if robot_execution is None else str(robot_execution.execution_source),
+            "route_source": "FK(result.dense_joint_path)" if realization.success else "unavailable",
+            "display_vs_trace_max_error": round(float(display_vs_trace_max_error), 6),
+            "display_vs_trace_mean_error": round(float(display_vs_trace_mean_error), 6),
+            "segment_start": realization.segment_messages.get("start_ik", ""),
+            "segment_entry": realization.segment_messages.get("entry_handoff", ""),
+            "segment_exit": realization.segment_messages.get("exit_handoff", ""),
+            "segment_goal": realization.segment_messages.get("goal_ik", ""),
+            "segment_left": realization.segment_messages.get("left_segment", ""),
+            "segment_left_fallback": realization.segment_messages.get("left_segment_task_waypoint_fallback", ""),
+            "segment_family": realization.segment_messages.get("family_segment", ""),
+            "segment_family_fallback": realization.segment_messages.get("family_segment_task_waypoint_fallback", ""),
+            "segment_right": realization.segment_messages.get("right_segment", ""),
+            "segment_right_fallback": realization.segment_messages.get("right_segment_task_waypoint_fallback", ""),
+            "message": realization.message,
+        },
+    )
+    return scene, result, robot, robot_execution
+
+
+def plan_full_jointspace_continuous_transfer_evidence_scaffold(
+    *,
+    scene_description,
+    seed: int,
+    joint_max_step: float,
+    max_ambient_probes: int | None,
+    **planner_kwargs,
+):
+    """Phase 3A: project ambient joint proposals onto all robot supports.
+
+    This is deliberately evidence-only. It does not infer transitions, extract
+    routes, or animate anything. The purpose is to prove that q-space proposal
+    projection can populate left/right robot sphere stores and multiple locked
+    robot family leaf stores before Phase 3B transition discovery.
+    """
+
+    np.random.seed(int(seed))
+    ou.RNG.setSeed(int(seed))
+    ou.setLogLevel(ou.LOG_ERROR)
+    scene = build_continuous_transfer_scene(scene_description)
+    rough_route = np.asarray(
+        [
+            scene.start_q,
+            0.5 * (scene.start_q + scene.goal_q),
+            scene.goal_q,
+        ],
+        dtype=float,
+    )
+    robot = choose_robot_for_route(rough_route)
+    families = (scene.left_support, scene.transfer_family, scene.right_support)
+    nominal_lambda = float(scene.transfer_family.nominal_lambda)
+    manifolds = build_robot_manifolds_for_selected_lambda(robot, families, nominal_lambda)
+    evidence = RobotJointspaceContinuousEvidence(
+        left_store=RobotStageEvidenceStore(name="left_robot_sphere", manifold=manifolds[LEFT_STAGE], nodes=[], edges=[], frontier_ids=[]),
+        right_store=RobotStageEvidenceStore(name="right_robot_sphere", manifold=manifolds[RIGHT_STAGE], nodes=[], edges=[], frontier_ids=[]),
+        family_leaf_stores={},
+        counters={},
+    )
+    scene_lambdas = _scene_candidate_lambdas(scene_description, scene.transfer_family)
+
+    q_start = inverse_kinematics_start(robot, scene.start_q, tol=8.0e-2)
+    q_goal = inverse_kinematics_start(robot, scene.goal_q, warm_start=q_start, tol=8.0e-2)
+    if q_start is not None:
+        projected = _project_to_manifold(evidence.left_store.manifold, q_start, local=False)
+        if projected is not None:
+            evidence.left_store.add_node(projected)
+            q_start = projected
+    if q_goal is not None:
+        projected = _project_to_manifold(evidence.right_store.manifold, q_goal, local=False)
+        if projected is not None:
+            evidence.right_store.add_node(projected)
+            q_goal = projected
+
+    proposal_rounds = int(max_ambient_probes if max_ambient_probes is not None else 80)
+    proposal_rounds = max(1, proposal_rounds)
+    proposal_count = 8
+    joint_lower = -np.pi * np.ones(3, dtype=float)
+    joint_upper = np.pi * np.ones(3, dtype=float)
+    start_seed = np.asarray(q_start if q_start is not None else np.zeros(3, dtype=float), dtype=float)
+    goal_seed = np.asarray(q_goal if q_goal is not None else np.asarray([0.0, 0.85, -0.65], dtype=float), dtype=float)
+
+    for round_idx in range(1, proposal_rounds + 1):
+        active_guides = []
+        for store in evidence.family_leaf_stores.values():
+            active_guides.extend(store.nodes[-2:])
+        proposals = generate_joint_proposals(
+            round_idx,
+            start_seed,
+            goal_seed,
+            active_guides,
+            proposal_count=proposal_count,
+            joint_lower=joint_lower,
+            joint_upper=joint_upper,
+        )
+        for proposal in proposals:
+            project_joint_proposal_to_supports(
+                proposal,
+                evidence,
+                robot,
+                families,
+                scene_lambdas,
+                joint_max_step=float(joint_max_step),
+            )
+
+    entry_transitions, exit_transitions, transition_diagnostics = discover_full_jointspace_transitions(
+        evidence=evidence,
+        robot=robot,
+        max_pairs_per_leaf=4,
+    )
+    route_candidates, route_counters = _build_full_jointspace_route_candidates(
+        entry_transitions=entry_transitions,
+        exit_transitions=exit_transitions,
+        start_task=scene.start_q,
+        goal_task=scene.goal_q,
+    )
+    route_realization: JointspaceRouteRealization | None = None
+    selected_candidate: FullJointspaceRouteCandidate | None = None
+    lambda_reconciliation = "failed"
+    route_candidates_rejected_local_replan = 0
+    failure_reason = ""
+    max_candidates_to_try = min(len(route_candidates), max(5, int(planner_kwargs.get("top_k_paths", 1)) * 8))
+    if q_start is None or q_goal is None:
+        failure_reason = "start or goal IK/projected joint state unavailable"
+    elif len(route_candidates) == 0:
+        failure_reason = "no entry/exit transition pair with compatible lambda"
+    else:
+        for candidate in route_candidates[:max_candidates_to_try]:
+            realization, _candidate_manifolds, reconciliation = realize_full_jointspace_candidate_route(
+                robot=robot,
+                families=families,
+                evidence=evidence,
+                start_q=np.asarray(q_start, dtype=float),
+                goal_q=np.asarray(q_goal, dtype=float),
+                start_task=scene.start_q,
+                goal_task=scene.goal_q,
+                candidate=candidate,
+                joint_max_step=float(joint_max_step),
+                allow_family_local_continuation_fallback=bool(
+                    planner_kwargs.get("allow_family_local_continuation_fallback", False)
+                ),
+                allow_closure_local_continuation_fallback=bool(
+                    planner_kwargs.get("allow_closure_local_continuation_fallback", False)
+                ),
+            )
+            route_realization = realization
+            lambda_reconciliation = reconciliation
+            if realization.success:
+                selected_candidate = candidate
+                break
+            route_candidates_rejected_local_replan += 1
+            failure_reason = realization.message
+    route_success = bool(route_realization is not None and route_realization.success and selected_candidate is not None)
+    full_graph_success = bool(
+        route_success
+        and route_realization is not None
+        and route_realization.left_graph_route_used_for_segment
+        and route_realization.family_graph_route_used_for_family_segment
+        and route_realization.right_graph_route_used_for_segment
+    )
+    final_route_realization = (
+        "full_evidence_graph_with_query_connectors"
+        if full_graph_success
+        else "hybrid_left_right_continuation_family_graph"
+        if route_success
+        and route_realization is not None
+        and bool(route_realization.family_graph_route_used_for_family_segment)
+        else "certified_projected_jointspace_continuation_segments"
+        if route_success
+        else "full_jointspace_route_failed"
+    )
+    execution_source = "certified_dense_joint_path" if route_success else "none"
+    route_source = "FK(result.dense_joint_path)" if route_success else "none"
+    route_realization_source = (
+        "full_evidence_graph_with_query_connectors"
+        if full_graph_success
+        else "hybrid_left_right_continuation_family_graph"
+        if route_success
+        and route_realization is not None
+        and bool(route_realization.family_graph_route_used_for_family_segment)
+        else "fallback_projected_jointspace_continuation"
+        if route_success
+        else "none"
+    )
+    robot_execution = None
+    display_vs_trace_max_error = float("inf")
+    display_vs_trace_mean_error = float("inf")
+    if route_success and route_realization is not None:
+        task_path = joint_path_to_task_path(robot, route_realization.dense_joint_path)
+        robot_execution = RobotExecutionResult(
+            target_task_points_3d=np.asarray(task_path, dtype=float),
+            joint_path=np.asarray(route_realization.dense_joint_path, dtype=float),
+            end_effector_points_3d=np.asarray(task_path, dtype=float),
+            ik_success_count=int(len(route_realization.dense_joint_path)),
+            ik_failure_count=0,
+            max_tracking_error=0.0,
+            mean_tracking_error=0.0,
+            max_joint_step=float(route_realization.max_joint_step),
+            execution_success=True,
+            diagnostics=str(route_realization.message),
+            animation_enabled=True,
+            planner_path_resampled_for_robot=False,
+            planner_joint_path_used_directly=True,
+            max_constraint_residual=float(route_realization.max_constraint_residual),
+            mean_constraint_residual=float(route_realization.mean_constraint_residual),
+            constraint_validation_success=True,
+            worst_constraint_stage="full_jointspace_selected_transition",
+            worst_constraint_index=-1,
+            execution_source="certified_dense_joint_path",
+        )
+        display_vs_trace_max_error, display_vs_trace_mean_error = _polyline_error(
+            np.asarray(route_realization.task_path, dtype=float),
+            np.asarray(robot_execution.end_effector_points_3d, dtype=float),
+        )
+    family_nodes = sum(len(store.nodes) for store in evidence.family_leaf_stores.values())
+    family_edges = sum(len(store.edges) for store in evidence.family_leaf_stores.values())
+    family_edges_certified = sum(1 for store in evidence.family_leaf_stores.values() for edge in store.edges if bool(edge.certified))
+    family_edges_rejected = int(evidence.counters.get("family_evidence_edges_rejected", 0))
+    left_edges_certified = sum(1 for edge in evidence.left_store.edges if bool(edge.certified))
+    right_edges_certified = sum(1 for edge in evidence.right_store.edges if bool(edge.certified))
+    left_edges_rejected = int(evidence.counters.get("left_evidence_edges_rejected", 0))
+    right_edges_rejected = int(evidence.counters.get("right_evidence_edges_rejected", 0))
+    active_lambdas = sorted(float(key) for key in evidence.family_leaf_stores.keys())
+    lambda_range = (
+        [round(float(min(active_lambdas)), 6), round(float(max(active_lambdas)), 6)]
+        if active_lambdas
+        else []
+    )
+    evidence_ready = bool(len(evidence.left_store.nodes) > 0 and len(evidence.right_store.nodes) > 0 and family_nodes > 0)
+    _print_key_value_block(
+        "Full Joint-Space Continuous-Transfer Exploration Scaffold",
+        {
+            "full_jointspace_exploration": True,
+            "implementation_phase": "certified_full_jointspace_continuous_transfer",
+            "planner_success": bool(route_success) if route_candidates else ("evidence_ready" if evidence_ready else False),
+            "left_evidence_nodes": int(len(evidence.left_store.nodes)),
+            "left_evidence_edges": int(len(evidence.left_store.edges)),
+            "left_evidence_edges_certified": int(left_edges_certified),
+            "left_evidence_edges_rejected": int(left_edges_rejected),
+            "right_evidence_nodes": int(len(evidence.right_store.nodes)),
+            "right_evidence_edges": int(len(evidence.right_store.edges)),
+            "right_evidence_edges_certified": int(right_edges_certified),
+            "right_evidence_edges_rejected": int(right_edges_rejected),
+            "family_leaf_store_count": int(len(evidence.family_leaf_stores)),
+            "family_evidence_nodes": int(family_nodes),
+            "family_evidence_edges": int(family_edges),
+            "family_evidence_edges_certified": int(family_edges_certified),
+            "family_evidence_edges_rejected": int(family_edges_rejected),
+            "projected_to_left_count": int(evidence.counters.get("projected_to_left_count", 0)),
+            "projected_to_family_count": int(evidence.counters.get("projected_to_family_count", 0)),
+            "projected_to_right_count": int(evidence.counters.get("projected_to_right_count", 0)),
+            "left_projection_failure_count": int(evidence.counters.get("left_projection_failure_count", 0)),
+            "family_projection_failure_count": int(evidence.counters.get("family_projection_failure_count", 0)),
+            "right_projection_failure_count": int(evidence.counters.get("right_projection_failure_count", 0)),
+            "candidate_lambdas_evaluated": int(evidence.counters.get("candidate_lambdas_evaluated", 0)),
+            "active_family_lambdas": [round(float(v), 6) for v in active_lambdas[:20]],
+            "active_family_lambdas_omitted": max(0, len(active_lambdas) - 20),
+            "lambda_coverage_range": lambda_range,
+            "entry_transitions_found": int(transition_diagnostics.get("entry_transitions_found", 0)),
+            "exit_transitions_found": int(transition_diagnostics.get("exit_transitions_found", 0)),
+            "final_route_realization": final_route_realization,
+            "graph_route_used_for_execution": True if full_graph_success else "partial_family_graph" if route_success else False,
+            "route_realization_source": route_realization_source,
+            "execution_source": execution_source,
+            "route_source": route_source,
+            "display_vs_trace_max_error": round(float(display_vs_trace_max_error), 6)
+            if route_success
+            else "not_applicable",
+            "joint_max_step": float(joint_max_step),
+            "proposal_rounds": int(proposal_rounds),
+            "proposals_per_round": int(proposal_count),
+            "next_step": "phase_3c_route_extraction" if not route_success else "phase_3d_visualization_cleanup",
+        },
+    )
+    best_entry = float(transition_diagnostics.get("best_entry_residual", float("inf")))
+    best_exit = float(transition_diagnostics.get("best_exit_residual", float("inf")))
+    _print_key_value_block(
+        "Full Joint-Space Transition Discovery",
+        {
+            "entry_transition_attempts": int(transition_diagnostics.get("entry_transition_attempts", 0)),
+            "entry_transitions_found": int(transition_diagnostics.get("entry_transitions_found", 0)),
+            "exit_transition_attempts": int(transition_diagnostics.get("exit_transition_attempts", 0)),
+            "exit_transitions_found": int(transition_diagnostics.get("exit_transitions_found", 0)),
+            "certified_entry_transitions": int(transition_diagnostics.get("certified_entry_transitions", 0)),
+            "certified_exit_transitions": int(transition_diagnostics.get("certified_exit_transitions", 0)),
+            "entry_transition_lambdas": list(transition_diagnostics.get("entry_transition_lambdas", []))[:20],
+            "entry_transition_lambdas_omitted": max(0, len(list(transition_diagnostics.get("entry_transition_lambdas", []))) - 20),
+            "exit_transition_lambdas": list(transition_diagnostics.get("exit_transition_lambdas", []))[:20],
+            "exit_transition_lambdas_omitted": max(0, len(list(transition_diagnostics.get("exit_transition_lambdas", []))) - 20),
+            "transition_lambdas": list(transition_diagnostics.get("transition_lambdas", []))[:20],
+            "transition_lambdas_omitted": max(0, len(list(transition_diagnostics.get("transition_lambdas", []))) - 20),
+            "family_regions_with_entry": int(transition_diagnostics.get("family_regions_with_entry", 0)),
+            "family_regions_with_exit": int(transition_diagnostics.get("family_regions_with_exit", 0)),
+            "best_entry_residual": round(best_entry, 8) if np.isfinite(best_entry) else float("inf"),
+            "best_exit_residual": round(best_exit, 8) if np.isfinite(best_exit) else float("inf"),
+            "entry_transition_failure_reasons": dict(transition_diagnostics.get("entry_transition_failure_reasons", {})),
+            "exit_transition_failure_reasons": dict(transition_diagnostics.get("exit_transition_failure_reasons", {})),
+            "final_route_realization": final_route_realization,
+            "graph_route_used_for_execution": True if full_graph_success else "partial_family_graph" if route_success else False,
+            "route_realization_source": route_realization_source,
+            "execution_source": execution_source,
+        },
+    )
+    selected_entry = selected_candidate.entry if selected_candidate is not None else None
+    selected_exit = selected_candidate.exit if selected_candidate is not None else None
+    max_residual = (
+        float(route_realization.max_constraint_residual)
+        if route_realization is not None
+        else float("inf")
+    )
+    mean_residual = (
+        float(route_realization.mean_constraint_residual)
+        if route_realization is not None
+        else float("inf")
+    )
+    max_step = (
+        float(route_realization.max_joint_step)
+        if route_realization is not None
+        else float("inf")
+    )
+    visualization_result = None
+    if route_success and route_realization is not None and selected_candidate is not None:
+        # Phase 3D wiring: the visual final route is the FK image of the same
+        # certified dense joint path used by robot animation. The exploration
+        # stores remain evidence only and are not used as robot motion.
+        display_route = np.asarray(route_realization.task_path, dtype=float)
+        left_evidence_points = joint_path_to_task_path(robot, evidence.left_store.nodes)
+        right_evidence_points = joint_path_to_task_path(robot, evidence.right_store.nodes)
+        family_joint_nodes = [
+            np.asarray(q, dtype=float)
+            for store in evidence.family_leaf_stores.values()
+            for q in store.nodes
+        ]
+        family_evidence_points = joint_path_to_task_path(robot, family_joint_nodes)
+        visualization_result = SimpleNamespace(
+            success=True,
+            full_jointspace_exploration=True,
+            selected_lambda_for_realization=float(selected_candidate.selected_lambda),
+            selected_lambda=float(selected_candidate.selected_lambda),
+            active_family_lambdas=np.asarray(active_lambdas, dtype=float),
+            lambda_coverage_range=np.asarray(lambda_range, dtype=float),
+            explored_edges_by_mode={
+                "left": [],
+                "family_leaf": [],
+                "family_transverse": [],
+                "right": [],
+            },
+            left_evidence_points_task=np.asarray(left_evidence_points, dtype=float),
+            family_evidence_points_task=np.asarray(family_evidence_points, dtype=float),
+            right_evidence_points_task=np.asarray(right_evidence_points, dtype=float),
+            entry_transition_points=np.asarray([hyp.task_point for hyp in entry_transitions], dtype=float)
+            if entry_transitions
+            else np.zeros((0, 3), dtype=float),
+            exit_transition_points=np.asarray([hyp.task_point for hyp in exit_transitions], dtype=float)
+            if exit_transitions
+            else np.zeros((0, 3), dtype=float),
+            selected_entry_point=np.asarray(selected_candidate.entry.task_point, dtype=float),
+            selected_exit_point=np.asarray(selected_candidate.exit.task_point, dtype=float),
+            path=display_route,
+            raw_path=display_route,
+            dense_joint_path=np.asarray(route_realization.dense_joint_path, dtype=float),
+            dense_joint_path_stage_labels=list(route_realization.stage_labels),
+            dense_lambda_labels=np.asarray(route_realization.lambda_labels, dtype=float),
+            dense_joint_path_execution_certified=True,
+            dense_joint_path_constraint_certified=bool(route_realization.success),
+            dense_joint_path_joint_continuity_certified=bool(route_realization.success),
+            dense_joint_path_constraint_residuals=np.asarray(route_realization.residuals, dtype=float),
+            dense_joint_path_joint_steps=np.asarray(route_realization.joint_steps, dtype=float),
+            dense_joint_path_max_joint_step=float(route_realization.max_joint_step),
+            dense_joint_path_mean_joint_step=float(route_realization.mean_joint_step),
+            max_dense_constraint_residual=float(route_realization.max_constraint_residual),
+            mean_dense_constraint_residual=float(route_realization.mean_constraint_residual),
+            collision_free=bool(route_realization.collision_free),
+            selected_left_family_transition_theta=np.asarray(route_realization.selected_left_family_transition_theta, dtype=float),
+            selected_family_right_transition_theta=np.asarray(route_realization.selected_family_right_transition_theta, dtype=float),
+            selected_left_family_transition_index=int(route_realization.selected_left_family_transition_index),
+            selected_family_right_transition_index=int(route_realization.selected_family_right_transition_index),
+            selected_left_family_stack_residual=float(route_realization.selected_left_family_stack_residual),
+            selected_family_right_stack_residual=float(route_realization.selected_family_right_stack_residual),
+            max_transition_stack_residual=float(route_realization.max_transition_stack_residual),
+            transition_stack_certified=bool(route_realization.transition_stack_certified),
+            stage_order_valid=bool(route_realization.stage_order_valid),
+            lambda_fixed_during_transfer=bool(route_realization.lambda_fixed_during_transfer),
+            lambda_variation_transfer=float(route_realization.lambda_variation_transfer),
+            final_route_stored_evidence_edges=int(route_realization.final_route_stored_evidence_edges),
+            final_route_evidence_edges=int(route_realization.final_route_evidence_edges),
+            final_route_query_connectors=int(route_realization.final_route_query_connectors),
+            final_route_projected_fallback_edges=int(route_realization.final_route_projected_fallback_edges),
+            final_route_dense_segments=int(route_realization.final_route_dense_segments),
+            final_route_segment_source=str(route_realization.final_route_segment_source),
+            final_route_projected_jointspace_edges=int(route_realization.final_route_projected_jointspace_edges),
+            final_route_taskspace_edges=int(route_realization.final_route_taskspace_edges),
+            left_segment_source=str(route_realization.left_segment_source),
+            right_segment_source=str(route_realization.right_segment_source),
+            left_graph_route_used_for_segment=bool(route_realization.left_graph_route_used_for_segment),
+            right_graph_route_used_for_segment=bool(route_realization.right_graph_route_used_for_segment),
+            left_graph_edges_used=int(route_realization.left_graph_edges_used),
+            right_graph_edges_used=int(route_realization.right_graph_edges_used),
+            left_graph_query_connectors_used=int(route_realization.left_graph_query_connectors_used),
+            right_graph_query_connectors_used=int(route_realization.right_graph_query_connectors_used),
+            left_graph_route_failure_reason=str(route_realization.left_graph_route_failure_reason),
+            right_graph_route_failure_reason=str(route_realization.right_graph_route_failure_reason),
+            family_segment_source=str(route_realization.family_segment_source),
+            family_graph_route_used_for_family_segment=bool(route_realization.family_graph_route_used_for_family_segment),
+            family_graph_edges_used=int(route_realization.family_graph_edges_used),
+            family_graph_query_connectors_used=int(route_realization.family_graph_query_connectors_used),
+            family_graph_path_joint_length=float(route_realization.family_graph_path_joint_length),
+            family_graph_route_certified=bool(route_realization.family_graph_route_certified),
+            family_graph_route_lambda_fixed=bool(route_realization.family_graph_route_lambda_fixed),
+            family_graph_route_max_residual=float(route_realization.family_graph_route_max_residual),
+            family_graph_route_max_joint_step=float(route_realization.family_graph_route_max_joint_step),
+            family_graph_route_failure_reason=str(route_realization.family_graph_route_failure_reason),
+            family_graph_route_node_ids=list(route_realization.family_graph_route_node_ids or []),
+            family_graph_route_edge_sources=list(route_realization.family_graph_route_edge_sources or []),
+            selected_lambda_family_nodes=int(route_realization.selected_lambda_family_nodes),
+            selected_lambda_family_edges=int(route_realization.selected_lambda_family_edges),
+            lambda_match_tol=float(route_realization.lambda_match_tol),
+            task_space_planner_used=False,
+            ik_waypoint_fallback_used=False,
+            task_space_route_reconstruction=False,
+            execution_path_source=route_realization_source,
+            visual_trace_source="FK(dense_theta_path)",
+            route_source="FK(result.dense_joint_path)",
+            route_realization_source=route_realization_source,
+            final_route_realization=final_route_realization,
+            graph_route_used_for_execution=(
+                True
+                if bool(route_realization.left_graph_route_used_for_segment)
+                and bool(route_realization.family_graph_route_used_for_family_segment)
+                and bool(route_realization.right_graph_route_used_for_segment)
+                else "partial_family_graph"
+                if bool(route_realization.family_graph_route_used_for_family_segment)
+                else False
+            ),
+        )
+
+    _print_key_value_block(
+        "Full Joint-Space Continuous-Transfer Route",
+        {
+            "planner_success": bool(route_success),
+            "planning_space": "joint_space",
+            "state_variable": "theta=[yaw, shoulder, elbow]",
+            "lambda_entry_exit_selection_space": "joint_space_evidence",
+            "task_space_robot_mode_enabled": False,
+            "ik_waypoint_fallback_used": bool(
+                (
+                    route_realization is not None
+                    and any(
+                        bool(route_realization.segment_messages.get(key, ""))
+                        for key in (
+                            "left_segment_task_waypoint_fallback",
+                            "family_segment_task_waypoint_fallback",
+                            "right_segment_task_waypoint_fallback",
+                        )
+                    )
+                )
+            ),
+            "route_candidates_evaluated": int(route_counters.get("route_candidates_evaluated", 0)),
+            "route_candidates_built": int(route_counters.get("route_candidates_built", 0)),
+            "route_candidates_rejected_lambda_mismatch": int(route_counters.get("route_candidates_rejected_lambda_mismatch", 0)),
+            "route_candidates_rejected_local_replan": int(route_candidates_rejected_local_replan),
+            "selected_lambda": None if selected_candidate is None else round(float(selected_candidate.selected_lambda), 6),
+            "lambda_match_tol": None if route_realization is None else float(route_realization.lambda_match_tol),
+            "selected_lambda_family_nodes": 0 if route_realization is None else int(route_realization.selected_lambda_family_nodes),
+            "selected_lambda_family_edges": 0 if route_realization is None else int(route_realization.selected_lambda_family_edges),
+            "selected_entry_point": None if selected_entry is None else np.round(selected_entry.task_point, 6).tolist(),
+            "selected_exit_point": None if selected_exit is None else np.round(selected_exit.task_point, 6).tolist(),
+            "selected_entry_residual": None if selected_entry is None else round(float(selected_entry.residual_norm), 8),
+            "selected_exit_residual": None if selected_exit is None else round(float(selected_exit.residual_norm), 8),
+            "lambda_reconciliation": lambda_reconciliation,
+            "left_graph_route_used_for_segment": bool(
+                route_realization is not None and route_realization.left_graph_route_used_for_segment
+            ),
+            "right_graph_route_used_for_segment": bool(
+                route_realization is not None and route_realization.right_graph_route_used_for_segment
+            ),
+            "left_graph_edges_used": 0 if route_realization is None else int(route_realization.left_graph_edges_used),
+            "left_graph_query_connectors_used": 0
+            if route_realization is None
+            else int(route_realization.left_graph_query_connectors_used),
+            "right_graph_edges_used": 0 if route_realization is None else int(route_realization.right_graph_edges_used),
+            "right_graph_query_connectors_used": 0
+            if route_realization is None
+            else int(route_realization.right_graph_query_connectors_used),
+            "left_segment_source": "" if route_realization is None else str(route_realization.left_segment_source),
+            "right_segment_source": "" if route_realization is None else str(route_realization.right_segment_source),
+            "family_segment_source": "" if route_realization is None else str(route_realization.family_segment_source),
+            "family_graph_route_used_for_family_segment": bool(
+                route_realization is not None and route_realization.family_graph_route_used_for_family_segment
+            ),
+            "family_graph_edges_used": 0 if route_realization is None else int(route_realization.family_graph_edges_used),
+            "family_graph_query_connectors_used": 0 if route_realization is None else int(route_realization.family_graph_query_connectors_used),
+            "family_graph_path_joint_length": 0.0 if route_realization is None else float(route_realization.family_graph_path_joint_length),
+            "family_graph_route_certified": bool(route_realization is not None and route_realization.family_graph_route_certified),
+            "family_graph_route_lambda_fixed": bool(route_realization is not None and route_realization.family_graph_route_lambda_fixed),
+            "family_graph_route_max_residual": float("inf")
+            if route_realization is None
+            else float(route_realization.family_graph_route_max_residual),
+            "family_graph_route_max_joint_step": float("inf")
+            if route_realization is None
+            else float(route_realization.family_graph_route_max_joint_step),
+            "final_route_realization": final_route_realization,
+            "graph_route_used_for_execution": True
+            if full_graph_success
+            else "partial_family_graph"
+            if route_success
+            and route_realization is not None
+            and bool(route_realization.family_graph_route_used_for_family_segment)
+            else False,
+            "route_realization_source": route_realization_source,
+            "dense_joint_path_execution_certified": bool(route_success),
+            "dense_joint_path_constraint_certified": bool(route_success and route_realization is not None),
+            "dense_joint_path_joint_continuity_certified": bool(route_success and route_realization is not None),
+            "dense_joint_path_points": 0 if route_realization is None else int(len(route_realization.dense_joint_path)),
+            "max_dense_constraint_residual": round(max_residual, 8) if np.isfinite(max_residual) else float("inf"),
+            "mean_dense_constraint_residual": round(mean_residual, 8) if np.isfinite(mean_residual) else float("inf"),
+            "dense_joint_path_max_joint_step": round(max_step, 6) if np.isfinite(max_step) else float("inf"),
+            "dense_joint_path_mean_joint_step": None
+            if route_realization is None or not np.isfinite(route_realization.mean_joint_step)
+            else round(float(route_realization.mean_joint_step), 6),
+            "collision_free": bool(route_realization.collision_free) if route_realization is not None else False,
+            "stage_order_valid": bool(route_realization.stage_order_valid) if route_realization is not None else False,
+            "lambda_fixed_during_transfer": bool(route_realization.lambda_fixed_during_transfer) if route_realization is not None else False,
+            "lambda_variation_transfer": None
+            if route_realization is None or not np.isfinite(route_realization.lambda_variation_transfer)
+            else float(route_realization.lambda_variation_transfer),
+            "selected_left_family_transition_index": None if route_realization is None else int(route_realization.selected_left_family_transition_index),
+            "selected_family_right_transition_index": None if route_realization is None else int(route_realization.selected_family_right_transition_index),
+            "selected_left_family_stack_residual": None
+            if route_realization is None or not np.isfinite(route_realization.selected_left_family_stack_residual)
+            else float(route_realization.selected_left_family_stack_residual),
+            "selected_family_right_stack_residual": None
+            if route_realization is None or not np.isfinite(route_realization.selected_family_right_stack_residual)
+            else float(route_realization.selected_family_right_stack_residual),
+            "max_transition_stack_residual": None
+            if route_realization is None or not np.isfinite(route_realization.max_transition_stack_residual)
+            else float(route_realization.max_transition_stack_residual),
+            "transition_stack_certified": bool(route_realization.transition_stack_certified) if route_realization is not None else False,
+            "final_route_dense_segments": 0 if route_realization is None else int(route_realization.final_route_dense_segments),
+            "final_route_segment_source": "" if route_realization is None else str(route_realization.final_route_segment_source),
+            "final_route_stored_evidence_edges": 0 if route_realization is None else int(route_realization.final_route_stored_evidence_edges),
+            "final_route_evidence_edges": 0 if route_realization is None else int(route_realization.final_route_evidence_edges),
+            "final_route_query_connectors": 0 if route_realization is None else int(route_realization.final_route_query_connectors),
+            "final_route_projected_fallback_edges": 0
+            if route_realization is None
+            else int(route_realization.final_route_projected_fallback_edges),
+            "final_route_projected_jointspace_edges": 0 if route_realization is None else int(route_realization.final_route_projected_jointspace_edges),
+            "final_route_taskspace_edges": 0 if route_realization is None else int(route_realization.final_route_taskspace_edges),
+            "execution_source": execution_source,
+            "route_source": route_source,
+            "display_vs_trace_max_error": round(float(display_vs_trace_max_error), 6) if route_success else float("inf"),
+            "display_vs_trace_mean_error": round(float(display_vs_trace_mean_error), 6) if route_success else float("inf"),
+            "segment_left": "" if route_realization is None else route_realization.segment_messages.get("left_segment", ""),
+            "segment_left_fallback": "" if route_realization is None else route_realization.segment_messages.get("left_segment_task_waypoint_fallback", ""),
+            "segment_family": "" if route_realization is None else route_realization.segment_messages.get("family_segment", ""),
+            "segment_family_fallback": "" if route_realization is None else route_realization.segment_messages.get("family_segment_task_waypoint_fallback", ""),
+            "segment_right": "" if route_realization is None else route_realization.segment_messages.get("right_segment", ""),
+            "segment_right_fallback": "" if route_realization is None else route_realization.segment_messages.get("right_segment_task_waypoint_fallback", ""),
+            "failure_reason": "" if route_success else str(failure_reason or (route_realization.message if route_realization is not None else "unknown")),
+        },
+    )
+    return scene, visualization_result, robot, robot_execution
+
+
+def _json_safe(value):
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (np.floating, np.integer)):
+        return value.item()
+    if isinstance(value, (float, int, str, bool)) or value is None:
+        return value
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    return str(value)
+
+
+def _cspace_manifolds_for_result(scene, robot, result):
+    selected_lambda = float(
+        getattr(
+            result,
+            "selected_lambda_for_realization",
+            getattr(result, "selected_lambda", scene.transfer_family.nominal_lambda),
+        )
+    )
+    manifolds = build_robot_manifolds_for_selected_lambda(
+        robot,
+        (scene.left_support, scene.transfer_family, scene.right_support),
+        selected_lambda,
+    )
+    return manifolds, selected_lambda
+
+
+def _dedupe_sorted_lambdas(values: list[float], *, transfer_family, tol: float = 1.0e-6) -> list[float]:
+    deduped: list[float] = []
+    for value in sorted(float(v) for v in values if np.isfinite(float(v))):
+        lam = float(np.clip(value, transfer_family.lambda_min, transfer_family.lambda_max))
+        if not transfer_family.lambda_in_range(lam, tol=float(tol)):
+            continue
+        if all(abs(lam - existing) > float(tol) for existing in deduped):
+            deduped.append(float(_lambda_key(lam)))
+    return deduped
+
+
+def _select_cspace_family_lambdas(scene, result, selected_lambda: float, leaf_count: int) -> list[float]:
+    transfer_family = scene.transfer_family
+    target = max(1, int(leaf_count))
+    coverage = np.asarray(getattr(result, "lambda_coverage_range", []), dtype=float)
+    if len(coverage) >= 2 and np.all(np.isfinite(coverage[:2])):
+        lam_min = float(min(coverage[0], coverage[1]))
+        lam_max = float(max(coverage[0], coverage[1]))
+    else:
+        lam_min = float(transfer_family.lambda_min)
+        lam_max = float(transfer_family.lambda_max)
+    lam_min = float(np.clip(lam_min, transfer_family.lambda_min, transfer_family.lambda_max))
+    lam_max = float(np.clip(lam_max, transfer_family.lambda_min, transfer_family.lambda_max))
+
+    selected = float(np.clip(selected_lambda, lam_min, lam_max))
+    candidates: list[float] = [selected, lam_min, lam_max]
+    if target > 1 and lam_max > lam_min:
+        candidates.extend(float(v) for v in np.linspace(lam_min, lam_max, num=max(target, 3)))
+    active = np.asarray(getattr(result, "active_family_lambdas", []), dtype=float)
+    active = active[np.isfinite(active)] if active.size else np.zeros(0, dtype=float)
+    if len(active) > 0:
+        active = np.asarray([float(v) for v in active if lam_min - 1.0e-6 <= float(v) <= lam_max + 1.0e-6], dtype=float)
+        if len(active) > 0:
+            nearest = active[np.argsort(np.abs(active - selected))[: max(2, target)]]
+            candidates.extend(float(v) for v in nearest)
+
+    values = _dedupe_sorted_lambdas(candidates, transfer_family=transfer_family)
+    if len(values) <= target:
+        return values
+
+    keep = {
+        min(range(len(values)), key=lambda idx: abs(values[idx] - selected)),
+        0,
+        len(values) - 1,
+    }
+    while len(keep) < target:
+        remaining = [idx for idx in range(len(values)) if idx not in keep]
+        if not remaining:
+            break
+        idx = min(remaining, key=lambda item: abs(values[item] - selected))
+        keep.add(int(idx))
+    return [values[idx] for idx in sorted(keep)]
+
+
+def _cspace_family_manifolds_for_lambdas(scene, robot, lambdas: list[float]) -> dict[float, object]:
+    return {
+        float(lam): RobotPlaneLeafManifold(
+            robot=robot,
+            transfer_family=scene.transfer_family,
+            lambda_value=float(lam),
+            name="continuous_robot_cspace_family_leaf",
+            joint_lower=-np.pi * np.ones(3, dtype=float),
+            joint_upper=np.pi * np.ones(3, dtype=float),
+        )
+        for lam in lambdas
+    }
+
+
+def _stage_residual_audit(
+    theta_path: np.ndarray,
+    labels: list[str],
+    manifolds: dict[str, object],
+) -> tuple[dict[str, list[float]], np.ndarray]:
+    stage_residuals: dict[str, list[float]] = {LEFT_STAGE: [], FAMILY_STAGE: [], RIGHT_STAGE: []}
+    active_residuals: list[float] = []
+    for idx, theta in enumerate(np.asarray(theta_path, dtype=float)):
+        stage = str(labels[idx]) if idx < len(labels) else ""
+        manifold = manifolds.get(stage)
+        residual = float("inf") if manifold is None else float(np.linalg.norm(manifold.residual(theta)))
+        active_residuals.append(residual)
+        if stage in stage_residuals:
+            stage_residuals[stage].append(residual)
+    return stage_residuals, np.asarray(active_residuals, dtype=float)
+
+
+def compute_ex65_jointspace_audit(scene, result, robot, robot_execution) -> dict[str, object]:
+    # TODO(jointspace_method): this example-specific audit now mirrors the
+    # reusable certification/debug utilities in
+    # primitive_manifold_planner.thesis.jointspace_method. Keep behavior stable
+    # here until Example 65 and 66 are migrated together.
+    theta_path = np.asarray(getattr(result, "dense_joint_path", np.zeros((0, 3), dtype=float)), dtype=float)
+    labels = list(getattr(result, "dense_joint_path_stage_labels", []))
+    lambda_labels = np.asarray(getattr(result, "dense_lambda_labels", np.zeros(0, dtype=float)), dtype=float)
+    if len(lambda_labels) != len(theta_path):
+        lambda_labels = _lambda_labels_for_stages(labels, float(getattr(result, "selected_lambda", np.nan)))
+    fk_trace = joint_path_to_task_path(robot, theta_path) if len(theta_path) else np.zeros((0, 3), dtype=float)
+    joint_steps = np.asarray(getattr(result, "dense_joint_path_joint_steps", np.zeros(0, dtype=float)), dtype=float)
+    if len(joint_steps) == 0 and len(theta_path) >= 2:
+        joint_steps, _max_step, _mean_step, _worst = joint_step_statistics(theta_path)
+    manifolds, selected_lambda = _cspace_manifolds_for_result(scene, robot, result)
+    stage_residuals, active_residuals = _stage_residual_audit(theta_path, labels, manifolds)
+    residuals = np.asarray(getattr(result, "dense_joint_path_constraint_residuals", active_residuals), dtype=float)
+    if len(residuals) != len(theta_path):
+        residuals = active_residuals
+    theta_min = np.min(theta_path, axis=0) if len(theta_path) else np.zeros(3, dtype=float)
+    theta_max = np.max(theta_path, axis=0) if len(theta_path) else np.zeros(3, dtype=float)
+    theta_span = theta_max - theta_min
+    family_lambda_min, family_lambda_max, lambda_variation, lambda_fixed, family_count = _lambda_fixed_audit(lambda_labels)
+    selected_entry_idx = int(getattr(result, "selected_left_family_transition_index", -1))
+    selected_exit_idx = int(getattr(result, "selected_family_right_transition_index", -1))
+    selected_left_family_stack = float(getattr(result, "selected_left_family_stack_residual", float("inf")))
+    selected_family_right_stack = float(getattr(result, "selected_family_right_stack_residual", float("inf")))
+    if not np.isfinite(selected_left_family_stack) and 0 <= selected_entry_idx < len(theta_path):
+        selected_left_family_stack = _stack_residual(manifolds[LEFT_STAGE], manifolds[FAMILY_STAGE], theta_path[selected_entry_idx])
+    if not np.isfinite(selected_family_right_stack) and 0 <= selected_exit_idx < len(theta_path):
+        selected_family_right_stack = _stack_residual(manifolds[FAMILY_STAGE], manifolds[RIGHT_STAGE], theta_path[selected_exit_idx])
+    max_transition_stack = float(
+        max(
+            value
+            for value in (selected_left_family_stack, selected_family_right_stack)
+            if np.isfinite(value)
+        )
+    ) if np.isfinite(selected_left_family_stack) or np.isfinite(selected_family_right_stack) else float("inf")
+    display_route = np.asarray(getattr(result, "path", np.zeros((0, 3), dtype=float)), dtype=float)
+    display_vs_trace_max, display_vs_trace_mean = _polyline_error(display_route, fk_trace) if len(display_route) else (0.0, 0.0)
+    label_counts = {
+        LEFT_STAGE: int(sum(1 for label in labels if str(label) == LEFT_STAGE)),
+        FAMILY_STAGE: int(sum(1 for label in labels if str(label) == FAMILY_STAGE)),
+        RIGHT_STAGE: int(sum(1 for label in labels if str(label) == RIGHT_STAGE)),
+    }
+    return {
+        "theta_path": theta_path,
+        "fk_trace": fk_trace,
+        "stage_labels": labels,
+        "lambda_labels": lambda_labels,
+        "constraint_residuals": residuals,
+        "joint_steps": np.asarray(joint_steps, dtype=float),
+        "theta_path_points": int(len(theta_path)),
+        "theta0_min": float(theta_min[0]),
+        "theta0_max": float(theta_max[0]),
+        "theta0_span": float(theta_span[0]),
+        "theta1_min": float(theta_min[1]),
+        "theta1_max": float(theta_max[1]),
+        "theta1_span": float(theta_span[1]),
+        "theta2_min": float(theta_min[2]),
+        "theta2_max": float(theta_max[2]),
+        "theta2_span": float(theta_span[2]),
+        "total_joint_path_length": float(np.sum(joint_steps)) if len(joint_steps) else 0.0,
+        "total_task_fk_path_length": float(np.sum(np.linalg.norm(np.diff(fk_trace, axis=0), axis=1))) if len(fk_trace) >= 2 else 0.0,
+        "max_joint_step": float(np.max(joint_steps)) if len(joint_steps) else 0.0,
+        "mean_joint_step": float(np.mean(joint_steps)) if len(joint_steps) else 0.0,
+        "max_constraint_residual": float(np.max(residuals)) if len(residuals) else 0.0,
+        "mean_constraint_residual": float(np.mean(residuals)) if len(residuals) else 0.0,
+        "left_count": label_counts[LEFT_STAGE],
+        "family_count": label_counts[FAMILY_STAGE],
+        "right_count": label_counts[RIGHT_STAGE],
+        "left_stage_max_residual": float(max(stage_residuals[LEFT_STAGE])) if stage_residuals[LEFT_STAGE] else 0.0,
+        "family_stage_max_residual": float(max(stage_residuals[FAMILY_STAGE])) if stage_residuals[FAMILY_STAGE] else 0.0,
+        "right_stage_max_residual": float(max(stage_residuals[RIGHT_STAGE])) if stage_residuals[RIGHT_STAGE] else 0.0,
+        "stage_order_valid": bool(_stage_order_valid(labels)),
+        "selected_lambda": float(selected_lambda),
+        "family_lambda_min": float(family_lambda_min),
+        "family_lambda_max": float(family_lambda_max),
+        "family_lambda_span": float(lambda_variation),
+        "lambda_fixed_during_transfer": bool(lambda_fixed),
+        "lambda_variation_transfer": float(lambda_variation),
+        "family_stage_count": int(family_count),
+        "selected_left_family_transition_index": int(selected_entry_idx),
+        "selected_family_right_transition_index": int(selected_exit_idx),
+        "selected_left_family_stack_residual": float(selected_left_family_stack),
+        "selected_family_right_stack_residual": float(selected_family_right_stack),
+        "max_transition_stack_residual": float(max_transition_stack),
+        "transition_stack_certified": bool(max_transition_stack <= 1.0e-3),
+        "planning_space": "joint_space",
+        "state_variable": "theta=[yaw, shoulder, elbow]",
+        "family_state": "theta+lambda",
+        "execution_path_source": str(
+            getattr(result, "execution_path_source", "certified_projected_jointspace_continuation_segments")
+        ),
+        "visual_trace_source": str(getattr(result, "visual_trace_source", "FK(dense_theta_path)")),
+        "route_realization_source": str(
+            getattr(result, "route_realization_source", "certified_projected_jointspace_continuation_segments")
+        ),
+        "task_space_planner_used": bool(getattr(result, "task_space_planner_used", False)),
+        "ik_waypoint_fallback_used": bool(getattr(result, "ik_waypoint_fallback_used", False)),
+        "task_space_route_reconstruction": bool(getattr(result, "task_space_route_reconstruction", False)),
+        "dense_joint_path_execution_certified": bool(getattr(result, "dense_joint_path_execution_certified", False)),
+        "dense_joint_path_constraint_certified": bool(getattr(result, "dense_joint_path_constraint_certified", False)),
+        "dense_joint_path_joint_continuity_certified": bool(getattr(result, "dense_joint_path_joint_continuity_certified", False)),
+        "collision_free": bool(getattr(result, "collision_free", False)),
+        "graph_route_used_for_execution": bool(getattr(result, "graph_route_used_for_execution", False)),
+        "final_route_stored_evidence_edges": int(getattr(result, "final_route_stored_evidence_edges", 0)),
+        "final_route_evidence_edges": int(getattr(result, "final_route_evidence_edges", 0)),
+        "final_route_query_connectors": int(getattr(result, "final_route_query_connectors", 0)),
+        "final_route_projected_fallback_edges": int(getattr(result, "final_route_projected_fallback_edges", 0)),
+        "final_route_dense_segments": int(getattr(result, "final_route_dense_segments", 0)),
+        "final_route_segment_source": str(getattr(result, "final_route_segment_source", "")),
+        "final_route_projected_jointspace_edges": int(getattr(result, "final_route_projected_jointspace_edges", 0)),
+        "final_route_taskspace_edges": int(getattr(result, "final_route_taskspace_edges", 0)),
+        "left_segment_source": str(getattr(result, "left_segment_source", "")),
+        "right_segment_source": str(getattr(result, "right_segment_source", "")),
+        "left_graph_route_used_for_segment": bool(getattr(result, "left_graph_route_used_for_segment", False)),
+        "right_graph_route_used_for_segment": bool(getattr(result, "right_graph_route_used_for_segment", False)),
+        "left_graph_edges_used": int(getattr(result, "left_graph_edges_used", 0)),
+        "right_graph_edges_used": int(getattr(result, "right_graph_edges_used", 0)),
+        "left_graph_query_connectors_used": int(getattr(result, "left_graph_query_connectors_used", 0)),
+        "right_graph_query_connectors_used": int(getattr(result, "right_graph_query_connectors_used", 0)),
+        "family_segment_source": str(getattr(result, "family_segment_source", "")),
+        "family_graph_route_used_for_family_segment": bool(
+            getattr(result, "family_graph_route_used_for_family_segment", False)
+        ),
+        "family_graph_edges_used": int(getattr(result, "family_graph_edges_used", 0)),
+        "family_graph_query_connectors_used": int(getattr(result, "family_graph_query_connectors_used", 0)),
+        "selected_lambda_family_nodes": int(getattr(result, "selected_lambda_family_nodes", 0)),
+        "selected_lambda_family_edges": int(getattr(result, "selected_lambda_family_edges", 0)),
+        "lambda_match_tol": float(getattr(result, "lambda_match_tol", 0.0)),
+        "family_graph_route_joint_length": float(getattr(result, "family_graph_path_joint_length", 0.0)),
+        "family_graph_route_certified": bool(getattr(result, "family_graph_route_certified", False)),
+        "family_graph_route_lambda_fixed": bool(getattr(result, "family_graph_route_lambda_fixed", False)),
+        "family_graph_route_max_residual": float(getattr(result, "family_graph_route_max_residual", float("inf"))),
+        "family_graph_route_max_joint_step": float(getattr(result, "family_graph_route_max_joint_step", float("inf"))),
+        "family_graph_route_node_ids": list(getattr(result, "family_graph_route_node_ids", []) or []),
+        "family_graph_route_edge_sources": list(getattr(result, "family_graph_route_edge_sources", []) or []),
+        "route_source": str(getattr(result, "route_source", "none")),
+        "display_vs_trace_max_error": float(display_vs_trace_max),
+        "display_vs_trace_mean_error": float(display_vs_trace_mean),
+        "robot_execution_source": "none" if robot_execution is None else str(robot_execution.execution_source),
+    }
+
+
+def print_ex65_jointspace_audits(audit: dict[str, object]) -> None:
+    _print_key_value_block(
+        "Joint-space methodology guardrails",
+        {
+            "planning_space": audit["planning_space"],
+            "state_variable": audit["state_variable"],
+            "family_state": audit["family_state"],
+            "task_space_planner_used": audit["task_space_planner_used"],
+            "ik_waypoint_fallback_used": audit["ik_waypoint_fallback_used"],
+            "task_space_route_reconstruction": audit["task_space_route_reconstruction"],
+            "execution_path_source": audit["execution_path_source"],
+            "visual_trace_source": audit["visual_trace_source"],
+            "graph_route_used_for_execution": audit["graph_route_used_for_execution"],
+            "route_realization_source": audit["route_realization_source"],
+            "dense_theta_points": audit["theta_path_points"],
+            "dense_joint_path_execution_certified": audit["dense_joint_path_execution_certified"],
+            "final_route_taskspace_edges": audit["final_route_taskspace_edges"],
+            "display_vs_trace_max_error": round(float(audit["display_vs_trace_max_error"]), 8),
+        },
+    )
+    _print_key_value_block(
+        "Lambda / family audit",
+        {
+            "selected_lambda": round(float(audit["selected_lambda"]), 8),
+            "family_lambda_min": audit["family_lambda_min"],
+            "family_lambda_max": audit["family_lambda_max"],
+            "family_lambda_span": audit["family_lambda_span"],
+            "lambda_fixed_during_transfer": audit["lambda_fixed_during_transfer"],
+            "lambda_variation_transfer": audit["lambda_variation_transfer"],
+            "family_stage_count": audit["family_stage_count"],
+        },
+    )
+    _print_key_value_block(
+        "C-space trajectory audit",
+        {
+            "stage_order_valid": audit["stage_order_valid"],
+            "theta0_span": audit["theta0_span"],
+            "theta1_span": audit["theta1_span"],
+            "theta2_span": audit["theta2_span"],
+            "total_joint_path_length": audit["total_joint_path_length"],
+            "total_task_fk_path_length": audit["total_task_fk_path_length"],
+            "max_joint_step": audit["max_joint_step"],
+            "mean_joint_step": audit["mean_joint_step"],
+            "max_constraint_residual": audit["max_constraint_residual"],
+            "mean_constraint_residual": audit["mean_constraint_residual"],
+            "left_stage_max_residual": audit["left_stage_max_residual"],
+            "family_stage_max_residual": audit["family_stage_max_residual"],
+            "right_stage_max_residual": audit["right_stage_max_residual"],
+            "selected_left_family_transition_index": audit["selected_left_family_transition_index"],
+            "selected_family_right_transition_index": audit["selected_family_right_transition_index"],
+            "selected_left_family_stack_residual": audit["selected_left_family_stack_residual"],
+            "selected_family_right_stack_residual": audit["selected_family_right_stack_residual"],
+            "max_transition_stack_residual": audit["max_transition_stack_residual"],
+            "transition_stack_certified": audit["transition_stack_certified"],
+            "final_route_dense_segments": audit["final_route_dense_segments"],
+            "final_route_segment_source": audit["final_route_segment_source"],
+            "final_route_stored_evidence_edges": audit["final_route_stored_evidence_edges"],
+            "final_route_evidence_edges": audit["final_route_evidence_edges"],
+            "final_route_query_connectors": audit["final_route_query_connectors"],
+            "final_route_projected_fallback_edges": audit["final_route_projected_fallback_edges"],
+            "final_route_projected_jointspace_edges": audit["final_route_projected_jointspace_edges"],
+            "final_route_taskspace_edges": audit["final_route_taskspace_edges"],
+            "left_segment_source": audit["left_segment_source"],
+            "left_graph_route_used_for_segment": audit["left_graph_route_used_for_segment"],
+            "left_graph_edges_used": audit["left_graph_edges_used"],
+            "left_graph_query_connectors_used": audit["left_graph_query_connectors_used"],
+            "family_segment_source": audit["family_segment_source"],
+            "family_graph_route_used_for_family_segment": audit["family_graph_route_used_for_family_segment"],
+            "family_graph_edges_used": audit["family_graph_edges_used"],
+            "family_graph_query_connectors_used": audit["family_graph_query_connectors_used"],
+            "right_segment_source": audit["right_segment_source"],
+            "right_graph_route_used_for_segment": audit["right_graph_route_used_for_segment"],
+            "right_graph_edges_used": audit["right_graph_edges_used"],
+            "right_graph_query_connectors_used": audit["right_graph_query_connectors_used"],
+            "family_graph_route_certified": audit["family_graph_route_certified"],
+            "family_graph_route_lambda_fixed": audit["family_graph_route_lambda_fixed"],
+            "family_graph_route_max_residual": audit["family_graph_route_max_residual"],
+            "family_graph_route_max_joint_step": audit["family_graph_route_max_joint_step"],
+        },
+    )
+
+
+def save_ex65_cspace_debug_artifacts(audit: dict[str, object], *, output_root: Path | None = None) -> Path:
+    # TODO(jointspace_method): replace this with the generic
+    # CspaceDebugArtifact/save_cspace_debug_artifacts helper after the examples
+    # share one audit schema.
+    base = output_root or Path("outputs") / "ex65_jointspace_debug" / "latest"
+    base.mkdir(parents=True, exist_ok=True)
+    theta_path = np.asarray(audit["theta_path"], dtype=float)
+    fk_trace = np.asarray(audit["fk_trace"], dtype=float)
+    residuals = np.asarray(audit["constraint_residuals"], dtype=float)
+    joint_steps = np.asarray(audit["joint_steps"], dtype=float)
+    labels = list(audit["stage_labels"])
+    lambda_labels = np.asarray(audit["lambda_labels"], dtype=float)
+
+    np.save(base / "dense_theta_path.npy", theta_path)
+    np.save(base / "dense_fk_trace.npy", fk_trace)
+    np.save(base / "constraint_residuals.npy", residuals)
+    np.save(base / "joint_steps.npy", joint_steps)
+    np.save(base / "dense_lambda_labels.npy", lambda_labels)
+    (base / "dense_stage_labels.txt").write_text("\n".join(labels), encoding="utf-8")
+    (base / "dense_stage_labels.json").write_text(json.dumps(labels, indent=2), encoding="utf-8")
+    lambda_json = [None if not np.isfinite(float(value)) else float(value) for value in lambda_labels]
+    (base / "dense_lambda_labels.json").write_text(json.dumps(lambda_json, indent=2), encoding="utf-8")
+
+    summary = {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "planning_space": audit["planning_space"],
+        "state_variable": audit["state_variable"],
+        "family_state": audit["family_state"],
+        "selected_lambda": audit["selected_lambda"],
+        "lambda_fixed_during_transfer": audit["lambda_fixed_during_transfer"],
+        "lambda_variation_transfer": audit["lambda_variation_transfer"],
+        "execution_path_source": audit["execution_path_source"],
+        "visual_trace_source": audit["visual_trace_source"],
+        "route_realization_source": audit["route_realization_source"],
+        "task_space_planner_used": audit["task_space_planner_used"],
+        "ik_waypoint_fallback_used": audit["ik_waypoint_fallback_used"],
+        "task_space_route_reconstruction": audit["task_space_route_reconstruction"],
+        "dense_joint_path_execution_certified": audit["dense_joint_path_execution_certified"],
+        "transition_stack_certified": audit["transition_stack_certified"],
+        "max_transition_stack_residual": audit["max_transition_stack_residual"],
+        "max_constraint_residual": audit["max_constraint_residual"],
+        "max_joint_step": audit["max_joint_step"],
+        "stage_order_valid": audit["stage_order_valid"],
+        "graph_route_used_for_execution": audit["graph_route_used_for_execution"],
+        "final_route_dense_segments": audit["final_route_dense_segments"],
+        "final_route_segment_source": audit["final_route_segment_source"],
+        "final_route_evidence_edges": audit["final_route_evidence_edges"],
+        "final_route_query_connectors": audit["final_route_query_connectors"],
+        "final_route_projected_fallback_edges": audit["final_route_projected_fallback_edges"],
+        "final_route_taskspace_edges": audit["final_route_taskspace_edges"],
+        "left_segment_source": audit["left_segment_source"],
+        "left_graph_route_used_for_segment": audit["left_graph_route_used_for_segment"],
+        "left_graph_edges_used": audit["left_graph_edges_used"],
+        "left_graph_query_connectors_used": audit["left_graph_query_connectors_used"],
+        "family_segment_source": audit["family_segment_source"],
+        "family_graph_route_used_for_family_segment": audit["family_graph_route_used_for_family_segment"],
+        "family_graph_edges_used": audit["family_graph_edges_used"],
+        "family_graph_query_connectors_used": audit["family_graph_query_connectors_used"],
+        "right_segment_source": audit["right_segment_source"],
+        "right_graph_route_used_for_segment": audit["right_graph_route_used_for_segment"],
+        "right_graph_edges_used": audit["right_graph_edges_used"],
+        "right_graph_query_connectors_used": audit["right_graph_query_connectors_used"],
+        "selected_lambda_family_nodes": audit["selected_lambda_family_nodes"],
+        "selected_lambda_family_edges": audit["selected_lambda_family_edges"],
+        "family_graph_route_joint_length": audit["family_graph_route_joint_length"],
+        "family_graph_route_certified": audit["family_graph_route_certified"],
+        "family_graph_route_lambda_fixed": audit["family_graph_route_lambda_fixed"],
+        "family_graph_route_max_residual": audit["family_graph_route_max_residual"],
+        "family_graph_route_max_joint_step": audit["family_graph_route_max_joint_step"],
+        "total_joint_path_length": audit["total_joint_path_length"],
+        "total_task_fk_path_length": audit["total_task_fk_path_length"],
+    }
+    (base / "cspace_summary.json").write_text(json.dumps(_json_safe(summary), indent=2), encoding="utf-8")
+    (base / "family_graph_route_node_ids.json").write_text(
+        json.dumps(_json_safe(audit.get("family_graph_route_node_ids", [])), indent=2),
+        encoding="utf-8",
+    )
+    (base / "family_graph_route_edge_sources.json").write_text(
+        json.dumps(_json_safe(audit.get("family_graph_route_edge_sources", [])), indent=2),
+        encoding="utf-8",
+    )
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        if len(theta_path) > 0:
+            fig, ax = plt.subplots(figsize=(8, 4.5))
+            ax.plot(theta_path[:, 0], label="theta0")
+            ax.plot(theta_path[:, 1], label="theta1")
+            ax.plot(theta_path[:, 2], label="theta2")
+            ax.set_xlabel("waypoint index")
+            ax.set_ylabel("theta [rad]")
+            ax.set_title("Example 65 dense theta trajectory")
+            ax.legend()
+            fig.tight_layout()
+            fig.savefig(base / "theta_vs_index.png", dpi=160)
+            plt.close(fig)
+
+            fig = plt.figure(figsize=(6.5, 5.8))
+            ax3 = fig.add_subplot(111, projection="3d")
+            ax3.plot(theta_path[:, 0], theta_path[:, 1], theta_path[:, 2], color="#111827", linewidth=1.5)
+            for stage, color in ((LEFT_STAGE, "#f97316"), (FAMILY_STAGE, "#2563eb"), (RIGHT_STAGE, "#16a34a")):
+                mask = [idx for idx, label in enumerate(labels) if str(label) == stage]
+                if len(mask) >= 2:
+                    segment = theta_path[np.asarray(mask, dtype=int)]
+                    ax3.plot(segment[:, 0], segment[:, 1], segment[:, 2], color=color, linewidth=2.5, label=f"{stage} segment")
+            ax3.scatter(theta_path[0, 0], theta_path[0, 1], theta_path[0, 2], color="black", s=42, label="start")
+            ax3.scatter(theta_path[-1, 0], theta_path[-1, 1], theta_path[-1, 2], color="gold", s=52, label="goal")
+            for key, color, label in (
+                ("selected_left_family_transition_index", "#ef4444", "left-family transition"),
+                ("selected_family_right_transition_index", "#14b8a6", "family-right transition"),
+            ):
+                idx = int(audit.get(key, -1))
+                if 0 <= idx < len(theta_path):
+                    ax3.scatter(theta_path[idx, 0], theta_path[idx, 1], theta_path[idx, 2], color=color, s=60, label=label)
+            ax3.set_xlabel("theta0")
+            ax3.set_ylabel("theta1")
+            ax3.set_zlabel("theta2")
+            ax3.set_title("Example 65 C-space dense path")
+            ax3.legend()
+            fig.tight_layout()
+            fig.savefig(base / "cspace_3d_path.png", dpi=160)
+            plt.close(fig)
+
+        if len(residuals) > 0:
+            fig, ax = plt.subplots(figsize=(8, 4.2))
+            ax.plot(residuals, color="#455a64")
+            ax.set_xlabel("waypoint index")
+            ax.set_ylabel("active constraint residual")
+            ax.set_title("Example 65 residual along dense theta path")
+            fig.tight_layout()
+            fig.savefig(base / "residual_vs_index.png", dpi=160)
+            plt.close(fig)
+    except Exception as exc:
+        (base / "plot_error.txt").write_text(str(exc), encoding="utf-8")
+
+    return base
+
+
+def assert_ex65_jointspace_methodology(result, robot_execution, audit: dict[str, object]) -> None:
+    if not bool(getattr(result, "success", False)):
+        return
+    if bool(audit["task_space_planner_used"]):
+        raise RuntimeError("Task-space planner is forbidden in Example 65 full joint-space thesis mode.")
+    if bool(audit["ik_waypoint_fallback_used"]):
+        raise RuntimeError("IK waypoint fallback is forbidden in Example 65 full joint-space thesis mode.")
+    if bool(audit["task_space_route_reconstruction"]):
+        raise RuntimeError("Task-space route reconstruction is forbidden in Example 65 full joint-space thesis mode.")
+    allowed_execution_sources = {
+        "full_evidence_graph_with_query_connectors",
+        "hybrid_left_right_continuation_family_graph",
+        "fallback_projected_jointspace_continuation",
+        "certified_projected_jointspace_continuation_segments",
+    }
+    if str(audit["execution_path_source"]) not in allowed_execution_sources:
+        raise RuntimeError(f"Unexpected execution path source: {audit['execution_path_source']}")
+    if bool(audit["graph_route_used_for_execution"]) and not bool(audit["family_graph_route_used_for_family_segment"]):
+        raise RuntimeError("Example 65 full joint-space mode may only use the graph for the certified family segment.")
+    if str(audit["route_realization_source"]) not in allowed_execution_sources:
+        raise RuntimeError(f"Unexpected route realization source: {audit['route_realization_source']}")
+    if str(audit["visual_trace_source"]) != "FK(dense_theta_path)":
+        raise RuntimeError(f"Unexpected visual trace source: {audit['visual_trace_source']}")
+    if int(audit["final_route_taskspace_edges"]) != 0:
+        raise RuntimeError("Final Example 65 joint-space route contains task-space edges.")
+    if not bool(audit["dense_joint_path_execution_certified"]):
+        raise RuntimeError("Planner success requires execution-certified dense theta path.")
+    if not bool(audit["lambda_fixed_during_transfer"]):
+        raise RuntimeError("Family transfer segment did not keep lambda fixed.")
+    if float(audit["lambda_variation_transfer"]) > 1.0e-6:
+        raise RuntimeError("Family transfer lambda variation exceeds tolerance.")
+    if not bool(audit["stage_order_valid"]):
+        raise RuntimeError("Dense theta path stage order is not left* -> family* -> right*.")
+    if not bool(audit["transition_stack_certified"]):
+        raise RuntimeError("Selected transition stack residuals are not certified.")
+    if float(audit["max_transition_stack_residual"]) > 1.0e-3:
+        raise RuntimeError("Selected transition stack residual exceeds thesis-mode tolerance.")
+    if str(audit["route_realization_source"]) == "full_evidence_graph_with_query_connectors":
+        if str(audit["left_segment_source"]) != "left_evidence_graph":
+            raise RuntimeError(f"Unexpected left segment source: {audit['left_segment_source']}")
+        if str(audit["right_segment_source"]) != "right_evidence_graph":
+            raise RuntimeError(f"Unexpected right segment source: {audit['right_segment_source']}")
+        if not bool(audit["left_graph_route_used_for_segment"]):
+            raise RuntimeError("Left graph route was not used for the left segment.")
+        if not bool(audit["right_graph_route_used_for_segment"]):
+            raise RuntimeError("Right graph route was not used for the right segment.")
+        if int(audit["left_graph_edges_used"]) <= 0:
+            raise RuntimeError("Left graph route did not use stored left evidence edges.")
+        if int(audit["right_graph_edges_used"]) <= 0:
+            raise RuntimeError("Right graph route did not use stored right evidence edges.")
+        if int(audit["final_route_projected_fallback_edges"]) != 0:
+            raise RuntimeError("Full evidence graph route used projected fallback edges.")
+    if str(audit["route_realization_source"]) in {
+        "full_evidence_graph_with_query_connectors",
+        "hybrid_left_right_continuation_family_graph",
+    }:
+        if str(audit["family_segment_source"]) != "selected_lambda_family_evidence_graph":
+            raise RuntimeError(f"Unexpected family segment source: {audit['family_segment_source']}")
+        if not bool(audit["family_graph_route_certified"]):
+            raise RuntimeError("Family graph route is not certified.")
+        if not bool(audit["family_graph_route_lambda_fixed"]):
+            raise RuntimeError("Family graph route did not keep lambda fixed.")
+        if int(audit["family_graph_edges_used"]) <= 0:
+            raise RuntimeError("Family graph route did not use stored family evidence edges.")
+        if float(audit["family_graph_route_max_residual"]) > 2.0e-3:
+            raise RuntimeError("Family graph route residual exceeds thesis-mode tolerance.")
+        if float(audit["family_graph_route_max_joint_step"]) > float(audit["max_joint_step"]) + 1.0e-9:
+            raise RuntimeError("Family graph route joint step exceeds dense path step limit.")
+    if float(audit["display_vs_trace_max_error"]) > 1.0e-6:
+        raise RuntimeError("Displayed route differs from FK(dense theta path).")
+    if robot_execution is None or str(robot_execution.execution_source) != "certified_dense_joint_path":
+        raise RuntimeError("Successful Example 65 full joint-space mode must animate certified dense theta path.")
+
+
+def show_continuous_transfer_robot_demo(
+    *,
+    scene,
+    result,
+    robot,
+    robot_execution: RobotExecutionResult | None,
+    show_exploration: bool = True,
+    max_evidence_points: int = 500,
+    show_family_leaves: bool = True,
+    num_family_leaf_surfaces: int = 9,
+) -> bool:
+    if pv is None or not pyvista_available():
+        print("PyVista is not available; skipping continuous-transfer robot visualization.")
+        return False
+
+    left_family = scene.left_support
+    transfer_family = scene.transfer_family
+    right_family = scene.right_support
+    left_manifold = left_family.manifold(float(left_family.sample_lambdas()[0]))
+    right_manifold = right_family.manifold(float(right_family.sample_lambdas()[0]))
+    selected_lambda = (
+        float(result.selected_lambda_for_realization)
+        if result.selected_lambda_for_realization is not None
+        else float(result.selected_lambda)
+        if result.selected_lambda is not None
+        else float(transfer_family.nominal_lambda)
+    )
+    family_leaf = transfer_family.manifold(float(selected_lambda))
+
+    plotter = pv.Plotter(window_size=(1440, 920))
+    if hasattr(plotter, "set_background"):
+        plotter.set_background("#edf3f8", top="#ffffff")
+    if hasattr(plotter, "enable_anti_aliasing"):
+        try:
+            plotter.enable_anti_aliasing()
+        except Exception:
+            pass
+    plotter.add_text(
+        "Continuous transfer: evidence graph plus 3DOF robot tracking only the selected final route",
+        font_size=12,
+    )
+
+    actor_groups: dict[str, list[object]] = {
+        "Manifolds": [],
+        "Evidence": [],
+        "Transitions": [],
+        "FinalRoute": [],
+        "Robot": [],
+        "EETrace": [],
+        "StartGoal": [],
+    }
+
+    for manifold, color in ((left_manifold, "#c58b4c"), (right_manifold, "#c58b4c")):
+        actor = add_manifold(plotter, manifold, color=color, opacity=0.10)
+        if actor is not None:
+            actor_groups["Manifolds"].append(actor)
+
+    if show_family_leaves:
+        active_lambdas = np.asarray(getattr(result, "active_family_lambdas", []), dtype=float)
+        coverage = np.asarray(getattr(result, "lambda_coverage_range", []), dtype=float)
+        leaf_count = max(1, int(num_family_leaf_surfaces))
+        if len(coverage) >= 2 and np.all(np.isfinite(coverage[:2])):
+            representative_lambdas = np.linspace(float(coverage[0]), float(coverage[1]), num=leaf_count)
+        elif len(active_lambdas) > 0:
+            if len(active_lambdas) <= leaf_count:
+                representative_lambdas = active_lambdas
+            else:
+                indices = np.linspace(0, len(active_lambdas) - 1, num=leaf_count, dtype=int)
+                representative_lambdas = active_lambdas[indices]
+        else:
+            representative_lambdas = np.asarray(transfer_family.sample_lambdas({"count": leaf_count}), dtype=float)
+        representative_lambdas = np.asarray(
+            sorted(
+                {
+                    round(float(np.clip(lam, transfer_family.lambda_min, transfer_family.lambda_max)), 6)
+                    for lam in representative_lambdas
+                    if transfer_family.lambda_in_range(float(lam), tol=1.0e-6)
+                }
+            ),
+            dtype=float,
+        )
+        for lam in representative_lambdas:
+            if abs(float(lam) - float(selected_lambda)) <= 1.0e-4:
+                continue
+            corners = plane_leaf_patch(transfer_family, float(lam))
+            patch = pv.PolyData(corners, faces=np.hstack([[4, 0, 1, 2, 3]]))
+            actor = plotter.add_mesh(
+                patch,
+                color="#90caf9",
+                opacity=0.075,
+                show_edges=True,
+                edge_color="#5d7890",
+                line_width=0.7,
+                label="sampled family leaves",
+            )
+            if actor is not None:
+                actor_groups["Manifolds"].append(actor)
+
+    leaf_corners = plane_leaf_patch(transfer_family, float(selected_lambda))
+    leaf_patch = pv.PolyData(leaf_corners, faces=np.hstack([[4, 0, 1, 2, 3]]))
+    actor = plotter.add_mesh(
+        leaf_patch,
+        color="#1565c0",
+        opacity=0.32,
+        show_edges=True,
+        edge_color="#0d47a1",
+        line_width=1.2,
+        label=f"selected transfer leaf lambda={selected_lambda:.3f}",
+    )
+    if actor is not None:
+        actor_groups["Manifolds"].append(actor)
+
+    if show_exploration:
+        colors = {
+            "left": "#81c784",
+            "family_leaf": "#64b5f6",
+            "family_transverse": "#8e24aa",
+            "right": "#a5d6a7",
+        }
+        for mode, edges in getattr(result, "explored_edges_by_mode", {}).items():
+            poly = build_segment_polydata(edges)
+            if poly is None:
+                continue
+            actor = plotter.add_mesh(
+                poly,
+                color=colors.get(str(mode), "#78909c"),
+                opacity=0.28,
+                line_width=1.8,
+                label=f"{mode} evidence",
+            )
+            if actor is not None:
+                actor_groups["Evidence"].append(actor)
+        left_points = _downsample_points(
+            np.asarray(getattr(result, "left_evidence_points_task", np.zeros((0, 3), dtype=float)), dtype=float),
+            min(300, int(max_evidence_points)),
+        )
+        family_points = _downsample_points(
+            np.asarray(getattr(result, "family_evidence_points_task", np.zeros((0, 3), dtype=float)), dtype=float),
+            int(max_evidence_points),
+        )
+        right_points = _downsample_points(
+            np.asarray(getattr(result, "right_evidence_points_task", np.zeros((0, 3), dtype=float)), dtype=float),
+            min(300, int(max_evidence_points)),
+        )
+        if len(left_points) > 0:
+            actor = add_points(plotter, left_points, color="#2e7d32", size=5.5, label="left q-evidence FK points")
+            if actor is not None:
+                actor_groups["Evidence"].append(actor)
+        if len(family_points) > 0:
+            actor = add_points(plotter, family_points, color="#1e88e5", size=5.0, label="family q-evidence FK points")
+            if actor is not None:
+                actor_groups["Evidence"].append(actor)
+        if len(right_points) > 0:
+            actor = add_points(plotter, right_points, color="#558b2f", size=5.5, label="right q-evidence FK points")
+            if actor is not None:
+                actor_groups["Evidence"].append(actor)
+
+    if len(result.entry_transition_points) > 0:
+        actor = add_points(plotter, result.entry_transition_points, color="#ff8a65", size=7.0, label="entry transition candidates")
+        if actor is not None:
+            actor_groups["Transitions"].append(actor)
+    if len(result.exit_transition_points) > 0:
+        actor = add_points(plotter, result.exit_transition_points, color="#26a69a", size=7.0, label="exit transition candidates")
+        if actor is not None:
+            actor_groups["Transitions"].append(actor)
+    selected_entry_point = np.asarray(getattr(result, "selected_entry_point", np.zeros((0, 3), dtype=float)), dtype=float)
+    if selected_entry_point.size == 3:
+        actor = add_points(plotter, selected_entry_point, color="#bf360c", size=16.0, label="SELECTED entry transition")
+        if actor is not None:
+            actor_groups["Transitions"].append(actor)
+    selected_exit_point = np.asarray(getattr(result, "selected_exit_point", np.zeros((0, 3), dtype=float)), dtype=float)
+    if selected_exit_point.size == 3:
+        actor = add_points(plotter, selected_exit_point, color="#00695c", size=16.0, label="SELECTED exit transition")
+        if actor is not None:
+            actor_groups["Transitions"].append(actor)
+
+    final_route = np.asarray(result.path, dtype=float)
+    if len(final_route) >= 2:
+        actor = plotter.add_mesh(
+            pv.lines_from_points(final_route),
+            color="#d32f2f",
+            line_width=8.0,
+            label="FINAL SELECTED-TRANSITION ROUTE",
+        )
+        if actor is not None:
+            actor_groups["FinalRoute"].append(actor)
+
+    actor = add_points(plotter, scene.start_q, color="black", size=16.0, label="start")
+    if actor is not None:
+        actor_groups["StartGoal"].append(actor)
+    actor = add_points(plotter, scene.goal_q, color="gold", size=18.0, label="goal")
+    if actor is not None:
+        actor_groups["StartGoal"].append(actor)
+
+    initial_angles = (
+        np.asarray(robot_execution.joint_path[0], dtype=float)
+        if robot_execution is not None and len(robot_execution.joint_path) > 0
+        else np.asarray([0.0, 0.55, -0.85], dtype=float)
+    )
+    robot_bundle = make_robot_actor_bundle(plotter, robot, initial_angles, opacity=1.0)
+    pedestal_actor = add_robot_pedestal(plotter, robot)
+    if pedestal_actor is not None:
+        actor_groups["Robot"].append(pedestal_actor)
+    actor_groups["Robot"].extend(robot_bundle.get("all", []))
+
+    trace_actor = {"actor": None}
+
+    def replace_trace(points: np.ndarray) -> None:
+        if trace_actor["actor"] is not None:
+            plotter.remove_actor(trace_actor["actor"], render=False)
+        pts = np.asarray(points, dtype=float)
+        if len(pts) == 0:
+            trace_actor["actor"] = None
+            return
+        if len(pts) == 1:
+            actor_inner = plotter.add_mesh(
+                pv.Sphere(radius=float(0.75 * robot.ee_radius), center=pts[0]),
+                color="#d81b60",
+                label="ROBOT END-EFFECTOR TRACE",
+            )
+        else:
+            actor_inner = plotter.add_mesh(
+                pv.lines_from_points(pts),
+                color="#d81b60",
+                line_width=5.0,
+                label="ROBOT END-EFFECTOR TRACE",
+            )
+        trace_actor["actor"] = actor_inner
+
+    animation_state = {"frame": 0, "playing": False, "trace": []}
+
+    def reset_animation() -> None:
+        animation_state["frame"] = 0
+        animation_state["playing"] = bool(robot_execution is not None and robot_execution.animation_enabled)
+        animation_state["trace"] = []
+        if robot_execution is not None and len(robot_execution.joint_path) > 0:
+            update_robot_actor_bundle(plotter, robot, robot_bundle, robot_execution.joint_path[0])
+        replace_trace(np.zeros((0, 3), dtype=float))
+        plotter.render()
+
+    def animate_step() -> None:
+        if robot_execution is None or not robot_execution.animation_enabled or not animation_state["playing"]:
+            return
+        idx = min(int(animation_state["frame"]), len(robot_execution.joint_path) - 1)
+        update_robot_actor_bundle(plotter, robot, robot_bundle, robot_execution.joint_path[idx])
+        animation_state["trace"].append(np.asarray(robot_execution.end_effector_points_3d[idx], dtype=float))
+        replace_trace(np.asarray(animation_state["trace"], dtype=float))
+        if idx >= len(robot_execution.joint_path) - 1:
+            animation_state["playing"] = False
+        else:
+            animation_state["frame"] += 1
+        plotter.render()
+
+    def play_animation() -> None:
+        import time
+
+        while bool(animation_state["playing"]):
+            animate_step()
+            plotter.update()
+            time.sleep(0.02)
+
+    def start_replay() -> None:
+        reset_animation()
+        play_animation()
+
+    if hasattr(plotter, "add_key_event"):
+        plotter.add_key_event("r", start_replay)
+    plotter.add_text("Press r to replay robot motion", position=(1030, 18), font_size=10, color="black")
+    plotter.add_axes()
+    plotter.show_grid()
+    plotter.camera_position = [
+        (0.25, -7.8, 3.8),
+        (0.0, -0.05, 0.35),
+        (0.0, 0.0, 1.0),
+    ]
+    reset_animation()
+    plotter.show(auto_close=False, interactive_update=True)
+    if robot_execution is not None and robot_execution.animation_enabled:
+        play_animation()
+    try:
+        plotter.app.exec()
+    except Exception:
+        try:
+            plotter.show()
+        except Exception:
+            pass
+    return True
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Continuous-transfer planner with 3DOF robot execution.")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--legacy-taskspace-ik-demo",
+        "--taskspace-planning",
+        dest="taskspace_planning",
+        action="store_true",
+        help="LEGACY DEBUG ONLY: task-space continuous-transfer route followed by IK; not a joint-space planner.",
+    )
+    mode.add_argument(
+        "--jointspace-planning",
+        action="store_true",
+        help="Run robot joint-space realization; add --full-jointspace-exploration for full q-space lambda/transition discovery.",
+    )
+    parser.set_defaults(taskspace_planning=False, jointspace_planning=True)
+    parser.add_argument(
+        "--full-jointspace-exploration",
+        action="store_true",
+        help="Opt into Phase 3 robot q-space continuous-family evidence projection scaffold.",
+    )
+    parser.add_argument("--seed", type=int, default=41)
+    parser.add_argument("--max-probes", type=int, default=None)
+    parser.add_argument("--extra-rounds-after-first-solution", type=int, default=DEFAULT_POST_ROUTE_EVIDENCE_ROUNDS)
+    parser.add_argument("--stop-after-first-solution", action="store_true")
+    parser.add_argument("--top-k", type=int, default=3)
+    parser.add_argument("--top-k-paths", type=int, default=1)
+    parser.add_argument("--obstacle-profile", type=str, default="none")
+    parser.add_argument("--max-cartesian-step", type=float, default=0.025)
+    parser.add_argument("--joint-max-step", type=float, default=0.12)
+    parser.add_argument(
+        "--allow-family-local-continuation-fallback",
+        action="store_true",
+        help="DEBUG ONLY: allow the old projected family continuation if selected-lambda family graph extraction fails.",
+    )
+    parser.add_argument(
+        "--allow-closure-local-continuation-fallback",
+        action="store_true",
+        help="DEBUG ONLY: allow old projected left/right continuation if closure graph extraction fails.",
+    )
+    parser.add_argument("--ik-tolerance", type=float, default=3.0e-3)
+    parser.add_argument("--show-exploration", dest="show_exploration", action="store_true", default=True)
+    parser.add_argument("--hide-exploration", dest="show_exploration", action="store_false")
+    parser.add_argument("--max-evidence-points", type=int, default=500)
+    parser.add_argument("--show-family-leaves", dest="show_family_leaves", action="store_true", default=True)
+    parser.add_argument("--hide-family-leaves", dest="show_family_leaves", action="store_false")
+    parser.add_argument("--num-family-leaf-surfaces", type=int, default=9)
+    parser.add_argument("--save-cspace-debug", action="store_true", help="Save Example 65 dense theta/lambda audit artifacts.")
+    parser.add_argument("--show-cspace", action="store_true", help="Show/save the theta-space constraint surface view for full joint-space mode.")
+    parser.add_argument("--cspace-grid-res", type=int, default=55, help="Grid resolution for C-space implicit surfaces.")
+    parser.add_argument("--show-cspace-family", dest="show_cspace_family", action="store_true", default=True)
+    parser.add_argument("--hide-cspace-family", dest="show_cspace_family", action="store_false")
+    parser.add_argument("--cspace-family-leaves", type=int, default=7)
+    parser.add_argument("--no-viz", action="store_true")
+    args = parser.parse_args()
+
+    if args.taskspace_planning:
+        args.jointspace_planning = False
+        print(
+            "WARNING: LEGACY DEBUG ONLY: task-space continuous-transfer route followed by IK; not a joint-space planner.",
+            flush=True,
+        )
+    if args.jointspace_planning and not args.full_jointspace_exploration:
+        print(
+            "NOTE: selected-lambda joint-space realization uses task-space continuous-transfer planning "
+            "to choose lambda/entry/exit before robot realization. Use --full-jointspace-exploration "
+            "for full q-space transition discovery.",
+            flush=True,
+        )
+
+    if args.jointspace_planning:
+        scene_description = default_example_65_scene_description(obstacle_profile=args.obstacle_profile)
+        if args.full_jointspace_exploration:
+            scene, result, robot, robot_execution = plan_full_jointspace_continuous_transfer_evidence_scaffold(
+                scene_description=scene_description,
+                seed=int(args.seed),
+                joint_max_step=float(args.joint_max_step),
+                max_ambient_probes=args.max_probes,
+                continue_after_first_solution=not args.stop_after_first_solution,
+                max_extra_rounds_after_first_solution=args.extra_rounds_after_first_solution,
+                top_k_assignments=args.top_k,
+                top_k_paths=args.top_k_paths,
+                obstacle_profile=args.obstacle_profile,
+                allow_family_local_continuation_fallback=bool(args.allow_family_local_continuation_fallback),
+                allow_closure_local_continuation_fallback=bool(args.allow_closure_local_continuation_fallback),
+            )
+        else:
+            scene, result, robot, robot_execution = plan_continuous_transfer_jointspace_robot(
+                scene_description=scene_description,
+                seed=int(args.seed),
+                joint_max_step=float(args.joint_max_step),
+                max_ambient_probes=args.max_probes,
+                continue_after_first_solution=not args.stop_after_first_solution,
+                max_extra_rounds_after_first_solution=args.extra_rounds_after_first_solution,
+                top_k_assignments=args.top_k,
+                top_k_paths=args.top_k_paths,
+                obstacle_profile=args.obstacle_profile,
+            )
+        if args.full_jointspace_exploration:
+            animation_ready = bool(
+                robot_execution is not None
+                and robot_execution.execution_success
+                and robot_execution.animation_enabled
+                and result is not None
+                and bool(getattr(result, "dense_joint_path_execution_certified", False))
+            )
+            print(f"pyvista_robot_animation = {'enabled' if animation_ready else 'disabled'}", flush=True)
+            print(
+                "visualization_route_source = "
+                f"{getattr(result, 'route_source', 'none') if result is not None else 'none'}",
+                flush=True,
+            )
+            print(
+                "display_route_source = "
+                f"{getattr(result, 'route_source', 'none') if result is not None else 'none'}",
+                flush=True,
+            )
+            print(
+                "robot_execution_source = "
+                f"{getattr(robot_execution, 'execution_source', 'none') if robot_execution is not None else 'none'}",
+                flush=True,
+            )
+            left_display_count = min(
+                len(getattr(result, "left_evidence_points_task", [])) if result is not None else 0,
+                min(300, int(args.max_evidence_points)),
+            )
+            family_display_count = min(
+                len(getattr(result, "family_evidence_points_task", [])) if result is not None else 0,
+                int(args.max_evidence_points),
+            )
+            right_display_count = min(
+                len(getattr(result, "right_evidence_points_task", [])) if result is not None else 0,
+                min(300, int(args.max_evidence_points)),
+            )
+            active_lambdas_for_viz = list(getattr(result, "active_family_lambdas", [])) if result is not None else []
+            if bool(args.show_family_leaves):
+                leaf_surface_count = int(args.num_family_leaf_surfaces) if active_lambdas_for_viz else 0
+            else:
+                leaf_surface_count = 0
+            _print_key_value_block(
+                "Full Joint-Space Visualization",
+                {
+                    "visualization_mode": "full_jointspace_continuous_transfer",
+                    "show_family_leaves": bool(args.show_family_leaves),
+                    "num_family_leaf_surfaces": leaf_surface_count,
+                    "show_exploration": bool(args.show_exploration),
+                    "left_evidence_points_displayed": int(left_display_count),
+                    "family_evidence_points_displayed": int(family_display_count),
+                    "right_evidence_points_displayed": int(right_display_count),
+                    "entry_transition_points_displayed": 0 if result is None else len(getattr(result, "entry_transition_points", [])),
+                    "exit_transition_points_displayed": 0 if result is None else len(getattr(result, "exit_transition_points", [])),
+                    "selected_lambda_visualized": None
+                    if result is None
+                    else round(float(getattr(result, "selected_lambda_for_realization", getattr(result, "selected_lambda", 0.0))), 6),
+                    "visualization_route_source": getattr(result, "route_source", "none") if result is not None else "none",
+                    "pyvista_robot_animation": "enabled" if animation_ready else "disabled",
+                },
+            )
+            if not animation_ready:
+                print(
+                    "Full joint-space exploration did not produce a certified dense joint path; "
+                    "robot animation disabled.",
+                    flush=True,
+                )
+            cspace_debug_dir: Path | None = None
+            if result is not None and robot is not None and len(getattr(result, "dense_joint_path", [])) > 0:
+                cspace_audit = compute_ex65_jointspace_audit(scene, result, robot, robot_execution)
+                print_ex65_jointspace_audits(cspace_audit)
+                assert_ex65_jointspace_methodology(result, robot_execution, cspace_audit)
+                if args.save_cspace_debug:
+                    cspace_debug_dir = save_ex65_cspace_debug_artifacts(cspace_audit)
+                    _print_key_value_block(
+                        "Example 65 C-space debug artifacts",
+                        {
+                            "debug_dir": str(cspace_debug_dir),
+                            "dense_theta_path_npy": str(cspace_debug_dir / "dense_theta_path.npy"),
+                            "dense_lambda_labels_npy": str(cspace_debug_dir / "dense_lambda_labels.npy"),
+                            "cspace_summary_json": str(cspace_debug_dir / "cspace_summary.json"),
+                        },
+                    )
+                if args.show_cspace:
+                    manifolds, _selected_lambda = _cspace_manifolds_for_result(scene, robot, result)
+                    cspace_family_values = _select_cspace_family_lambdas(
+                        scene,
+                        result,
+                        float(_selected_lambda),
+                        int(args.cspace_family_leaves),
+                    ) if bool(args.show_cspace_family) else []
+                    cspace_family_manifolds = _cspace_family_manifolds_for_lambdas(
+                        scene,
+                        robot,
+                        cspace_family_values,
+                    ) if cspace_family_values else {}
+                    cspace_manifolds = {
+                        "left": manifolds[LEFT_STAGE],
+                        "plane": manifolds[FAMILY_STAGE],
+                        "right": manifolds[RIGHT_STAGE],
+                    }
+                    cspace_output_dir = cspace_debug_dir if cspace_debug_dir is not None else None
+                    _print_key_value_block(
+                        "C-space visualization",
+                        {
+                            "cspace_family_visualization_enabled": bool(args.show_cspace_family),
+                            "cspace_family_leaves_displayed": int(len(cspace_family_values)),
+                            "cspace_selected_lambda_surface": round(float(_selected_lambda), 6),
+                            "cspace_family_lambda_values": [round(float(v), 6) for v in cspace_family_values],
+                        },
+                    )
+                    screenshot = show_cspace_robot_planning(
+                        result=result,
+                        manifolds=cspace_manifolds,
+                        cspace_audit=cspace_audit,
+                        grid_res=int(args.cspace_grid_res),
+                        output_dir=cspace_output_dir,
+                        show=not bool(args.no_viz),
+                        family_leaf_manifolds=cspace_family_manifolds,
+                        selected_lambda=float(_selected_lambda),
+                        show_cspace_family=bool(args.show_cspace_family),
+                    )
+                    if screenshot is not None:
+                        print(f"cspace_environment_png = {screenshot}", flush=True)
+                        family_screenshot = Path(screenshot).with_name("cspace_family_environment.png")
+                        if bool(args.show_cspace_family) and family_screenshot.exists():
+                            print(f"cspace_family_environment_png = {family_screenshot}", flush=True)
+            elif args.save_cspace_debug or args.show_cspace:
+                print(
+                    "C-space debug/visualization skipped: no certified dense theta path is available.",
+                    flush=True,
+                )
+        if not args.no_viz and scene is not None and result is not None and robot is not None:
+            show_continuous_transfer_robot_demo(
+                scene=scene,
+                result=result,
+                robot=robot,
+                robot_execution=robot_execution,
+                show_exploration=bool(args.show_exploration),
+                max_evidence_points=int(args.max_evidence_points),
+                show_family_leaves=bool(args.show_family_leaves),
+                num_family_leaf_surfaces=int(args.num_family_leaf_surfaces),
+            )
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
+
+    np.random.seed(int(args.seed))
+    ou.RNG.setSeed(int(args.seed))
+    ou.setLogLevel(ou.LOG_ERROR)
+
+    scene_description = default_example_65_scene_description(obstacle_profile=args.obstacle_profile)
+    scene = build_continuous_transfer_scene(scene_description)
+    result = plan_continuous_transfer_route(
+        max_ambient_probes=args.max_probes,
+        continue_after_first_solution=not args.stop_after_first_solution,
+        max_extra_rounds_after_first_solution=args.extra_rounds_after_first_solution,
+        top_k_assignments=args.top_k,
+        top_k_paths=args.top_k_paths,
+        seed=args.seed,
+        obstacle_profile=args.obstacle_profile,
+        scene_description=scene_description,
+    )
+
+    route = np.asarray(result.path, dtype=float)
+    robot = choose_robot_for_route(route)
+    robot_execution = build_continuous_robot_execution_path(
+        route,
+        robot,
+        max_cartesian_step=float(args.max_cartesian_step),
+        max_joint_step=float(args.joint_max_step),
+        ik_tolerance=float(args.ik_tolerance),
+    )
+    display_vs_trace_max_error, display_vs_trace_mean_error = (
+        _polyline_error(
+            np.asarray(robot_execution.target_task_points_3d, dtype=float),
+            np.asarray(robot_execution.end_effector_points_3d, dtype=float),
+        )
+        if robot_execution is not None
+        else (float("inf"), float("inf"))
+    )
+
+    print_continuous_route_summary(result)
+    _print_key_value_block(
+        "Continuous-Transfer Robot Execution",
+        {
+            "planning_mode": "taskspace_ik_execution",
+            "planner_success": bool(result.success),
+            "selected_lambda_for_realization": None
+            if result.selected_lambda_for_realization is None
+            else round(float(result.selected_lambda_for_realization), 6),
+            "final_route_realization": result.final_route_realization,
+            "graph_route_used_for_execution": bool(result.graph_route_used_for_execution),
+            "strict_validation_success": bool(result.strict_validation_success),
+            "robot_execution_success": bool(robot_execution.execution_success) if robot_execution is not None else False,
+            "robot_animation_enabled": bool(robot_execution.animation_enabled) if robot_execution is not None else False,
+            "robot_execution_waypoints": 0 if robot_execution is None else len(robot_execution.joint_path),
+            "max_tracking_error": float("inf") if robot_execution is None else round(float(robot_execution.max_tracking_error), 6),
+            "mean_tracking_error": float("inf") if robot_execution is None else round(float(robot_execution.mean_tracking_error), 6),
+            "max_joint_step": float("inf") if robot_execution is None else round(float(robot_execution.max_joint_step), 6),
+            "ik_failures": -1 if robot_execution is None else int(robot_execution.ik_failure_count),
+            "display_vs_trace_max_error": round(float(display_vs_trace_max_error), 6),
+            "display_vs_trace_mean_error": round(float(display_vs_trace_mean_error), 6),
+            "execution_source": "none" if robot_execution is None else str(robot_execution.execution_source),
+            "diagnostics": "robot execution unavailable" if robot_execution is None else str(robot_execution.diagnostics),
+        },
+    )
+
+    if not args.no_viz:
+        show_continuous_transfer_robot_demo(
+            scene=scene,
+            result=result,
+            robot=robot,
+            robot_execution=robot_execution,
+            show_exploration=bool(args.show_exploration),
+            max_evidence_points=int(args.max_evidence_points),
+            show_family_leaves=bool(args.show_family_leaves),
+            num_family_leaf_surfaces=int(args.num_family_leaf_surfaces),
+        )
+
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
+
+
+if __name__ == "__main__":
+    main()

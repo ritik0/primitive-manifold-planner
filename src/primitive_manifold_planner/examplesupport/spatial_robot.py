@@ -41,6 +41,13 @@ class SpatialRobot3DOF:
         return float(np.sum(np.asarray(self.link_lengths, dtype=float)))
 
     def forward_kinematics_3d(self, joint_angles: np.ndarray) -> np.ndarray:
+        """Return the 3D FK points for the 3-DOF theta convention.
+
+        ``joint_angles`` is theta=[base yaw, shoulder pitch, elbow pitch].
+        The returned array is [base, link1, elbow, end-effector], so callers
+        use ``points[-1]`` as FK(theta) for workspace constraints.
+        """
+
         q0, q1, q2 = np.asarray(joint_angles, dtype=float).reshape(3)
         l1, l2, l3 = np.asarray(self.link_lengths, dtype=float).reshape(3)
 
@@ -54,10 +61,12 @@ class SpatialRobot3DOF:
         # Second and third physical segments follow the elbow angle.
         # With only 3DOF total, there is no independent wrist orientation.
         d2 = math.cos(q1 + q2) * yaw_dir + math.sin(q1 + q2) * z_dir
-
+        
+        # computing joint positions
         p0 = np.asarray(self.base_world, dtype=float).reshape(3)
         p1 = p0 + float(l1) * d1
         p2 = p1 + float(l2) * d2
+        # The end-effector is the FK point used by robot manifold residuals.
         p3 = p2 + float(l3) * d2
 
         return np.asarray([p0, p1, p2, p3], dtype=float)

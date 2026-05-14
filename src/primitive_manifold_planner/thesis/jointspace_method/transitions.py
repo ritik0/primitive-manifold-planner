@@ -8,7 +8,7 @@ from .modes import ConstraintMode
 
 
 @dataclass(frozen=True)
-class TransitionCertification:
+class TransitionCertification: #stores results
     """Certification result for a shared theta transition."""
 
     success: bool
@@ -29,17 +29,25 @@ class TransitionConstraint:
     source_mode: ConstraintMode
     target_mode: ConstraintMode
     name: str
-    lambda_value: float | None = None
+    lambda_value: float | None = None #for multiple possible lambdas in continuous space
 
-    def stacked_residual(self, theta: np.ndarray) -> np.ndarray:
-        source = np.ravel(self.source_mode.residual(theta)).astype(float)
+    def stacked_residual(self, theta: np.ndarray) -> np.ndarray: #input theta output residual vecotr for both modes
+        """Return source and target residuals together for one theta.
+
+        A valid transition configuration must lie on both adjacent active
+        manifolds, so certification checks this stacked vector near zero.
+        """
+
+        source = np.ravel(self.source_mode.residual(theta)).astype(float) #ravel --> flattens it so [[0.01]] becomes [0.01]
         target = np.ravel(self.target_mode.residual(theta)).astype(float)
-        return np.concatenate([source, target])
+        return np.concatenate([source, target]) #stacks them
 
     def residual_norm(self, theta: np.ndarray) -> float:
-        return float(np.linalg.norm(self.stacked_residual(theta)))
+        return float(np.linalg.norm(self.stacked_residual(theta))) #norm of stacked residual sqrt(a^2 + b^2)
 
-    def certify(self, theta: np.ndarray, tol: float = 1e-3) -> TransitionCertification:
+    def certify(self, theta: np.ndarray, tol: float = 1e-3) -> TransitionCertification: #perfomrs the transition check
+        # Transition certification is stricter than per-stage membership:
+        # the same theta must satisfy both adjacent residual equations.
         residual = self.stacked_residual(theta)
         norm = float(np.linalg.norm(residual))
         success = bool(norm <= float(tol))

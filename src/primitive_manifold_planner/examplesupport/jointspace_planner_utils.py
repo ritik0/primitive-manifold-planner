@@ -13,15 +13,21 @@ except Exception:
 
 
 def wrap_joint_angles(joint_angles: np.ndarray) -> np.ndarray:
+    """Wrap theta values into the conventional [-pi, pi) joint range."""
+
     arr = np.asarray(joint_angles, dtype=float)
     return (arr + np.pi) % (2.0 * np.pi) - np.pi
 
 
 def end_effector_point(robot: Any, q: np.ndarray) -> np.ndarray:
+    """Return FK(theta) for the end-effector, i.e. robot points[-1]."""
+
     return np.asarray(robot.forward_kinematics_3d(np.asarray(q, dtype=float))[-1], dtype=float)
 
 
 def joint_path_to_task_path(robot: Any, path: np.ndarray) -> np.ndarray:
+    """Convert a dense theta path into its FK trace for visualization/debugging."""
+
     arr = np.asarray(path, dtype=float)
     if len(arr) == 0:
         return np.zeros((0, 3), dtype=float)
@@ -36,6 +42,8 @@ def inverse_kinematics_start(
     joint_upper: np.ndarray | None = None,
     tol: float = 8e-2,
 ) -> np.ndarray | None:
+    """Find a starting theta whose end-effector is near one task point."""
+
     target = np.asarray(task_point, dtype=float).reshape(3)
     lower = np.asarray(joint_lower, dtype=float).reshape(3) if joint_lower is not None else -np.pi * np.ones(3, dtype=float)
     upper = np.asarray(joint_upper, dtype=float).reshape(3) if joint_upper is not None else np.pi * np.ones(3, dtype=float)
@@ -91,6 +99,8 @@ def inverse_kinematics_start(
 
 @dataclass
 class JointExploreResult:
+    """Result of local joint-manifold exploration or interpolation."""
+
     success: bool
     path: np.ndarray
     explored_edges: list[tuple[np.ndarray, np.ndarray]]
@@ -105,6 +115,8 @@ class JointExploreResult:
 
 
 def joint_step_statistics(joint_path: np.ndarray) -> tuple[np.ndarray, float, float, int]:
+    """Measure wrapped theta-step continuity along a joint path."""
+
     q_path = np.asarray(joint_path, dtype=float)
     if len(q_path) < 2:
         return np.zeros(0, dtype=float), 0.0, 0.0, -1
@@ -120,6 +132,8 @@ def joint_step_statistics(joint_path: np.ndarray) -> tuple[np.ndarray, float, fl
 
 
 def numerical_robot_jacobian(robot: Any, q: np.ndarray, eps: float = 1e-5) -> np.ndarray:
+    """Finite-difference Jacobian of the end-effector FK trace."""
+
     theta = np.asarray(q, dtype=float).reshape(3)
     base = end_effector_point(robot, theta)
     jac = np.zeros((3, 3), dtype=float)
@@ -139,6 +153,8 @@ def generate_joint_proposals(
     joint_lower: np.ndarray | None = None,
     joint_upper: np.ndarray | None = None,
 ) -> list[np.ndarray]:
+    """Generate theta proposals biased by start/goal and current guides."""
+
     lower = np.asarray(joint_lower, dtype=float).reshape(3) if joint_lower is not None else -np.pi * np.ones(3, dtype=float)
     upper = np.asarray(joint_upper, dtype=float).reshape(3) if joint_upper is not None else np.pi * np.ones(3, dtype=float)
     midpoint = 0.5 * (np.asarray(start_q, dtype=float) + np.asarray(goal_q, dtype=float))
@@ -146,13 +162,16 @@ def generate_joint_proposals(
     for idx in range(int(proposal_count)):
         selector = (round_idx + idx) % 5
         if selector == 0:
+            # Uniform proposals keep broad C-space exploration alive.
             q = np.random.uniform(lower, upper)
         elif selector == 1:
+            # Midpoint proposals search the likely corridor between start and goal.
             q = midpoint + np.random.normal(scale=np.array([0.55, 0.45, 0.45], dtype=float), size=3)
         elif selector == 2:
             q = 0.35 * np.asarray(start_q, dtype=float) + 0.65 * np.asarray(goal_q, dtype=float)
             q = q + np.random.normal(scale=np.array([0.40, 0.35, 0.35], dtype=float), size=3)
         elif selector == 3 and len(guides) > 0:
+            # Guide-biased proposals revisit frontier/transition neighborhoods.
             guide = np.asarray(guides[np.random.randint(len(guides))], dtype=float)
             q = guide + np.random.normal(scale=np.array([0.28, 0.25, 0.25], dtype=float), size=3)
         else:
@@ -211,6 +230,8 @@ def _explore_joint_manifold_interpolation(
     collision_fn=None,
     local_max_joint_step: float | None = None,
 ) -> JointExploreResult:
+    """Follow a straight theta guess while projecting each waypoint to the manifold."""
+
     local_limit = float(local_max_joint_step if local_max_joint_step is not None else max_step)
     q_start = np.asarray(start, dtype=float).reshape(3)
     q_goal = np.asarray(goal, dtype=float).reshape(3)
@@ -234,6 +255,7 @@ def _explore_joint_manifold_interpolation(
     for idx in range(1, steps + 1):
         alpha = float(idx / steps)
         guess = wrap_joint_angles(q_start + alpha * delta)
+        # Projection makes the interpolated theta lie on the active manifold.
         projection = manifold.project(guess, tol=projection_tol, max_iters=60)
         if not projection.success:
             return JointExploreResult(
@@ -317,6 +339,8 @@ def explore_joint_manifold_continuation(
     max_iters: int = 90,
     damping: float = 0.05,
 ) -> JointExploreResult:
+    """Grow a local theta path by FK-guided projected continuation."""
+
     local_limit = float(local_max_joint_step if local_max_joint_step is not None else max_step)
     q_start = np.asarray(start, dtype=float).reshape(3)
     q_goal = np.asarray(goal, dtype=float).reshape(3)
@@ -396,6 +420,7 @@ def explore_joint_manifold_continuation(
             desired_task_delta = direction * min(0.075, max(0.01, task_distance), step_scale)
             jac = numerical_robot_jacobian(robot, current)
             system = jac @ jac.T + float(damping) ** 2 * np.eye(3, dtype=float)
+            # Pull a small task-space FK step back to theta, then reproject to the manifold.
             dq = jac.T @ np.linalg.solve(system, desired_task_delta)
             dq_norm = float(np.linalg.norm(dq))
             if dq_norm > step_scale:
@@ -469,6 +494,8 @@ def explore_joint_manifold(
     collision_fn=None,
     local_max_joint_step: float | None = None,
 ) -> JointExploreResult:
+    """Try FK-guided continuation, then a projected interpolation fallback."""
+
     continuation = explore_joint_manifold_continuation(
         manifold=manifold,
         start=start,
@@ -508,6 +535,12 @@ def detect_transitions_jointspace(
     collision_fn=None,
     diagnostics: dict[str, float | int] | None = None,
 ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Detect source-to-target transition candidates along a theta path.
+
+    Each returned tuple stores the source theta, projected target theta, and
+    FK transition point used for visualization/debugging.
+    """
+
     path = np.asarray(path_configs, dtype=float)
     if len(path) == 0:
         return []
@@ -545,6 +578,7 @@ def detect_transitions_jointspace(
             continue
         target_residual_before = float(np.linalg.norm(target_manifold.residual(q))) if hasattr(target_manifold, "residual") else float("inf")
         stat("target_residual_before_projection", target_residual_before)
+        # Project onto the neighboring manifold to test for a shared transition.
         projection = target_manifold.project(q, tol=projection_tol, max_iters=60)
         if not projection.success:
             inc("target_projection_failed")
@@ -568,6 +602,7 @@ def detect_transitions_jointspace(
             inc("task_distance_too_large")
             continue
         if any(float(np.linalg.norm(ee_target - prev)) <= max(task_tol * 0.75, 2e-2) for prev in seen_task):
+            # Deduplicate by FK transition point so nearby theta variants do not flood the list.
             inc("duplicate_rejected")
             continue
         seen_task.append(ee_target.copy())

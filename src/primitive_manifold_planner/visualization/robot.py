@@ -7,6 +7,7 @@ import numpy as np
 
 from primitive_manifold_planner.thesis import parallel_evidence_planner as ex66
 from primitive_manifold_planner.examplesupport.intrinsic_multimodal_helpers import build_segment_polydata
+from primitive_manifold_planner.visualization.cspace_robot import suppress_native_output
 from primitive_manifold_planner.visualization.display import plane_patch_corners
 from primitive_manifold_planner.visualization import add_manifold, add_points, pyvista_available
 
@@ -17,12 +18,16 @@ except Exception:
 
 
 def make_link_mesh(p0: np.ndarray, p1: np.ndarray, radius: float):
+    """Build one cylindrical visual link between two FK joint points."""
+
     if pv is None:
         return None
     return pv.Line(np.asarray(p0, dtype=float), np.asarray(p1, dtype=float), resolution=1).tube(radius=float(radius))
 
 
 def update_actor_mesh(actor, mesh) -> None:
+    """Swap the mesh data for an existing PyVista actor during replay."""
+
     if actor is None or mesh is None:
         return
     mapper = getattr(actor, "mapper", None)
@@ -31,6 +36,8 @@ def update_actor_mesh(actor, mesh) -> None:
 
 
 def add_robot_pedestal(plotter, robot) -> Any:
+    """Draw the fixed base marker; it is separate from the planner path."""
+
     if pv is None:
         return None
     base = np.asarray(robot.base_world, dtype=float)
@@ -66,6 +73,11 @@ def _display_joints(robot, joint_angles: np.ndarray) -> np.ndarray:
 
 
 def make_robot_actor_bundle(plotter, robot, joint_angles: np.ndarray, opacity: float = 1.0):
+    """Create robot mesh actors for one theta state.
+
+    The mesh is drawn from FK(theta); it is not an independent task-space curve.
+    """
+
     if pv is None:
         return {"all": [], "base": None, "links": [], "joints": []}
 
@@ -131,6 +143,8 @@ def make_robot_actor_bundle(plotter, robot, joint_angles: np.ndarray, opacity: f
 
 
 def update_robot_actor_bundle(plotter, robot, bundle, joint_angles: np.ndarray) -> None:
+    """Move all robot actors to a new theta state during animation."""
+
     if pv is None:
         return
 
@@ -359,6 +373,7 @@ def show_pyvista_robot_demo(
         plotter.render()
 
     def replace_robot_pose(joint_angles: np.ndarray) -> None:
+        # Replay advances the robot from theta states, then redraws the FK mesh.
         bundle = robot_state.get("bundle")
         if isinstance(bundle, dict):
             update_robot_actor_bundle(plotter, robot, bundle, joint_angles)
@@ -368,6 +383,7 @@ def show_pyvista_robot_demo(
                         actor_inner.SetVisibility(False)
 
     def replace_trace(points: np.ndarray) -> None:
+        # The end-effector trace is FK(dense theta path), not a separate plan.
         existing = robot_state.get("trace_actor")
         if existing is not None:
             plotter.remove_actor(existing, render=False)
@@ -439,6 +455,7 @@ def show_pyvista_robot_demo(
             return
 
         idx = min(int(animation_state["frame"]), len(robot_execution.joint_path) - 1)
+        # Animation state uses the certified joint path as the single source of motion.
         replace_robot_pose(robot_execution.joint_path[idx])
         animation_state["trace_points"].append(np.asarray(robot_execution.end_effector_points_3d[idx], dtype=float))
         replace_trace(np.asarray(animation_state["trace_points"], dtype=float))
@@ -523,16 +540,20 @@ def show_pyvista_robot_demo(
         set_visibility(name, visible)
 
     reset_animation()
-    plotter.show(auto_close=False, interactive_update=True)
+    vtk_log = "outputs/vtk_warnings.log"
+    with suppress_native_output(True, vtk_log):
+        plotter.show(auto_close=False, interactive_update=True)
 
     if robot_execution is not None and robot_execution.animation_enabled:
         play_animation()
 
     try:
-        plotter.app.exec()
+        with suppress_native_output(True, vtk_log):
+            plotter.app.exec()
     except Exception:
         try:
-            plotter.show()
+            with suppress_native_output(True, vtk_log):
+                plotter.show()
         except Exception:
             pass
 

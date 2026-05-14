@@ -9,7 +9,12 @@ from .continuation import ProjectedContinuationSegment, concatenate_segments
 
 @dataclass
 class RouteCandidate:
-    """A realized or rejected joint-space route candidate."""
+    """A realized or rejected joint-space route candidate.
+
+    The candidate stores projected joint-space continuation segments and
+    exposes ``dense_theta_path``, ``stage_labels``, and ``lambda_labels`` for
+    certification/debugging.
+    """
 
     segments: list[ProjectedContinuationSegment] = field(default_factory=list)
     transition_thetas: dict[str, np.ndarray] = field(default_factory=dict)
@@ -40,4 +45,5 @@ class RouteCandidate:
 
     @property
     def final_route_taskspace_edges(self) -> int:
+        # This route object is joint-space only; task-space traces are derived by FK.
         return 0

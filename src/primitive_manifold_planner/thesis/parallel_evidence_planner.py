@@ -83,6 +83,8 @@ BOUNDS_MAX = np.array([3.5, 2.7, 1.9], dtype=float)
 
 @dataclass
 class StageNode:
+    """One configuration-space evidence vertex on an active manifold."""
+
     node_id: int
     q: np.ndarray
     expansion_count: int = 0
@@ -91,6 +93,8 @@ class StageNode:
 
 @dataclass
 class StageEdge:
+    """A certified local edge between two evidence vertices in one stage."""
+
     edge_id: int
     src: int
     dst: int
@@ -101,6 +105,8 @@ class StageEdge:
 
 @dataclass
 class StageGraph:
+    """Lightweight evidence graph for a single manifold stage."""
+
     nodes: dict[int, StageNode] = field(default_factory=dict)
     edges: dict[int, StageEdge] = field(default_factory=dict)
     adjacency: dict[int, list[tuple[int, int]]] = field(default_factory=dict)
@@ -110,6 +116,8 @@ class StageGraph:
 
 @dataclass
 class StageEvidenceStore:
+    """All accumulated evidence for one active manifold stage."""
+
     stage: str
     manifold: object
     graph: StageGraph = field(default_factory=StageGraph)
@@ -122,6 +130,8 @@ class StageEvidenceStore:
 
 @dataclass
 class TransitionHypothesis:
+    """Candidate shared transition configuration between fixed stages."""
+
     left_node_id: int | None = None
     plane_node_id: int | None = None
     right_node_id: int | None = None
@@ -133,6 +143,8 @@ class TransitionHypothesis:
 
 @dataclass
 class SequentialRouteCandidate:
+    """Committed left-plane-right route assembled from stage graph paths."""
+
     total_cost: float
     left_node_path: list[int]
     left_edge_path: list[int]
@@ -168,6 +180,8 @@ class SequentialRouteCandidate:
 
 @dataclass
 class FixedPlaneRoute:
+    """Planner result for the known left-plane-right Example 66 sequence."""
+
     success: bool
     message: str
     total_rounds: int
@@ -243,6 +257,8 @@ class FixedPlaneRoute:
 
 @dataclass
 class GenericTransitionHypothesis:
+    """Candidate transition for planners where the stage sequence is unknown."""
+
     source_stage: str
     target_stage: str
     source_node_id: int | None = None
@@ -254,6 +270,8 @@ class GenericTransitionHypothesis:
 
 @dataclass
 class MetaGraph:
+    """Stage-level graph whose edges mean a transition hypothesis exists."""
+
     nodes: set[str] = field(default_factory=set)
     adjacency: dict[str, set[str]] = field(default_factory=dict)
 
@@ -274,6 +292,8 @@ class MetaGraph:
 
 @dataclass
 class UnknownSequenceCandidate:
+    """Route candidate for an inferred stage sequence."""
+
     total_cost: float
     stage_sequence: list[str]
     stage_node_paths: dict[str, list[int]]
@@ -285,6 +305,8 @@ class UnknownSequenceCandidate:
 
 @dataclass
 class UnknownSequenceRoute:
+    """Planner result when the manifold stage sequence is discovered online."""
+
     success: bool
     message: str
     discovered_sequence: list[str]
@@ -312,7 +334,7 @@ class UnknownSequenceRoute:
     mode_counts: dict[str, int] = field(default_factory=dict)
 
 
-def _plane_basis(normal: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _plane_basis(normal: np.ndarray) -> tuple[np.ndarray, np.ndarray]: #helpful in displaying plane points
     n = np.asarray(normal, dtype=float)
     ref = np.array([1.0, 0.0, 0.0], dtype=float) if abs(n[0]) < 0.9 else np.array([0.0, 1.0, 0.0], dtype=float)
     u = np.cross(n, ref)
@@ -330,7 +352,7 @@ def is_plane_like(manifold) -> bool:
     return isinstance(unwrap_manifold(manifold), PlaneManifold)
 
 
-def path_cost(path: np.ndarray) -> float:
+def path_cost(path: np.ndarray) -> float: #computes path length
     arr = np.asarray(path, dtype=float)
     if len(arr) < 2:
         return 0.0
@@ -338,6 +360,8 @@ def path_cost(path: np.ndarray) -> float:
 
 
 def add_stage_node(store: StageEvidenceStore, q: np.ndarray, seeded_from_proposal: bool = False, tol: float = GRAPH_NODE_TOL) -> int:
+    """Insert or reuse a stage evidence node near configuration ``q``."""
+
     qq = np.asarray(q, dtype=float).reshape(-1)
     for node_id, node in store.graph.nodes.items():
         if float(np.linalg.norm(node.q - qq)) <= tol:
@@ -350,6 +374,8 @@ def add_stage_node(store: StageEvidenceStore, q: np.ndarray, seeded_from_proposa
 
 
 def add_stage_edge(store: StageEvidenceStore, src: int, dst: int, kind: str, path: np.ndarray) -> int:
+    """Add one evidence edge and adjacency entry for a local manifold path."""
+
     arr = np.asarray(path, dtype=float)
     if len(arr) == 0:
         arr = np.asarray([store.graph.nodes[src].q.copy(), store.graph.nodes[dst].q.copy()], dtype=float)
@@ -414,6 +440,8 @@ def connect_path_to_stage_graph(
     preserve_dense_path: bool = False,
     max_joint_step_for_edge: float | None = None,
 ) -> tuple[int, list[int], list[int]]:
+    """Convert a local path into graph nodes/edges for one active manifold."""
+
     full_path = np.asarray(path, dtype=float)
     if len(full_path) == 0:
         return source_node_id, [source_node_id], []
@@ -436,6 +464,7 @@ def connect_path_to_stage_graph(
         if len(segment) == 0:
             segment = np.asarray([store.graph.nodes[current_id].q.copy(), np.asarray(q, dtype=float).copy()], dtype=float)
         if max_joint_step_for_edge is not None:
+            # Joint-space edges are rejected if a stored dense segment hides a jump.
             src_q = np.asarray(store.graph.nodes[current_id].q, dtype=float)
             dst_q = np.asarray(store.graph.nodes[next_id].q, dtype=float)
             if len(segment) > 0:
@@ -484,6 +513,8 @@ def stage_stagnating(history_nodes: list[int], history_transitions: list[int], h
 
 
 def stage_evidence_points(store: StageEvidenceStore) -> np.ndarray:
+    """Collect deduplicated points that summarize explored stage evidence."""
+
     groups: list[np.ndarray] = []
     explored = explored_points_from_edges(store.explored_edges)
     if len(explored) > 0:
@@ -506,6 +537,8 @@ def stage_evidence_counts(stores: dict[str, StageEvidenceStore]) -> dict[str, in
 
 
 def stage_underexploration_factor(stage: str, stores: dict[str, StageEvidenceStore]) -> float:
+    """Return a small scheduling bonus for stages with less evidence."""
+
     stage_names = list(stores.keys())
     counts = np.asarray([max(1, len(stores[name].graph.nodes)) for name in stage_names], dtype=float)
     mean_count = float(np.mean(counts))
@@ -520,6 +553,8 @@ def stage_underexploration_factor(stage: str, stores: dict[str, StageEvidenceSto
 
 
 def greedy_stage_for_serial_round(stores: dict[str, StageEvidenceStore]) -> str:
+    """Choose the serial-mode stage most in need of exploration."""
+
     return max(
         STAGES,
         key=lambda stage: (
@@ -538,6 +573,8 @@ def adaptive_stage_update_budget(
     stores: dict[str, StageEvidenceStore],
     first_solution_round: int | None,
 ) -> int:
+    """Pick how many stages may receive active updates from one proposal."""
+
     total_nodes = sum(len(stores[stage].graph.nodes) for stage in stores)
     budget = int(MAX_STAGE_OMPL_UPDATES_PER_PROPOSAL)
     if total_nodes > SOFT_TOTAL_NODE_TARGET:
@@ -552,6 +589,8 @@ def adaptive_stage_update_budget(
 
 
 def prune_transition_hypotheses(hypotheses: list[TransitionHypothesis]) -> None:
+    """Keep a compact, deduplicated set of low-score transition hypotheses."""
+
     if len(hypotheses) <= SOFT_HYPOTHESIS_LIMIT:
         return
     hypotheses.sort(key=lambda hyp: float(hyp.score))
@@ -566,6 +605,8 @@ def prune_transition_hypotheses(hypotheses: list[TransitionHypothesis]) -> None:
 
 
 def prune_generic_transition_hypotheses(hypotheses: list[GenericTransitionHypothesis], limit: int = SOFT_HYPOTHESIS_LIMIT * 4) -> None:
+    """Deduplicate generic transition hypotheses after ranking by score."""
+
     if len(hypotheses) <= limit:
         return
     hypotheses.sort(key=lambda hyp: (str(hyp.source_stage), str(hyp.target_stage), float(hyp.score)))
@@ -815,6 +856,8 @@ def add_generic_transition_hypotheses(
     guide_point: np.ndarray,
     hypotheses: list[GenericTransitionHypothesis],
 ) -> tuple[int, int]:
+    """Scan a new stage exploration result for transitions to another stage."""
+
     if result is None or source_node_id is None or str(source_stage) == str(target_stage):
         return 0, 0
 
@@ -842,9 +885,11 @@ def add_generic_transition_hypotheses(
             and float(np.linalg.norm(np.asarray(hit, dtype=float) - np.asarray(hyp.q, dtype=float))) <= TRANSITION_DEDUP_TOL
             for hyp in hypotheses
         ):
+            # Avoid keeping multiple hypotheses for the same local transition configuration.
             continue
         refined, refined_ok = refine_intersection_on_both_manifolds(source_store.manifold, target_store.manifold, hit, tol=1e-8, max_iters=25)
         q_hit = np.asarray(refined if refined_ok else hit, dtype=float)
+        # Certify that the source stage can actually reach the transition configuration.
         exact_result = solve_exact_segment_on_manifold(
             manifold=source_store.manifold,
             x_start=source_q,
@@ -894,6 +939,8 @@ def bridge_stage_node_sets(
     motion_kind: str,
     max_tries: int = 3,
 ) -> tuple[int, int]:
+    """Try exact local connectors between two node sets in the same stage."""
+
     source_ids = sorted({int(node_id) for node_id in source_node_ids if node_id in store.graph.nodes})
     target_ids = sorted({int(node_id) for node_id in target_node_ids if node_id in store.graph.nodes})
     if len(source_ids) == 0 or len(target_ids) == 0:
@@ -1085,6 +1132,8 @@ def add_left_plane_hypotheses(
     guide_point: np.ndarray,
     hypotheses: list[TransitionHypothesis],
 ) -> tuple[int, int]:
+    """Add candidate left-plane transition configurations from new evidence."""
+
     if result is None or source_node_id is None:
         return 0, 0
     hits = transition_points_from_result(source_store.manifold, plane_store.manifold if source_stage == LEFT_STAGE else left_store.manifold, result)
@@ -1167,6 +1216,8 @@ def add_plane_right_hypotheses(
     guide_point: np.ndarray,
     hypotheses: list[TransitionHypothesis],
 ) -> tuple[int, int]:
+    """Add candidate plane-right transition configurations from new evidence."""
+
     if result is None or source_node_id is None:
         return 0, 0
     hits = transition_points_from_result(source_store.manifold, right_store.manifold if source_stage == PLANE_STAGE else plane_store.manifold, result)
@@ -1559,6 +1610,8 @@ def extract_committed_route_for_sequence(
     goal_stage_nodes: dict[str, int],
     transition_hypotheses: list[GenericTransitionHypothesis],
 ) -> UnknownSequenceCandidate | None:
+    """Select the cheapest committed route for a proposed stage sequence."""
+
     if len(stage_sequence) == 0:
         return None
     start_stage = str(stage_sequence[0])
@@ -1587,6 +1640,7 @@ def extract_committed_route_for_sequence(
 
     pair_hypotheses: dict[tuple[str, str], list[GenericTransitionHypothesis]] = {}
     for hyp in transition_hypotheses:
+        # Group transition hypotheses by adjacent stage pair for route recursion.
         pair_hypotheses.setdefault((str(hyp.source_stage), str(hyp.target_stage)), []).append(hyp)
 
     distance_cache: dict[tuple[str, int], tuple[dict[int, float], dict[int, int], dict[int, int]]] = {}
@@ -1639,6 +1693,7 @@ def extract_committed_route_for_sequence(
                 display_path=np.asarray(display_path, dtype=float),
             )
             if best is None or candidate.total_cost + 1e-9 < best.total_cost:
+                # Route scoring is purely graph/path cost at this stage.
                 best = candidate
             return
 
@@ -1707,6 +1762,8 @@ def extract_committed_route(
     left_plane_hypotheses: list[TransitionHypothesis],
     plane_right_hypotheses: list[TransitionHypothesis],
 ) -> tuple[SequentialRouteCandidate | None, bool, bool, int]:
+    """Select the cheapest known left-plane-right route from transition pairs."""
+
     left_dist, left_prev_node, left_prev_edge = shortest_paths_in_stage(left_store, start_node_id)
     right_dist, right_prev_node, right_prev_edge = shortest_paths_in_stage(right_store, goal_node_id)
 
@@ -1722,6 +1779,7 @@ def extract_committed_route(
     for entry_hyp in entry_candidates:
         plane_dist, plane_prev_node, plane_prev_edge = shortest_paths_in_stage(plane_store, int(entry_hyp.plane_node_id))
         for exit_hyp in exit_candidates:
+            # Score every entry/exit pair by the three committed stage subpaths.
             pairs_evaluated += 1
             plane_exit_id = int(exit_hyp.plane_node_id)
             if plane_exit_id not in plane_dist:
@@ -1825,6 +1883,8 @@ def should_stop_exploration(
     stage_route_gains: dict[str, list[int]],
     current_stage_counts: dict[str, int],
 ) -> bool:
+    """Decide whether evidence growth has saturated enough to stop."""
+
     if total_rounds >= SAFETY_MAX_TOTAL_ROUNDS:
         return True
     if total_rounds < MIN_ROUNDS_BEFORE_SATURATION_CHECK:
@@ -1849,6 +1909,7 @@ def should_stop_exploration(
         return True
     if total_rounds - first_solution_round < MIN_POST_SOLUTION_ROUNDS:
         return False
+    # After a first solution, continue only while nodes/transitions/routes improve.
     return node_gain == 0 and transition_gain == 0 and route_gain == 0 and not plane_lagging
 
 
@@ -1949,6 +2010,8 @@ def plan_multimodal_unknown_sequence(
     goal_q: np.ndarray,
     serial_mode: bool = False,
 ) -> UnknownSequenceRoute:
+    """Grow evidence graphs and infer a feasible stage sequence from them."""
+
     stage_ids, manifold_map = _coerce_stage_manifolds(stage_manifolds)
     stores = {
         stage_id: StageEvidenceStore(stage=stage_id, manifold=manifold_map[stage_id])
@@ -2058,6 +2121,7 @@ def plan_multimodal_unknown_sequence(
             useful_scores: dict[str, float] = {}
             for stage_id in stage_ids:
                 store = stores[stage_id]
+                # Project the same ambient proposal to multiple active manifolds.
                 projection = proposal_projection(store.manifold, np.asarray(proposal, dtype=float))
                 if projection is None:
                     continue
@@ -2087,6 +2151,7 @@ def plan_multimodal_unknown_sequence(
             passive_seed_stages = [] if serial_mode else [stage for stage in ranked_stages if stage not in active_update_stage_set]
 
             for stage_id in passive_seed_stages:
+                # Passive seeding grows coverage without spending a local planner call.
                 node_id = seed_stage_evidence_only(stores[stage_id], useful[stage_id], guides[stage_id])
                 if node_id >= 0:
                     round_node_gain[stage_id] += 1
@@ -2121,6 +2186,7 @@ def plan_multimodal_unknown_sequence(
                     round_transition_gain[target_stage] += transition_gain
 
         meta_graph = build_meta_graph(stage_ids, global_hypotheses)
+        # The meta-graph separates stage ordering from the within-stage evidence graphs.
         promising_meta_path = bfs_meta_path(meta_graph, sorted(start_stage_nodes), sorted(goal_stage_nodes))
         if len(promising_meta_path) > 0:
             pair_hypotheses: dict[tuple[str, str], list[GenericTransitionHypothesis]] = {}
@@ -2199,6 +2265,7 @@ def plan_multimodal_unknown_sequence(
             )
             if candidate is not None:
                 if best_candidate is None or candidate.total_cost + 1e-9 < best_candidate.total_cost:
+                    # Keep improving after the first route if exploration is still productive.
                     best_candidate = candidate
                     best_sequence = list(promising_meta_path)
                     route_improved_this_round = 1
@@ -2288,7 +2355,10 @@ def plan_fixed_manifold_multimodal_route(
     obstacles=None,
     joint_max_step: float | None = None,
 ) -> FixedPlaneRoute:
+    """Plan the known Example 66 sequence or delegate to the robot C-space path."""
+
     if robot is not None:
+        # With a robot, the thesis-facing path is planned/certified in joint space.
         from .jointspace_helpers import plan_fixed_manifold_multimodal_route_jointspace
 
         return plan_fixed_manifold_multimodal_route_jointspace(
@@ -2400,6 +2470,7 @@ def plan_fixed_manifold_multimodal_route(
             useful: dict[str, np.ndarray] = {}
             useful_scores: dict[str, float] = {}
             for stage, store in stores.items():
+                # One ambient proposal can contribute evidence to several stages.
                 projection = proposal_projection(store.manifold, np.asarray(proposal, dtype=float))
                 if projection is None:
                     continue
@@ -2445,6 +2516,7 @@ def plan_fixed_manifold_multimodal_route(
             passive_seed_stages = [] if serial_mode else [stage for stage in ranked_stages if stage not in active_update_stages]
 
             for stage in passive_seed_stages:
+                # Passive evidence keeps unexplored stages visible without exact solves.
                 node_id = seed_stage_evidence_only(stores[stage], useful[stage], guides[stage])
                 if node_id >= 0:
                     round_node_gain[stage] += 1
@@ -2466,6 +2538,7 @@ def plan_fixed_manifold_multimodal_route(
                     plane_updated_this_round = True
 
                 if stage in [LEFT_STAGE, PLANE_STAGE]:
+                    # Transition hypotheses are shared configurations between adjacent manifolds.
                     transition_gain, evals = add_left_plane_hypotheses(
                         source_stage=stage,
                         source_store=store,
@@ -2483,6 +2556,7 @@ def plan_fixed_manifold_multimodal_route(
                         plane_updated_this_round = True
 
                 if stage in [PLANE_STAGE, RIGHT_STAGE]:
+                    # Plane-right transitions complete the second interface of the route.
                     transition_gain, evals = add_plane_right_hypotheses(
                         source_stage=stage,
                         source_store=store,
@@ -2587,6 +2661,7 @@ def plan_fixed_manifold_multimodal_route(
                 plane_evidence_at_first_solution = len(stores[PLANE_STAGE].graph.nodes)
                 right_evidence_at_first_solution = len(stores[RIGHT_STAGE].graph.nodes)
             if best_candidate is None or candidate.total_cost + 1e-9 < best_candidate.total_cost:
+                # Route selection may improve after the first solution as evidence grows.
                 if first_solution_round is not None and best_candidate is not None and round_idx > first_solution_round:
                     committed_route_changes_after_first_solution += 1
                 best_candidate = candidate

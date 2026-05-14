@@ -46,6 +46,8 @@ except Exception:
 
 @dataclass
 class RobotExecutionResult:
+    """Robot animation/execution data derived from a dense theta path."""
+
     target_task_points_3d: np.ndarray
     joint_path: np.ndarray
     end_effector_points_3d: np.ndarray
@@ -109,6 +111,8 @@ def wrap_angles(joint_angles: np.ndarray) -> np.ndarray:
 
 
 def choose_robot_for_route(route: np.ndarray) -> SpatialRobot3DOF:
+    """Create the educational 3-DOF robot positioned near the task-space scene."""
+
     pts = np.asarray(route, dtype=float)
     center = np.mean(pts, axis=0)
     mins = np.min(pts, axis=0)
@@ -633,6 +637,37 @@ def configure_example_66_budgets(args) -> None:
         planner_core.MIN_POST_SOLUTION_ROUNDS = ex66.MIN_POST_SOLUTION_ROUNDS
 
 
+def has_certified_dense_joint_path(result) -> bool:
+    """Return True only when the planner produced an executable dense theta path."""
+
+    theta_path = np.asarray(getattr(result, "dense_joint_path", np.zeros((0, 3), dtype=float)), dtype=float)
+    return bool(
+        theta_path.ndim == 2
+        and theta_path.shape[1] == 3
+        and len(theta_path) >= 2
+        and bool(getattr(result, "dense_joint_path_execution_certified", False))
+    )
+
+
+def apply_quick_cspace_demo_preset(args) -> None:
+    """Apply runtime-friendly Example 66 settings without changing certification."""
+
+    if not bool(getattr(args, "quick_cspace_demo", False)):
+        return
+    args.planning_mode = "jointspace_constrained_planning"
+    args.with_obstacles = False
+    args.seed = int(args.seed if args.seed is not None else 41)
+    if args.max_rounds is None and args.max_iters is None:
+        args.max_rounds = 12
+    args.fast = True
+    if float(args.joint_max_step) == 0.08:
+        args.joint_max_step = 0.12
+    args.smooth_final_route = False
+    args.show_cspace = True
+    args.cspace_route_only = True
+    args.cspace_no_surfaces = True
+
+
 def planner_parity_stats(result: ex66.FixedPlaneRoute, planner_mode: str, robot_execution: RobotExecutionResult | None) -> dict[str, object]:
     nodes_explored = int(result.left_evidence_nodes + result.plane_evidence_nodes + result.right_evidence_nodes)
     edges_explored = int(sum(len(edges) for edges in result.stage_evidence_edges.values()))
@@ -652,6 +687,94 @@ def planner_parity_stats(result: ex66.FixedPlaneRoute, planner_mode: str, robot_
         "final_path_waypoints": int(len(result.path if len(result.path) >= 2 else result.raw_path)),
         "robot_execution_waypoints": int(0 if robot_execution is None else len(robot_execution.joint_path)),
     }
+
+
+def _main_route_rejection_reason(result: ex66.FixedPlaneRoute) -> str:
+    counts = getattr(result, "mode_counts", {}) or {}
+    dense_message = str(getattr(result, "dense_joint_path_message", "") or "")
+    if dense_message:
+        return dense_message
+    if int(counts.get("route_candidates_evaluated", 0)) <= 0:
+        if int(counts.get("route_candidates_missing_plane_graph_path", 0)) > 0:
+            return "transition pairs exist, but the plane graph has no entry-to-exit path for the evaluated candidates"
+        if int(counts.get("route_candidates_missing_left_graph_path", 0)) > 0:
+            return "left graph path from start to left-plane transition is missing"
+        if int(counts.get("route_candidates_missing_right_graph_path", 0)) > 0:
+            return "right graph path from plane-right transition to goal is missing"
+        if int(counts.get("route_candidates_dense_edge_path_missing", 0)) > 0:
+            return "graph route exists only as sparse nodes; stored dense edge path is missing"
+        if int(getattr(result, "transition_hypotheses_left_plane", 0)) <= 0:
+            return "no left-plane transition hypotheses were found"
+        if int(getattr(result, "transition_hypotheses_plane_right", 0)) <= 0:
+            return "no plane-right transition hypotheses were found"
+        return "transitions exist, but no route candidate was built from them"
+    if int(counts.get("route_candidates_local_connector_failed_plane", 0)) > 0:
+        return "route candidate rejected: plane segment local connector failed residual/joint continuity certification"
+    if int(counts.get("route_candidates_local_connector_failed_left", 0)) > 0:
+        return "route candidate rejected: left segment local connector failed residual/joint continuity certification"
+    if int(counts.get("route_candidates_local_connector_failed_right", 0)) > 0:
+        return "route candidate rejected: right segment local connector failed residual/joint continuity certification"
+    if int(counts.get("route_candidates_rejected_joint_jump", 0)) > 0:
+        return "route candidates were rejected by joint-step continuity certification"
+    if int(counts.get("route_candidates_constraint_certified", 0)) <= 0:
+        return "route candidates did not pass constraint certification"
+    if int(counts.get("route_candidates_execution_certified", 0)) <= 0:
+        return "route candidates did not pass dense execution certification"
+    if bool(getattr(result, "saturated_before_solution", False)):
+        return f"exploration saturated before a certified dense route was extracted; stagnation_stage={getattr(result, 'stagnation_stage', None)}"
+    return "certified dense route was not available"
+
+
+def print_example66_failure_report(result: ex66.FixedPlaneRoute, *, quick_mode: bool) -> None:
+    dense_points = int(len(getattr(result, "dense_joint_path", [])))
+    dense_certified = bool(getattr(result, "dense_joint_path_execution_certified", False))
+    if bool(getattr(result, "success", False)) and dense_points > 0 and dense_certified:
+        return
+    counts = getattr(result, "mode_counts", {}) or {}
+    print_block(
+        "Example 66 quick failure report" if quick_mode else "Example 66 dense-route failure report",
+        {
+            "planner_success": bool(getattr(result, "success", False)),
+            "planner_raw_success_before_dense_certification": bool(
+                getattr(result, "raw_planner_success_before_dense_certification", getattr(result, "success", False))
+            ),
+            "dense_joint_path_points": dense_points,
+            "dense_joint_path_execution_certified": dense_certified,
+            "transitions_found_left_plane": int(getattr(result, "transition_hypotheses_left_plane", 0)),
+            "transitions_found_plane_right": int(getattr(result, "transition_hypotheses_plane_right", 0)),
+            "route_candidates_built": int(counts.get("route_candidates_evaluated", 0)),
+            "route_candidates_constraint_certified": int(counts.get("route_candidates_constraint_certified", 0)),
+            "route_candidates_execution_certified": int(counts.get("route_candidates_execution_certified", 0)),
+            "route_candidates_rejected_joint_jump": int(counts.get("route_candidates_rejected_joint_jump", 0)),
+            "missing_left_graph_path": int(counts.get("route_candidates_missing_left_graph_path", 0)),
+            "missing_plane_graph_path": int(counts.get("route_candidates_missing_plane_graph_path", 0)),
+            "missing_right_graph_path": int(counts.get("route_candidates_missing_right_graph_path", 0)),
+            "dense_edge_path_missing": int(counts.get("route_candidates_dense_edge_path_missing", 0)),
+            "sparse_only_graph_path": int(counts.get("route_candidates_sparse_only_graph_path", 0)),
+            "local_connector_attempts": int(counts.get("route_candidates_local_replan_attempted", 0)),
+            "local_connector_failed_left": int(counts.get("route_candidates_local_connector_failed_left", 0)),
+            "local_connector_failed_plane": int(counts.get("route_candidates_local_connector_failed_plane", 0)),
+            "local_connector_failed_right": int(counts.get("route_candidates_local_connector_failed_right", 0)),
+            "transition_stack_rejections": int(counts.get("route_candidates_transition_stack_rejected", 0)),
+            "constraint_residual_rejections": int(counts.get("route_candidates_constraint_rejected", 0)),
+            "collision_rejections": int(counts.get("route_candidates_collision_rejected", 0)),
+            "query_connector_routes_built": int(counts.get("route_candidates_query_connectors_used", 0)),
+            "main_rejection_reason": _main_route_rejection_reason(result),
+            "suggestion": "Increase --max-rounds or inspect route realization / dense local edges.",
+        },
+    )
+
+
+def enforce_dense_certified_success_for_jointspace(result: ex66.FixedPlaneRoute) -> None:
+    """For the demo contract, success means an execution-certified dense theta route."""
+
+    raw_success = bool(getattr(result, "success", False))
+    result.raw_planner_success_before_dense_certification = raw_success
+    if raw_success and not has_certified_dense_joint_path(result):
+        result.success = False
+        message = str(getattr(result, "message", "") or "")
+        dense_message = str(getattr(result, "dense_joint_path_message", "") or "dense joint path was not execution-certified")
+        result.message = f"{message} Dense route certification failed: {dense_message}"
 
 
 def jointspace_display_route_from_dense(result: ex66.FixedPlaneRoute, robot: SpatialRobot3DOF) -> np.ndarray:
@@ -764,6 +887,8 @@ def _route_quality_cost(
 
 
 def _stage_manifolds_for_robot(families, robot: SpatialRobot3DOF):
+    """Build FK-pulled-back robot sphere/plane manifolds for Example 66."""
+
     left_family, plane_family, right_family = families
     left_geom = left_family.manifold(float(left_family.sample_lambdas()[0]))
     plane_geom = plane_family.manifold(float(plane_family.sample_lambdas()[0]))
@@ -779,6 +904,7 @@ def _stage_manifolds_for_robot(families, robot: SpatialRobot3DOF):
         else None
     )
     return {
+        # Workspace sphere residual is pulled back through FK(theta).
         ex66.LEFT_STAGE: RobotSphereManifold(
             robot=robot,
             center=left_base.center,
@@ -787,6 +913,7 @@ def _stage_manifolds_for_robot(families, robot: SpatialRobot3DOF):
             joint_lower=joint_lower,
             joint_upper=joint_upper,
         ),
+        # Workspace plane residual is pulled back through FK(theta).
         ex66.PLANE_STAGE: RobotPlaneManifold(
             robot=robot,
             point=plane_base.point,
@@ -796,6 +923,7 @@ def _stage_manifolds_for_robot(families, robot: SpatialRobot3DOF):
             joint_upper=joint_upper,
             task_space_validity_fn=plane_task_validity,
         ),
+        # Right support is another active manifold in robot joint space.
         ex66.RIGHT_STAGE: RobotSphereManifold(
             robot=robot,
             center=right_base.center,
@@ -823,6 +951,8 @@ def _transition_stack_residuals(
     selected_left_plane_theta: np.ndarray | None = None,
     selected_plane_right_theta: np.ndarray | None = None,
 ) -> dict[str, object]:
+    """Measure whether selected transition theta values satisfy both stages."""
+
     q_arr = np.asarray(q_path, dtype=float)
 
     def stack_at(q: np.ndarray, source: str, target: str) -> float:
@@ -879,6 +1009,7 @@ def compute_cspace_trajectory_audit(
     if len(joint_steps) == 0 and len(theta_path) >= 2:
         joint_steps, _max_step, _mean_step, _worst = joint_step_statistics(theta_path)
     fk_trace = (
+        # Thesis-facing path is dense theta; this FK trace is derived for display.
         np.asarray([robot.forward_kinematics_3d(theta)[-1] for theta in theta_path], dtype=float)
         if len(theta_path) > 0
         else np.zeros((0, 3), dtype=float)
@@ -1621,7 +1752,9 @@ def save_cspace_debug_artifacts(
     joint_steps = np.asarray(audit["joint_steps"], dtype=float)
     labels = list(audit["stage_labels"])
 
+    # Save theta first because it is the executable joint-space route.
     np.save(base / "dense_theta_path.npy", theta_path)
+    # Save FK(theta) only as the visualization/debug trace.
     np.save(base / "dense_fk_trace.npy", fk_trace)
     np.save(base / "constraint_residuals.npy", residuals)
     np.save(base / "joint_steps.npy", joint_steps)
@@ -1775,6 +1908,16 @@ def print_jointspace_exploration_block(result: ex66.FixedPlaneRoute) -> None:
             "route_candidates_execution_certified": int(result.mode_counts.get("route_candidates_execution_certified", 0)),
             "route_candidates_rejected_joint_jump": int(result.mode_counts.get("route_candidates_rejected_joint_jump", 0)),
             "route_candidates_realized_by_local_replan": int(result.mode_counts.get("route_candidates_realized_by_local_replan", 0)),
+            "missing_left_graph_path": int(result.mode_counts.get("route_candidates_missing_left_graph_path", 0)),
+            "missing_plane_graph_path": int(result.mode_counts.get("route_candidates_missing_plane_graph_path", 0)),
+            "missing_right_graph_path": int(result.mode_counts.get("route_candidates_missing_right_graph_path", 0)),
+            "dense_edge_path_missing": int(result.mode_counts.get("route_candidates_dense_edge_path_missing", 0)),
+            "sparse_only_graph_path": int(result.mode_counts.get("route_candidates_sparse_only_graph_path", 0)),
+            "local_connector_attempts": int(result.mode_counts.get("route_candidates_local_replan_attempted", 0)),
+            "local_connector_failed_left": int(result.mode_counts.get("route_candidates_local_connector_failed_left", 0)),
+            "local_connector_failed_plane": int(result.mode_counts.get("route_candidates_local_connector_failed_plane", 0)),
+            "local_connector_failed_right": int(result.mode_counts.get("route_candidates_local_connector_failed_right", 0)),
+            "query_connector_routes_built": int(result.mode_counts.get("route_candidates_query_connectors_used", 0)),
             "left_update_attempts": int(result.mode_counts.get("left_update_attempts", 0)),
             "plane_update_attempts": int(result.mode_counts.get("plane_update_attempts", 0)),
             "right_update_attempts": int(result.mode_counts.get("right_update_attempts", 0)),
@@ -1895,6 +2038,7 @@ def run_planner_and_execution(
     smoothing_use_local_planner: bool,
 ) -> tuple[ex66.FixedPlaneRoute, RobotExecutionResult | None, JointRouteSmoothingResult | None]:
     if mode == "jointspace_constrained_planning":
+        # Thesis branch: plan in C-space against FK-pulled-back manifolds.
         print("[planner] starting joint-space evidence planning...", flush=True)
         result = ex66.plan_fixed_manifold_multimodal_route(
             families=families,
@@ -1934,6 +2078,7 @@ def run_planner_and_execution(
             else None
         )
         execution = (
+            # Robot execution uses result.dense_joint_path directly.
             build_robot_execution(
                 result,
                 robot,
@@ -1951,6 +2096,7 @@ def run_planner_and_execution(
         )
         return result, execution, smoothing_summary
 
+    # Legacy branch: task-space route followed by IK, retained only for debugging.
     print("[planner] starting task-space evidence planning...", flush=True)
     result = ex66.plan_fixed_manifold_multimodal_route(
         families=families,
@@ -2004,6 +2150,12 @@ def print_comparison(
 def main():
     parser = argparse.ArgumentParser(
         description="Example 66.1: joint-space FK-constrained planning for a simple 3DOF robot."
+    )
+    # Arguments below choose between thesis joint-space planning and legacy/debug modes.
+    parser.add_argument(
+        "--quick-cspace-demo",
+        action="store_true",
+        help="Fast Example 66 preset: joint-space, no obstacles, modest rounds, route-only C-space if certified.",
     )
     parser.add_argument("--seed", type=int, default=41)
     parser.add_argument("--max-rounds", type=int, default=None)
@@ -2111,11 +2263,76 @@ def main():
     parser.add_argument(
         "--cspace-grid-res",
         type=int,
-        default=55,
+        default=65,
         help="Grid resolution per joint axis for C-space implicit constraint surfaces.",
     )
+    parser.add_argument("--cspace-no-surfaces", action="store_true", help="Show the C-space theta route without implicit surfaces.")
+    parser.add_argument("--cspace-route-only", action="store_true", help="Show only dense theta route, stage segments, and exact transition markers.")
+    parser.add_argument("--cspace-marker-scale", type=float, default=0.35, help="Scale C-space start/goal/transition marker sizes.")
+    parser.add_argument("--cspace-opacity", type=float, default=0.28, help="Opacity for full C-space isosurface meshes.")
+    parser.add_argument("--cspace-left-opacity", type=float, default=None, help="Opacity for the left C-space surface.")
+    parser.add_argument("--cspace-middle-opacity", type=float, default=None, help="Opacity for the middle plane C-space surface.")
+    parser.add_argument("--cspace-right-opacity", type=float, default=None, help="Opacity for the right C-space surface.")
+    parser.add_argument("--cspace-middle-color", type=str, default=None, help="Color for the middle plane C-space surface.")
+    parser.add_argument("--cspace-force-middle-sheet", action="store_true", help="Always draw a route-local cyan middle sheet for presentation clarity.")
+    cspace_smoothing_group = parser.add_mutually_exclusive_group()
+    cspace_smoothing_group.add_argument("--cspace-smooth-surfaces", dest="cspace_smooth_surfaces", action="store_true", default=True)
+    cspace_smoothing_group.add_argument("--cspace-no-smooth-surfaces", dest="cspace_smooth_surfaces", action="store_false")
+    cspace_render_group = parser.add_mutually_exclusive_group()
+    cspace_render_group.add_argument(
+        "--cspace-safe-render",
+        dest="cspace_safe_render",
+        action="store_true",
+        default=True,
+        help="Use conservative C-space rendering; this is the default.",
+    )
+    cspace_render_group.add_argument(
+        "--cspace-fancy-render",
+        dest="cspace_safe_render",
+        action="store_false",
+        help="Allow prettier C-space rendering options that may trigger GPU/VTK shader warnings.",
+    )
+    vtk_warning_group = parser.add_mutually_exclusive_group()
+    vtk_warning_group.add_argument(
+        "--suppress-vtk-warnings",
+        dest="suppress_vtk_warnings",
+        action="store_true",
+        default=True,
+        help="Suppress VTK/OpenGL warning spam from the C-space renderer; this is the default.",
+    )
+    vtk_warning_group.add_argument(
+        "--show-vtk-warnings",
+        dest="suppress_vtk_warnings",
+        action="store_false",
+        help="Let VTK/OpenGL warnings print to the terminal.",
+    )
+    parser.add_argument(
+        "--vtk-output-log",
+        type=str,
+        default="outputs/vtk_warnings.log",
+        help="File for redirected native VTK/OpenGL stdout/stderr; use 'null' to discard.",
+    )
+    parser.add_argument(
+        "--cspace-surface-mode",
+        choices=("full", "solid-safe", "route-only", "fallback"),
+        default="full",
+        help="C-space surface mode: full transparent surfaces, solid-safe opaque surfaces, route-only, or fallback context.",
+    )
+    parser.add_argument(
+        "--cspace-surface-style",
+        choices=("points-outline", "points", "wireframe", "contour"),
+        default="points-outline",
+        help="Surface context style for C-space views.",
+    )
+    cspace_view_group = parser.add_mutually_exclusive_group()
+    cspace_view_group.add_argument("--cspace-clean-view", dest="cspace_clean_view", action="store_true", default=True)
+    cspace_view_group.add_argument("--cspace-box-view", dest="cspace_clean_view", action="store_false")
+    cspace_quality = parser.add_mutually_exclusive_group()
+    cspace_quality.add_argument("--cspace-lightweight", dest="cspace_lightweight", action="store_true", default=True)
+    cspace_quality.add_argument("--cspace-full-surfaces", dest="cspace_lightweight", action="store_false")
     parser.add_argument("--no-viz", action="store_true")
     args = parser.parse_args()
+    apply_quick_cspace_demo_preset(args)
 
     if args.planning_mode == "jointspace_constrained_planning":
         if bool(args.allow_taskspace_fallback):
@@ -2132,6 +2349,21 @@ def main():
             "WARNING: LEGACY DEBUG ONLY: comparison mode includes task-space IK tracking and is not the thesis robot planner.",
             flush=True,
         )
+    if bool(args.quick_cspace_demo):
+        print_block(
+            "Quick C-space demo preset",
+            {
+                "planning_mode": args.planning_mode,
+                "with_obstacles": bool(args.with_obstacles),
+                "seed": int(args.seed),
+                "max_rounds": args.max_rounds if args.max_rounds is not None else args.max_iters,
+                "fast_effort_guard": bool(args.fast),
+                "joint_max_step": float(args.joint_max_step),
+                "smooth_final_route": bool(args.smooth_final_route),
+                "show_cspace": bool(args.show_cspace),
+                "cspace_route_only": bool(args.cspace_route_only),
+            },
+        )
 
     np.random.seed(args.seed)
     ou.RNG.setSeed(args.seed)
@@ -2139,8 +2371,10 @@ def main():
 
     configure_example_66_budgets(args)
 
+    # Task-space scene defines the supports; robot manifolds pull them back to theta.
     families, start_q, goal_q, plane_half_u, plane_half_v = build_example66_scene()
     active_obstacles = default_example_66_obstacles() if args.with_obstacles else []
+    # Simple 3-DOF robot convention is theta=[yaw, shoulder, elbow].
     robot = SpatialRobot3DOF(
         link_lengths=np.asarray([1.35, 1.05, 0.75], dtype=float),
         base_world=np.asarray([0.0, -1.25, 0.10], dtype=float),
@@ -2157,6 +2391,7 @@ def main():
     )
 
     if args.planning_mode == "compare_taskspace_vs_jointspace":
+        # Comparison mode is diagnostic; the selected thesis result remains the joint-space branch.
         np.random.seed(args.seed)
         task_result, task_execution, _task_smoothing = run_planner_and_execution(
             mode="taskspace_ik_execution",
@@ -2243,6 +2478,9 @@ def main():
         )
         planner_mode_label = "joint_space" if args.planning_mode == "jointspace_constrained_planning" else "task_space"
 
+    if planner_mode_label == "joint_space":
+        enforce_dense_certified_success_for_jointspace(result)
+
     route, route_source = primary_display_route_for_mode(result, robot, planner_mode_label)
     path_audit = path_source_audit(result, robot_execution, robot, planner_mode_label)
     cspace_audit: dict[str, object] | None = None
@@ -2295,6 +2533,7 @@ def main():
     )
     print(f"obstacle_count = {len(result.obstacles)}")
     print("replay_key = r")
+    print_example66_failure_report(result, quick_mode=bool(args.quick_cspace_demo))
     if (
         planner_mode_label == "joint_space"
         and result.success
@@ -2376,15 +2615,16 @@ def main():
         )
     )
     cspace_debug_dir = Path("outputs") / "ex66_jointspace_debug" / "latest"
-    should_render_cspace = bool(args.show_cspace and planner_mode_label == "joint_space" and result.success)
-    should_save_cspace = bool(args.save_cspace_debug and planner_mode_label == "joint_space" and result.success)
+    certified_dense_cspace_route = bool(planner_mode_label == "joint_space" and has_certified_dense_joint_path(result))
+    should_render_cspace = bool(args.show_cspace and certified_dense_cspace_route)
+    should_save_cspace = bool(args.save_cspace_debug and certified_dense_cspace_route)
     print_block(
         "C-space visualization",
         {
             "cspace_visualization_requested": bool(args.show_cspace),
             "cspace_axes": "theta0, theta1, theta2",
             "cspace_grid_res": int(args.cspace_grid_res),
-            "cspace_route_source": "result.dense_joint_path" if planner_mode_label == "joint_space" else "none",
+            "cspace_route_source": "result.dense_joint_path" if certified_dense_cspace_route else "none",
             "cspace_surface_source": "FK-pulled-back residual(theta)=0" if planner_mode_label == "joint_space" else "none",
             "cspace_interactive_view": bool(should_render_cspace and not args.no_viz),
             "cspace_screenshot": str(cspace_debug_dir / "cspace_environment.png") if should_save_cspace else "disabled",
@@ -2400,9 +2640,29 @@ def main():
             grid_res=int(args.cspace_grid_res),
             output_dir=cspace_output_dir,
             show=not bool(args.no_viz),
+            show_surfaces=not bool(args.cspace_no_surfaces),
+            route_only=bool(args.cspace_route_only),
+            lightweight=bool(args.cspace_lightweight),
+            marker_scale=float(args.cspace_marker_scale),
+            surface_opacity=float(args.cspace_opacity),
+            left_surface_opacity=args.cspace_left_opacity,
+            middle_surface_opacity=args.cspace_middle_opacity,
+            right_surface_opacity=args.cspace_right_opacity,
+            middle_surface_color=args.cspace_middle_color,
+            force_middle_sheet=bool(args.cspace_force_middle_sheet),
+            surface_style=str(args.cspace_surface_style),
+            surface_mode=str(args.cspace_surface_mode),
+            smooth_surfaces=bool(args.cspace_smooth_surfaces),
+            clean_view=bool(args.cspace_clean_view),
+            safe_render=bool(args.cspace_safe_render),
+            suppress_vtk_warnings=bool(args.suppress_vtk_warnings),
+            vtk_warning_log=args.vtk_output_log,
+            example_name="fixed_transfer_plane",
         )
         if screenshot_path is not None:
             print(f"cspace_environment_screenshot = {screenshot_path}")
+    elif args.show_cspace:
+        print("No certified dense joint path found; C-space route cannot be shown.", flush=True)
 
     if args.no_viz:
         sys.stdout.flush()

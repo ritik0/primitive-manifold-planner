@@ -1857,6 +1857,149 @@ def realize_selected_transition_route_jointspace(
     }
 
 
+def _route_query_connector_candidate(
+    *,
+    stores: dict[str, ex66.StageEvidenceStore],
+    start_node_id: int,
+    goal_node_id: int,
+    entry_hyp: ex66.TransitionHypothesis,
+    exit_hyp: ex66.TransitionHypothesis,
+    left_node_path: list[int],
+    left_edge_path: list[int],
+    plane_node_path: list[int],
+    plane_edge_path: list[int],
+    right_node_path: list[int],
+    right_edge_path: list[int],
+    robot,
+    collision_fn=None,
+) -> tuple[ex66.SequentialRouteCandidate | None, str, str]:
+    """Build a certified dense theta route from exact transition endpoints.
+
+    This is used only when the evidence graph has selected transition
+    hypotheses but a stored dense graph route is missing or incomplete. The
+    connectors stay in joint space and are certified on the active manifolds.
+    """
+
+    entry_theta = np.asarray(getattr(entry_hyp, "transition_theta", np.zeros(0, dtype=float)), dtype=float)
+    exit_theta = np.asarray(getattr(exit_hyp, "transition_theta", np.zeros(0, dtype=float)), dtype=float)
+    if entry_theta.shape != (3,) or not np.all(np.isfinite(entry_theta)):
+        return None, "transition", "left-plane exact transition theta unavailable"
+    if exit_theta.shape != (3,) or not np.all(np.isfinite(exit_theta)):
+        return None, "transition", "plane-right exact transition theta unavailable"
+
+    left_store = stores[ex66.LEFT_STAGE]
+    plane_store = stores[ex66.PLANE_STAGE]
+    right_store = stores[ex66.RIGHT_STAGE]
+    start_theta = np.asarray(left_store.graph.nodes[int(start_node_id)].q, dtype=float)
+    goal_theta = np.asarray(right_store.graph.nodes[int(goal_node_id)].q, dtype=float)
+
+    left_plane_stack_residual = _stack_residual_norm(left_store.manifold, plane_store.manifold, entry_theta)
+    plane_right_stack_residual = _stack_residual_norm(plane_store.manifold, right_store.manifold, exit_theta)
+    max_transition_stack_residual = float(max(left_plane_stack_residual, plane_right_stack_residual))
+    transition_stack_certified = bool(max_transition_stack_residual <= 1.0e-3)
+    if not transition_stack_certified:
+        return (
+            None,
+            "transition",
+            "transition stack rejection: "
+            f"left_plane={left_plane_stack_residual:.4g}, plane_right={plane_right_stack_residual:.4g}",
+        )
+
+    segment_specs = [
+        (ex66.LEFT_STAGE, left_store.manifold, start_theta, entry_theta),
+        (ex66.PLANE_STAGE, plane_store.manifold, entry_theta, exit_theta),
+        (ex66.RIGHT_STAGE, right_store.manifold, exit_theta, goal_theta),
+    ]
+    segment_paths: list[tuple[str, np.ndarray]] = []
+    for stage, manifold, q0, q1 in segment_specs:
+        result = explore_joint_manifold(
+            manifold=manifold,
+            start=np.asarray(q0, dtype=float),
+            goal=np.asarray(q1, dtype=float),
+            max_step=0.5 * float(LOCAL_MAX_JOINT_STEP),
+            local_max_joint_step=float(LOCAL_MAX_JOINT_STEP),
+            collision_fn=collision_fn,
+        )
+        if not result.success:
+            return None, stage, f"{stage} local connector failed: {result.message}"
+        path = np.asarray(result.path, dtype=float)
+        if len(path) < 2:
+            return None, stage, f"{stage} local connector produced an empty dense path"
+        segment_paths.append((stage, path))
+
+    dense_joint_path, dense_labels = _labeled_dense_joint_path(*segment_paths)
+    certification = _certify_dense_joint_execution(
+        dense_joint_path=dense_joint_path,
+        stage_labels=dense_labels,
+        stores=stores,
+        collision_fn=collision_fn,
+        robot=robot,
+        max_joint_step=LOCAL_MAX_JOINT_STEP,
+    )
+    if not bool(certification["execution_certified"]):
+        message = str(certification["message"])
+        if not bool(certification["constraint_certified"]):
+            return None, "constraint", f"constraint residual rejection: {message}"
+        if not bool(certification["joint_continuity_certified"]):
+            return None, "joint_jump", f"joint jump rejection: {message}"
+        if not bool(certification["collision_free"]):
+            return None, "collision", f"collision rejection: {message}"
+        return None, "certification", f"dense execution certification failed: {message}"
+
+    raw_path = joint_path_to_task_path(robot, dense_joint_path)
+    display_path = np.asarray(raw_path, dtype=float)
+    dense_residuals = np.asarray(certification["residuals"], dtype=float)
+    dense_joint_steps = np.asarray(certification["joint_steps"], dtype=float)
+    selected_left_plane_transition_index = _transition_theta_index(dense_joint_path, entry_theta)
+    selected_plane_right_transition_index = _transition_theta_index(dense_joint_path, exit_theta)
+    candidate = ex66.SequentialRouteCandidate(
+        total_cost=float(ex66.path_cost(raw_path)),
+        left_node_path=list(left_node_path) if len(left_node_path) > 0 else [int(start_node_id), int(entry_hyp.left_node_id)],
+        left_edge_path=list(left_edge_path),
+        plane_node_path=list(plane_node_path)
+        if len(plane_node_path) > 0
+        else [int(entry_hyp.plane_node_id), int(exit_hyp.plane_node_id)],
+        plane_edge_path=list(plane_edge_path),
+        right_node_path=list(right_node_path) if len(right_node_path) > 0 else [int(exit_hyp.right_node_id), int(goal_node_id)],
+        right_edge_path=list(right_edge_path),
+        committed_nodes={
+            ex66.LEFT_STAGE: set(left_node_path) if len(left_node_path) > 0 else {int(start_node_id), int(entry_hyp.left_node_id)},
+            ex66.PLANE_STAGE: set(plane_node_path)
+            if len(plane_node_path) > 0
+            else {int(entry_hyp.plane_node_id), int(exit_hyp.plane_node_id)},
+            ex66.RIGHT_STAGE: set(right_node_path) if len(right_node_path) > 0 else {int(exit_hyp.right_node_id), int(goal_node_id)},
+        },
+        raw_path=np.asarray(raw_path, dtype=float),
+        display_path=display_path,
+        joint_path=np.asarray(dense_joint_path, dtype=float),
+        dense_joint_path=np.asarray(dense_joint_path, dtype=float),
+        dense_joint_path_stage_labels=list(dense_labels),
+        dense_joint_path_constraint_residuals=np.asarray(dense_residuals, dtype=float),
+        dense_joint_path_is_certified=bool(certification["constraint_certified"]),
+        dense_joint_path_joint_steps=np.asarray(dense_joint_steps, dtype=float),
+        dense_joint_path_max_joint_step=float(certification["max_joint_step"]),
+        dense_joint_path_mean_joint_step=float(certification["mean_joint_step"]),
+        dense_joint_path_worst_joint_step_index=int(certification["worst_joint_step_index"]),
+        dense_joint_path_execution_certified=True,
+        dense_joint_path_constraint_certified=True,
+        dense_joint_path_joint_continuity_certified=True,
+        dense_joint_path_message=(
+            "final_route_realization=query_connectors; "
+            "execution_path_source=certified_jointspace_query_connectors; "
+            f"{certification['message']}"
+        ),
+        selected_left_plane_transition_theta=np.asarray(entry_theta, dtype=float),
+        selected_plane_right_transition_theta=np.asarray(exit_theta, dtype=float),
+        selected_left_plane_transition_index=int(selected_left_plane_transition_index),
+        selected_plane_right_transition_index=int(selected_plane_right_transition_index),
+        selected_left_plane_stack_residual=float(left_plane_stack_residual),
+        selected_plane_right_stack_residual=float(plane_right_stack_residual),
+        max_transition_stack_residual=float(max_transition_stack_residual),
+        transition_stack_certified=True,
+    )
+    return candidate, "success", str(candidate.dense_joint_path_message)
+
+
 def _extract_committed_route_joint(
     left_store: ex66.StageEvidenceStore,
     plane_store: ex66.StageEvidenceStore,
@@ -1881,6 +2024,21 @@ def _extract_committed_route_joint(
         "route_candidates_execution_certified": 0,
         "route_candidates_rejected_joint_jump": 0,
         "route_candidates_realized_by_local_replan": 0,
+        "route_candidates_missing_left_graph_path": 0,
+        "route_candidates_missing_plane_graph_path": 0,
+        "route_candidates_missing_right_graph_path": 0,
+        "route_candidates_dense_edge_path_missing": 0,
+        "route_candidates_sparse_only_graph_path": 0,
+        "route_candidates_constraint_rejected": 0,
+        "route_candidates_transition_stack_rejected": 0,
+        "route_candidates_collision_rejected": 0,
+        "route_candidates_local_connector_failed_left": 0,
+        "route_candidates_local_connector_failed_plane": 0,
+        "route_candidates_local_connector_failed_right": 0,
+        "route_candidates_local_connector_failed_transition": 0,
+        "route_candidates_local_connector_failed_certification": 0,
+        "route_candidates_local_replan_attempted": 0,
+        "route_candidates_query_connectors_used": 0,
     }
     if not has_committed_entry or not has_committed_exit:
         return None, has_committed_entry, has_committed_exit, 0, route_stats
@@ -1889,13 +2047,81 @@ def _extract_committed_route_joint(
     best_key: tuple[float, float] | None = None
     built_candidates: list[tuple[tuple[float, float], ex66.SequentialRouteCandidate]] = []
     pairs_evaluated = 0
+    local_connector_attempt_limit = 24
+
+    def record_local_rejection(stage_key: str) -> None:
+        if stage_key == ex66.LEFT_STAGE:
+            route_stats["route_candidates_local_connector_failed_left"] += 1
+        elif stage_key == ex66.PLANE_STAGE:
+            route_stats["route_candidates_local_connector_failed_plane"] += 1
+        elif stage_key == ex66.RIGHT_STAGE:
+            route_stats["route_candidates_local_connector_failed_right"] += 1
+        elif stage_key == "transition":
+            route_stats["route_candidates_local_connector_failed_transition"] += 1
+        elif stage_key == "joint_jump":
+            route_stats["route_candidates_rejected_joint_jump"] += 1
+        elif stage_key == "constraint":
+            route_stats["route_candidates_constraint_rejected"] += 1
+        elif stage_key == "collision":
+            route_stats["route_candidates_collision_rejected"] += 1
+        else:
+            route_stats["route_candidates_local_connector_failed_certification"] += 1
+
+    def maybe_add_candidate(candidate: ex66.SequentialRouteCandidate) -> None:
+        nonlocal best, best_key
+        candidate_key = _joint_route_candidate_rank_key(candidate)
+        built_candidates.append((candidate_key, candidate))
+        if best is None or best_key is None or candidate_key < best_key:
+            best = candidate
+            best_key = candidate_key
+
+    def try_query_connector(
+        entry_hyp: ex66.TransitionHypothesis,
+        exit_hyp: ex66.TransitionHypothesis,
+        left_node_path: list[int],
+        left_edge_path: list[int],
+        plane_node_path: list[int],
+        plane_edge_path: list[int],
+        right_node_path: list[int],
+        right_edge_path: list[int],
+    ) -> None:
+        if route_stats["route_candidates_local_replan_attempted"] >= local_connector_attempt_limit:
+            return
+        route_stats["route_candidates_local_replan_attempted"] += 1
+        candidate, rejection_stage, _message = _route_query_connector_candidate(
+            stores={
+                ex66.LEFT_STAGE: left_store,
+                ex66.PLANE_STAGE: plane_store,
+                ex66.RIGHT_STAGE: right_store,
+            },
+            start_node_id=start_node_id,
+            goal_node_id=goal_node_id,
+            entry_hyp=entry_hyp,
+            exit_hyp=exit_hyp,
+            left_node_path=left_node_path,
+            left_edge_path=left_edge_path,
+            plane_node_path=plane_node_path,
+            plane_edge_path=plane_edge_path,
+            right_node_path=right_node_path,
+            right_edge_path=right_edge_path,
+            robot=robot,
+            collision_fn=collision_fn,
+        )
+        if candidate is None:
+            record_local_rejection(rejection_stage)
+            return
+        route_stats["route_candidates_evaluated"] += 1
+        route_stats["route_candidates_constraint_certified"] += 1
+        route_stats["route_candidates_execution_certified"] += 1
+        route_stats["route_candidates_realized_by_local_replan"] += 1
+        route_stats["route_candidates_query_connectors_used"] += 1
+        maybe_add_candidate(candidate)
+
     for entry_hyp in entry_candidates:
         plane_dist, plane_prev_node, plane_prev_edge = ex66.shortest_paths_in_stage(plane_store, int(entry_hyp.plane_node_id))
         for exit_hyp in exit_candidates:
             pairs_evaluated += 1
             plane_exit_id = int(exit_hyp.plane_node_id)
-            if plane_exit_id not in plane_dist:
-                continue
 
             left_node_path, left_edge_path = ex66.reconstruct_stage_path(
                 left_store,
@@ -1904,13 +2130,6 @@ def _extract_committed_route_joint(
                 left_prev_node,
                 left_prev_edge,
             )
-            plane_node_path, plane_edge_path = ex66.reconstruct_stage_path(
-                plane_store,
-                int(entry_hyp.plane_node_id),
-                plane_exit_id,
-                plane_prev_node,
-                plane_prev_edge,
-            )
             right_goal_to_entry_nodes, right_goal_to_entry_edges = ex66.reconstruct_stage_path(
                 right_store,
                 goal_node_id,
@@ -1918,7 +2137,39 @@ def _extract_committed_route_joint(
                 right_prev_node,
                 right_prev_edge,
             )
-            if len(left_node_path) == 0 or len(plane_node_path) == 0 or len(right_goal_to_entry_nodes) == 0:
+            plane_node_path: list[int] = []
+            plane_edge_path: list[int] = []
+            if plane_exit_id in plane_dist:
+                plane_node_path, plane_edge_path = ex66.reconstruct_stage_path(
+                    plane_store,
+                    int(entry_hyp.plane_node_id),
+                    plane_exit_id,
+                    plane_prev_node,
+                    plane_prev_edge,
+                )
+            else:
+                route_stats["route_candidates_missing_plane_graph_path"] += 1
+            missing_graph_path = False
+            if len(left_node_path) == 0:
+                route_stats["route_candidates_missing_left_graph_path"] += 1
+                missing_graph_path = True
+            if len(plane_node_path) == 0:
+                route_stats["route_candidates_missing_plane_graph_path"] += 1
+                missing_graph_path = True
+            if len(right_goal_to_entry_nodes) == 0:
+                route_stats["route_candidates_missing_right_graph_path"] += 1
+                missing_graph_path = True
+            if missing_graph_path:
+                try_query_connector(
+                    entry_hyp,
+                    exit_hyp,
+                    left_node_path,
+                    left_edge_path,
+                    plane_node_path,
+                    plane_edge_path,
+                    list(reversed(right_goal_to_entry_nodes)) if len(right_goal_to_entry_nodes) > 0 else [],
+                    list(reversed(right_goal_to_entry_edges)) if len(right_goal_to_entry_edges) > 0 else [],
+                )
                 continue
             right_node_path = list(reversed(right_goal_to_entry_nodes))
             right_edge_path = list(reversed(right_goal_to_entry_edges))
@@ -1926,6 +2177,20 @@ def _extract_committed_route_joint(
             left_joint_path = ex66.build_stage_raw_path(left_store, left_node_path, left_edge_path)
             plane_joint_path = ex66.build_stage_raw_path(plane_store, plane_node_path, plane_edge_path)
             right_joint_path = ex66.build_stage_raw_path(right_store, right_node_path, right_edge_path)
+            if len(left_joint_path) == 0 or len(plane_joint_path) == 0 or len(right_joint_path) == 0:
+                route_stats["route_candidates_dense_edge_path_missing"] += 1
+                route_stats["route_candidates_sparse_only_graph_path"] += 1
+                try_query_connector(
+                    entry_hyp,
+                    exit_hyp,
+                    left_node_path,
+                    left_edge_path,
+                    plane_node_path,
+                    plane_edge_path,
+                    right_node_path,
+                    right_edge_path,
+                )
+                continue
             left_task_path = _build_stage_task_path(left_store, left_node_path, left_edge_path, robot)
             plane_task_path = _build_stage_task_path(plane_store, plane_node_path, plane_edge_path, robot)
             right_task_path = _build_stage_task_path(right_store, right_node_path, right_edge_path, robot)
@@ -2034,10 +2299,16 @@ def _extract_committed_route_joint(
             route_stats["route_candidates_evaluated"] += 1
             if bool(certification["constraint_certified"]):
                 route_stats["route_candidates_constraint_certified"] += 1
+            else:
+                route_stats["route_candidates_constraint_rejected"] += 1
             if bool(execution_certified):
                 route_stats["route_candidates_execution_certified"] += 1
             elif bool(certification["constraint_certified"]) and not bool(certification["joint_continuity_certified"]):
                 route_stats["route_candidates_rejected_joint_jump"] += 1
+            if not bool(transition_stack_certified):
+                route_stats["route_candidates_transition_stack_rejected"] += 1
+            if not bool(certification["collision_free"]):
+                route_stats["route_candidates_collision_rejected"] += 1
 
             total_cost = ex66.path_cost(raw_path)
             dense_message = str(certification["message"])
@@ -2084,11 +2355,18 @@ def _extract_committed_route_joint(
                 max_transition_stack_residual=float(max_transition_stack_residual),
                 transition_stack_certified=bool(transition_stack_certified),
             )
-            candidate_key = _joint_route_candidate_rank_key(candidate)
-            built_candidates.append((candidate_key, candidate))
-            if best is None or best_key is None or candidate_key < best_key:
-                best = candidate
-                best_key = candidate_key
+            maybe_add_candidate(candidate)
+            if not bool(execution_certified):
+                try_query_connector(
+                    entry_hyp,
+                    exit_hyp,
+                    left_node_path,
+                    left_edge_path,
+                    plane_node_path,
+                    plane_edge_path,
+                    right_node_path,
+                    right_edge_path,
+                )
     if best is not None:
         best.alternative_candidates = [candidate for _key, candidate in sorted(built_candidates, key=lambda item: item[0])]
     return best, has_committed_entry, has_committed_exit, pairs_evaluated, route_stats
@@ -2100,25 +2378,36 @@ def _realize_best_candidate_after_selection(
     robot,
     collision_fn=None,
 ) -> tuple[ex66.SequentialRouteCandidate, dict[str, int], str]:
-    """Return the route assembled from stored dense joint-space graph edges.
+    """Attach final-route provenance without changing the dense theta path."""
 
-    The thesis-facing robot demo must execute the configuration-space planner's
-    own dense theta path. We therefore do not rebuild execution from selected
-    task-space transition points here. Any post-selection local replan would be
-    a different planner product and must be reported separately, not silently
-    substituted for the graph route.
-    """
+    if "query_connectors" in str(candidate.dense_joint_path_message):
+        stats = {
+            "final_route_realization_selected_transition_local_replan": 1,
+            "graph_route_used_for_execution": 0,
+            "final_route_projected_jointspace_edges": 3,
+            "final_route_query_connectors": 3,
+            "final_route_taskspace_edges": 0,
+        }
+        message = (
+            f"{candidate.dense_joint_path_message}; "
+            "final_route_taskspace_edges=0"
+        )
+        candidate.dense_joint_path_message = message
+        return candidate, stats, message
+
     stats = {
-        "route_candidates_realized_by_local_replan": 0,
         "final_route_realization_selected_transition_local_replan": 0,
         "graph_route_used_for_execution": 1,
-        "route_candidates_local_replan_attempted": 0,
+        "final_route_projected_jointspace_edges": 0,
+        "final_route_query_connectors": 0,
+        "final_route_taskspace_edges": 0,
     }
     message = (
         "final_route_realization=stored_dense_joint_edges; "
         "graph_route_used_for_execution=True; "
         "execution_path_source=stored_dense_joint_edges; "
-        f"{candidate.dense_joint_path_message}"
+        f"{candidate.dense_joint_path_message}; "
+        "final_route_taskspace_edges=0"
     )
     candidate.dense_joint_path_message = message
     return candidate, stats, message
@@ -2710,6 +2999,7 @@ def plan_fixed_manifold_multimodal_route_jointspace(
             + len(best_candidate.plane_edge_path)
             + len(best_candidate.right_edge_path)
         )
+        success = bool(best_candidate.dense_joint_path_execution_certified)
 
     total_evidence_nodes = sum(len(stores[stage].graph.nodes) for stage in ex66.STAGES)
     committed_node_count = sum(len(committed_nodes[stage]) for stage in ex66.STAGES)

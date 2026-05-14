@@ -1,0 +1,37 @@
+warning: in the working copy of 'examples/continuous_transfer_family.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'examples/continuous_transfer_robot_pyvista_demo.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'examples/three_dof_robot_pyvista_demo.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/primitive_manifold_planner/examplesupport/intrinsic_multimodal_helpers.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/primitive_manifold_planner/examplesupport/jointspace_planner_utils.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/primitive_manifold_planner/examplesupport/spatial_robot.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/primitive_manifold_planner/manifolds/robot.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/primitive_manifold_planner/projection/newton.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/primitive_manifold_planner/thesis/jointspace_helpers.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/primitive_manifold_planner/thesis/jointspace_method/certification.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/primitive_manifold_planner/thesis/jointspace_method/continuation.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/primitive_manifold_planner/thesis/jointspace_method/debug_artifacts.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/primitive_manifold_planner/thesis/jointspace_method/modes.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/primitive_manifold_planner/thesis/jointspace_method/route.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/primitive_manifold_planner/thesis/jointspace_method/transitions.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/primitive_manifold_planner/thesis/parallel_evidence_planner.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/primitive_manifold_planner/visualization/cspace_robot.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/primitive_manifold_planner/visualization/robot.py', LF will be replaced by CRLF the next time Git touches it
+ examples/continuous_transfer_family.py             |   11 [32m+[m
+ examples/continuous_transfer_robot_pyvista_demo.py |  435 [32m+++++++[m[31m-[m
+ examples/three_dof_robot_pyvista_demo.py           |  268 [32m++++[m[31m-[m
+ .../examplesupport/intrinsic_multimodal_helpers.py |   26 [32m+[m
+ .../examplesupport/jointspace_planner_utils.py     |   35 [32m+[m
+ .../examplesupport/spatial_robot.py                |   13 [32m+[m[31m-[m
+ src/primitive_manifold_planner/manifolds/robot.py  |  133 [32m++[m[31m-[m
+ .../projection/newton.py                           |   23 [32m+[m[31m-[m
+ .../thesis/jointspace_helpers.py                   |  340 [32m+++++[m[31m-[m
+ .../thesis/jointspace_method/certification.py      |   32 [32m+[m[31m-[m
+ .../thesis/jointspace_method/continuation.py       |   12 [32m+[m[31m-[m
+ .../thesis/jointspace_method/debug_artifacts.py    |   18 [32m+[m[31m-[m
+ .../thesis/jointspace_method/modes.py              |    3 [32m+[m
+ .../thesis/jointspace_method/route.py              |    8 [32m+[m[31m-[m
+ .../thesis/jointspace_method/transitions.py        |   22 [32m+[m[31m-[m
+ .../thesis/parallel_evidence_planner.py            |   79 [32m+[m[31m-[m
+ .../visualization/cspace_robot.py                  | 1105 [32m++++++++++++++++++[m[31m--[m
+ .../visualization/robot.py                         |   29 [32m+[m[31m-[m
+ 18 files changed, 2366 insertions(+), 226 deletions(-)

@@ -52,7 +52,7 @@ from primitive_manifold_planner.experiments.continuous_transfer.config import DE
 from primitive_manifold_planner.experiments.continuous_transfer.family_definition import plane_leaf_patch
 from primitive_manifold_planner.manifolds.robot import RobotPlaneManifold, RobotSphereManifold
 from primitive_manifold_planner.visualization import add_manifold, add_points, pyvista_available
-from primitive_manifold_planner.visualization.cspace_robot import show_cspace_robot_planning
+from primitive_manifold_planner.visualization.cspace_robot import show_cspace_robot_planning, suppress_native_output
 from primitive_manifold_planner.visualization.robot import (
     add_robot_pedestal,
     make_robot_actor_bundle,
@@ -143,11 +143,14 @@ class RobotPlaneLeafManifold(RobotPlaneManifold):
         )
 
     def infer_lambda(self, theta: np.ndarray) -> float:
+        # Lambda is inferred from FK(theta), but the active leaf itself is fixed.
         return float(self.transfer_family.infer_lambda(end_effector_point(self.robot, theta)))
 
 
 @dataclass
 class JointspaceRouteRealization:
+    """Certified dense theta route for one selected continuous-transfer leaf."""
+
     success: bool
     dense_joint_path: np.ndarray
     stage_labels: list[str]
@@ -333,6 +336,17 @@ class FullJointspaceRouteCandidate:
     selected_lambda: float
     score: float
     lambda_reconciliation: str
+
+
+@dataclass
+class RankedRouteCandidate:
+    """Certified route candidate retained for optional rank-based selection."""
+
+    rank: int
+    candidate: FullJointspaceRouteCandidate
+    realization: JointspaceRouteRealization
+    lambda_reconciliation: str
+    summary: dict[str, object]
 
 
 @dataclass
@@ -1400,6 +1414,8 @@ def realize_selected_continuous_transfer_route_jointspace(
     joint_max_step: float,
     obstacles=None,
 ) -> tuple[JointspaceRouteRealization, dict[str, object]]:
+    """Realize selected task-space entry/exit/lambda as local theta segments."""
+
     manifolds = build_robot_manifolds_for_selected_lambda(robot, families, float(selected_lambda))
     collision_fn = None
     if obstacles:
@@ -1417,6 +1433,7 @@ def realize_selected_continuous_transfer_route_jointspace(
         collision_fn=collision_fn,
     )
     segment_messages["start_ik"] = msg
+    # Entry/exit handoffs are transition configurations shared by adjacent manifolds.
     q_entry, msg = _solve_shared_task_handoff(
         robot=robot,
         target_task=selected_entry_point,
@@ -1546,6 +1563,7 @@ def realize_selected_continuous_transfer_route_jointspace(
             manifolds,
         )
 
+    # Dense joint path is assembled from left, fixed lambda leaf, and right segments.
     dense_joint_path, labels = _concatenate_labeled_segments(
         [(LEFT_STAGE, left_path), (FAMILY_STAGE, family_path), (RIGHT_STAGE, right_path)]
     )
@@ -1557,6 +1575,7 @@ def realize_selected_continuous_transfer_route_jointspace(
         joint_max_step=float(joint_max_step),
         collision_fn=collision_fn,
     )
+    # Task path is derived as FK(dense theta path) for display/debug.
     task_path = joint_path_to_task_path(robot, dense_joint_path)
     message = (
         "selected-lambda joint-space local replan certified"
@@ -1593,6 +1612,113 @@ def _task_route_length(points: list[np.ndarray]) -> float:
             for a, b in zip(points[:-1], points[1:])
         )
     )
+
+
+def _route_realization_task_length(realization: JointspaceRouteRealization) -> float:
+    task_path = np.asarray(realization.task_path, dtype=float)
+    if len(task_path) < 2:
+        return 0.0
+    return float(np.sum(np.linalg.norm(np.diff(task_path, axis=0), axis=1)))
+
+
+def _route_realization_joint_length(realization: JointspaceRouteRealization) -> float:
+    steps = np.asarray(realization.joint_steps, dtype=float)
+    if len(steps) > 0:
+        return float(np.sum(steps))
+    q_path = np.asarray(realization.dense_joint_path, dtype=float)
+    if len(q_path) < 2:
+        return 0.0
+    return float(np.sum(np.linalg.norm(np.diff(q_path, axis=0), axis=1)))
+
+
+def _route_candidate_certified(realization: JointspaceRouteRealization) -> bool:
+    return bool(
+        realization.success
+        and realization.transition_stack_certified
+        and realization.lambda_fixed_during_transfer
+        and realization.final_route_taskspace_edges == 0
+        and realization.collision_free
+        and realization.max_constraint_residual <= 2.0e-3
+        and realization.max_joint_step < float("inf")
+    )
+
+
+def _ranked_route_summary(
+    *,
+    rank: int,
+    candidate: FullJointspaceRouteCandidate,
+    realization: JointspaceRouteRealization,
+    lambda_reconciliation: str,
+) -> dict[str, object]:
+    segment_source = (
+        f"left={realization.left_segment_source}; "
+        f"family={realization.family_segment_source}; "
+        f"right={realization.right_segment_source}"
+    )
+    return {
+        "rank": int(rank),
+        "selected_lambda": float(candidate.selected_lambda),
+        "route_score": float(candidate.score),
+        "route_cost": float(candidate.score),
+        "joint_path_length": float(_route_realization_joint_length(realization)),
+        "task_fk_path_length": float(_route_realization_task_length(realization)),
+        "dense_theta_points": int(len(realization.dense_joint_path)),
+        "max_constraint_residual": float(realization.max_constraint_residual),
+        "max_joint_step": float(realization.max_joint_step),
+        "transition_stack_residual": float(realization.max_transition_stack_residual),
+        "lambda_fixed_during_transfer": bool(realization.lambda_fixed_during_transfer),
+        "entry_transition_index": int(realization.selected_left_family_transition_index),
+        "exit_transition_index": int(realization.selected_family_right_transition_index),
+        "entry_transition_node_id": int(candidate.entry.source_node_id),
+        "exit_transition_node_id": int(candidate.exit.target_node_id),
+        "segment_source_summary": segment_source,
+        "lambda_reconciliation": str(lambda_reconciliation),
+        "certified": bool(_route_candidate_certified(realization)),
+    }
+
+
+def _print_route_candidate_table(summaries: list[dict[str, object]]) -> None:
+    print("\n=== Ranked certified route candidates ===")
+    if len(summaries) == 0:
+        print("No certified route candidates available.")
+        return
+    headers = [
+        "rank",
+        "lambda",
+        "score",
+        "joint_len",
+        "task_len",
+        "points",
+        "max_res",
+        "max_step",
+        "stack_res",
+        "lambda_fixed",
+        "entry_idx",
+        "exit_idx",
+        "certified",
+    ]
+    print(" | ".join(headers))
+    for item in summaries:
+        print(
+            " | ".join(
+                [
+                    str(item["rank"]),
+                    f"{float(item['selected_lambda']):.6g}",
+                    f"{float(item['route_score']):.6g}",
+                    f"{float(item['joint_path_length']):.6g}",
+                    f"{float(item['task_fk_path_length']):.6g}",
+                    str(item["dense_theta_points"]),
+                    f"{float(item['max_constraint_residual']):.3g}",
+                    f"{float(item['max_joint_step']):.3g}",
+                    f"{float(item['transition_stack_residual']):.3g}",
+                    str(bool(item["lambda_fixed_during_transfer"])),
+                    str(item["entry_transition_index"]),
+                    str(item["exit_transition_index"]),
+                    str(bool(item["certified"])),
+                ]
+            )
+        )
+        print(f"    sources: {item['segment_source_summary']}")
 
 
 def _build_full_jointspace_route_candidates(
@@ -2570,6 +2696,7 @@ def plan_continuous_transfer_jointspace_robot(*, scene_description, seed: int, j
         if result.selected_lambda is not None
         else float(scene.transfer_family.nominal_lambda)
     )
+    # Selected-lambda mode uses task-space family planning only to choose lambda/entry/exit.
     entry = np.asarray(result.selected_entry_point, dtype=float)
     exit_point = np.asarray(result.selected_exit_point, dtype=float)
     if entry.size != 3 or exit_point.size != 3 or not bool(result.success):
@@ -2599,6 +2726,7 @@ def plan_continuous_transfer_jointspace_robot(*, scene_description, seed: int, j
     )
 
     if realization.success:
+        # Store the certified dense theta route on the result; FK trace is derived below.
         result.dense_joint_path = np.asarray(realization.dense_joint_path, dtype=float)
         result.dense_joint_path_stage_labels = list(realization.stage_labels)
         result.dense_joint_path_constraint_residuals = np.asarray(realization.residuals, dtype=float)
@@ -2619,6 +2747,7 @@ def plan_continuous_transfer_jointspace_robot(*, scene_description, seed: int, j
 
     robot_execution = None
     if len(realization.dense_joint_path) > 0:
+        # Robot execution and visualization are driven by theta states, not IK waypoints.
         task_path = joint_path_to_task_path(robot, realization.dense_joint_path)
         robot_execution = RobotExecutionResult(
             target_task_points_3d=np.asarray(task_path, dtype=float),
@@ -2744,6 +2873,7 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
     )
     scene_lambdas = _scene_candidate_lambdas(scene_description, scene.transfer_family)
 
+    # Seed left/right stores from task endpoints, then continue in joint space.
     q_start = inverse_kinematics_start(robot, scene.start_q, tol=8.0e-2)
     q_goal = inverse_kinematics_start(robot, scene.goal_q, warm_start=q_start, tol=8.0e-2)
     if q_start is not None:
@@ -2769,6 +2899,7 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
         active_guides = []
         for store in evidence.family_leaf_stores.values():
             active_guides.extend(store.nodes[-2:])
+        # Full joint-space mode proposes theta states and projects them to supports/leaves.
         proposals = generate_joint_proposals(
             round_idx,
             start_seed,
@@ -2789,6 +2920,7 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
             )
 
     entry_transitions, exit_transitions, transition_diagnostics = discover_full_jointspace_transitions(
+        # Transition discovery is done in joint space across fixed lambda leaves.
         evidence=evidence,
         robot=robot,
         max_pairs_per_leaf=4,
@@ -2804,7 +2936,13 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
     lambda_reconciliation = "failed"
     route_candidates_rejected_local_replan = 0
     failure_reason = ""
-    max_candidates_to_try = min(len(route_candidates), max(5, int(planner_kwargs.get("top_k_paths", 1)) * 8))
+    requested_route_rank = max(0, int(planner_kwargs.get("route_rank", 0)))
+    list_route_candidates = bool(planner_kwargs.get("list_route_candidates", False))
+    top_k_paths = max(1, int(planner_kwargs.get("top_k_paths", 1)))
+    certified_to_keep = max(top_k_paths, requested_route_rank + 1)
+    max_candidates_to_try = min(len(route_candidates), max(5, certified_to_keep * 8))
+    ranked_candidates: list[RankedRouteCandidate] = []
+    selected_rank = -1
     if q_start is None or q_goal is None:
         failure_reason = "start or goal IK/projected joint state unavailable"
     elif len(route_candidates) == 0:
@@ -2830,11 +2968,46 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
             )
             route_realization = realization
             lambda_reconciliation = reconciliation
-            if realization.success:
-                selected_candidate = candidate
-                break
-            route_candidates_rejected_local_replan += 1
-            failure_reason = realization.message
+            if _route_candidate_certified(realization):
+                summary = _ranked_route_summary(
+                    rank=len(ranked_candidates),
+                    candidate=candidate,
+                    realization=realization,
+                    lambda_reconciliation=reconciliation,
+                )
+                ranked_candidates.append(
+                    RankedRouteCandidate(
+                        rank=len(ranked_candidates),
+                        candidate=candidate,
+                        realization=realization,
+                        lambda_reconciliation=reconciliation,
+                        summary=summary,
+                    )
+                )
+                if len(ranked_candidates) >= certified_to_keep:
+                    break
+            else:
+                route_candidates_rejected_local_replan += 1
+                failure_reason = realization.message
+    if len(ranked_candidates) > 0:
+        selected_rank = requested_route_rank
+        if requested_route_rank >= len(ranked_candidates):
+            available_max = len(ranked_candidates) - 1
+            print(
+                f"Requested route rank {requested_route_rank} unavailable; "
+                f"available certified route ranks: 0..{available_max}. Falling back to rank 0.",
+                flush=True,
+            )
+            selected_rank = 0
+        selected_ranked = ranked_candidates[selected_rank]
+        route_realization = selected_ranked.realization
+        selected_candidate = selected_ranked.candidate
+        lambda_reconciliation = selected_ranked.lambda_reconciliation
+    elif len(route_candidates) > 0 and not failure_reason:
+        failure_reason = "no certified dense joint route candidate passed strict checks"
+    route_candidate_summaries = [dict(item.summary) for item in ranked_candidates]
+    if list_route_candidates:
+        _print_route_candidate_table(route_candidate_summaries)
     route_success = bool(route_realization is not None and route_realization.success and selected_candidate is not None)
     full_graph_success = bool(
         route_success
@@ -2871,6 +3044,7 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
     display_vs_trace_max_error = float("inf")
     display_vs_trace_mean_error = float("inf")
     if route_success and route_realization is not None:
+        # Final route is a certified dense joint route; task path is FK(theta).
         task_path = joint_path_to_task_path(robot, route_realization.dense_joint_path)
         robot_execution = RobotExecutionResult(
             target_task_points_3d=np.asarray(task_path, dtype=float),
@@ -3020,6 +3194,11 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
         visualization_result = SimpleNamespace(
             success=True,
             full_jointspace_exploration=True,
+            selected_route_rank=int(selected_rank),
+            available_certified_route_candidates=int(len(ranked_candidates)),
+            route_candidates_ranked=list(ranked_candidates),
+            top_route_candidates=list(ranked_candidates),
+            route_candidates_summary=list(route_candidate_summaries),
             selected_lambda_for_realization=float(selected_candidate.selected_lambda),
             selected_lambda=float(selected_candidate.selected_lambda),
             active_family_lambdas=np.asarray(active_lambdas, dtype=float),
@@ -3144,6 +3323,9 @@ def plan_full_jointspace_continuous_transfer_evidence_scaffold(
             "route_candidates_built": int(route_counters.get("route_candidates_built", 0)),
             "route_candidates_rejected_lambda_mismatch": int(route_counters.get("route_candidates_rejected_lambda_mismatch", 0)),
             "route_candidates_rejected_local_replan": int(route_candidates_rejected_local_replan),
+            "selected_route_rank": int(selected_rank),
+            "available_certified_route_candidates": int(len(ranked_candidates)),
+            "selected_route_cost": None if selected_rank < 0 or selected_rank >= len(route_candidate_summaries) else float(route_candidate_summaries[selected_rank]["route_cost"]),
             "selected_lambda": None if selected_candidate is None else round(float(selected_candidate.selected_lambda), 6),
             "lambda_match_tol": None if route_realization is None else float(route_realization.lambda_match_tol),
             "selected_lambda_family_nodes": 0 if route_realization is None else int(route_realization.selected_lambda_family_nodes),
@@ -3279,6 +3461,16 @@ def _cspace_manifolds_for_result(scene, robot, result):
     return manifolds, selected_lambda
 
 
+def _has_certified_dense_joint_path(result) -> bool:
+    theta_path = np.asarray(getattr(result, "dense_joint_path", np.zeros((0, 3), dtype=float)), dtype=float)
+    return bool(
+        theta_path.ndim == 2
+        and theta_path.shape[1] == 3
+        and len(theta_path) >= 2
+        and bool(getattr(result, "dense_joint_path_execution_certified", False))
+    )
+
+
 def _stage_residual_audit(
     theta_path: np.ndarray,
     labels: list[str],
@@ -3371,6 +3563,9 @@ def compute_ex65_jointspace_audit(scene, result, robot, robot_execution) -> dict
         "family_stage_max_residual": float(max(stage_residuals[FAMILY_STAGE])) if stage_residuals[FAMILY_STAGE] else 0.0,
         "right_stage_max_residual": float(max(stage_residuals[RIGHT_STAGE])) if stage_residuals[RIGHT_STAGE] else 0.0,
         "stage_order_valid": bool(_stage_order_valid(labels)),
+        "selected_route_rank": int(getattr(result, "selected_route_rank", -1)),
+        "available_certified_route_candidates": int(getattr(result, "available_certified_route_candidates", 0)),
+        "route_candidates_summary": list(getattr(result, "route_candidates_summary", []) or []),
         "selected_lambda": float(selected_lambda),
         "family_lambda_min": float(family_lambda_min),
         "family_lambda_max": float(family_lambda_max),
@@ -3455,6 +3650,8 @@ def print_ex65_jointspace_audits(audit: dict[str, object]) -> None:
             "visual_trace_source": audit["visual_trace_source"],
             "graph_route_used_for_execution": audit["graph_route_used_for_execution"],
             "route_realization_source": audit["route_realization_source"],
+            "selected_route_rank": audit["selected_route_rank"],
+            "available_certified_route_candidates": audit["available_certified_route_candidates"],
             "dense_theta_points": audit["theta_path_points"],
             "dense_joint_path_execution_certified": audit["dense_joint_path_execution_certified"],
             "final_route_taskspace_edges": audit["final_route_taskspace_edges"],
@@ -3536,10 +3733,12 @@ def save_ex65_cspace_debug_artifacts(audit: dict[str, object], *, output_root: P
     labels = list(audit["stage_labels"])
     lambda_labels = np.asarray(audit["lambda_labels"], dtype=float)
 
+    # Dense theta path is the source of truth; FK trace is derived visualization data.
     np.save(base / "dense_theta_path.npy", theta_path)
     np.save(base / "dense_fk_trace.npy", fk_trace)
     np.save(base / "constraint_residuals.npy", residuals)
     np.save(base / "joint_steps.npy", joint_steps)
+    # Lambda labels certify the fixed lambda leaf used during transfer.
     np.save(base / "dense_lambda_labels.npy", lambda_labels)
     (base / "dense_stage_labels.txt").write_text("\n".join(labels), encoding="utf-8")
     (base / "dense_stage_labels.json").write_text(json.dumps(labels, indent=2), encoding="utf-8")
@@ -3551,6 +3750,8 @@ def save_ex65_cspace_debug_artifacts(audit: dict[str, object], *, output_root: P
         "planning_space": audit["planning_space"],
         "state_variable": audit["state_variable"],
         "family_state": audit["family_state"],
+        "selected_route_rank": audit["selected_route_rank"],
+        "available_candidate_count": audit["available_certified_route_candidates"],
         "selected_lambda": audit["selected_lambda"],
         "lambda_fixed_during_transfer": audit["lambda_fixed_during_transfer"],
         "lambda_variation_transfer": audit["lambda_variation_transfer"],
@@ -3596,6 +3797,17 @@ def save_ex65_cspace_debug_artifacts(audit: dict[str, object], *, output_root: P
         "total_task_fk_path_length": audit["total_task_fk_path_length"],
     }
     (base / "cspace_summary.json").write_text(json.dumps(_json_safe(summary), indent=2), encoding="utf-8")
+    route_summaries = list(audit.get("route_candidates_summary", []) or [])
+    (base / "route_candidates_summary.json").write_text(
+        json.dumps(_json_safe(route_summaries), indent=2),
+        encoding="utf-8",
+    )
+    if len(route_summaries) > 0:
+        headers = list(route_summaries[0].keys())
+        rows = [",".join(headers)]
+        for item in route_summaries:
+            rows.append(",".join(str(item.get(header, "")).replace(",", ";") for header in headers))
+        (base / "route_candidates_summary.csv").write_text("\n".join(rows), encoding="utf-8")
     (base / "family_graph_route_node_ids.json").write_text(
         json.dumps(_json_safe(audit.get("family_graph_route_node_ids", [])), indent=2),
         encoding="utf-8",
@@ -3750,6 +3962,8 @@ def show_continuous_transfer_robot_demo(
     show_family_leaves: bool = True,
     num_family_leaf_surfaces: int = 9,
 ) -> bool:
+    """Visualize evidence, selected leaf, and robot replay for Example 65."""
+
     if pv is None or not pyvista_available():
         print("PyVista is not available; skipping continuous-transfer robot visualization.")
         return False
@@ -3768,6 +3982,7 @@ def show_continuous_transfer_robot_demo(
     )
     family_leaf = transfer_family.manifold(float(selected_lambda))
 
+    # PyVista scene shows task-space supports plus FK-derived route/trace.
     plotter = pv.Plotter(window_size=(1440, 920))
     if hasattr(plotter, "set_background"):
         plotter.set_background("#edf3f8", top="#ffffff")
@@ -3823,6 +4038,7 @@ def show_continuous_transfer_robot_demo(
         for lam in representative_lambdas:
             if abs(float(lam) - float(selected_lambda)) <= 1.0e-4:
                 continue
+            # Neighbor leaves visualize the continuous family around the selected lambda.
             corners = plane_leaf_patch(transfer_family, float(lam))
             patch = pv.PolyData(corners, faces=np.hstack([[4, 0, 1, 2, 3]]))
             actor = plotter.add_mesh(
@@ -3837,6 +4053,7 @@ def show_continuous_transfer_robot_demo(
             if actor is not None:
                 actor_groups["Manifolds"].append(actor)
 
+    # Highlight the fixed lambda leaf selected for transfer.
     leaf_corners = plane_leaf_patch(transfer_family, float(selected_lambda))
     leaf_patch = pv.PolyData(leaf_corners, faces=np.hstack([[4, 0, 1, 2, 3]]))
     actor = plotter.add_mesh(
@@ -3859,6 +4076,7 @@ def show_continuous_transfer_robot_demo(
             "right": "#a5d6a7",
         }
         for mode, edges in getattr(result, "explored_edges_by_mode", {}).items():
+            # Evidence edges are shown in task space through FK for readability.
             poly = build_segment_polydata(edges)
             if poly is None:
                 continue
@@ -3917,6 +4135,7 @@ def show_continuous_transfer_robot_demo(
 
     final_route = np.asarray(result.path, dtype=float)
     if len(final_route) >= 2:
+        # result.path is FK(result.dense_joint_path) for joint-space thesis runs.
         actor = plotter.add_mesh(
             pv.lines_from_points(final_route),
             color="#d32f2f",
@@ -3947,6 +4166,7 @@ def show_continuous_transfer_robot_demo(
     trace_actor = {"actor": None}
 
     def replace_trace(points: np.ndarray) -> None:
+        # End-effector trace is accumulated from FK of replayed theta states.
         if trace_actor["actor"] is not None:
             plotter.remove_actor(trace_actor["actor"], render=False)
         pts = np.asarray(points, dtype=float)
@@ -3983,6 +4203,7 @@ def show_continuous_transfer_robot_demo(
         if robot_execution is None or not robot_execution.animation_enabled or not animation_state["playing"]:
             return
         idx = min(int(animation_state["frame"]), len(robot_execution.joint_path) - 1)
+        # Robot mesh is animated from theta, not from an independent task-space curve.
         update_robot_actor_bundle(plotter, robot, robot_bundle, robot_execution.joint_path[idx])
         animation_state["trace"].append(np.asarray(robot_execution.end_effector_points_3d[idx], dtype=float))
         replace_trace(np.asarray(animation_state["trace"], dtype=float))
@@ -4015,14 +4236,18 @@ def show_continuous_transfer_robot_demo(
         (0.0, 0.0, 1.0),
     ]
     reset_animation()
-    plotter.show(auto_close=False, interactive_update=True)
+    vtk_log = "outputs/vtk_warnings.log"
+    with suppress_native_output(True, vtk_log):
+        plotter.show(auto_close=False, interactive_update=True)
     if robot_execution is not None and robot_execution.animation_enabled:
         play_animation()
     try:
-        plotter.app.exec()
+        with suppress_native_output(True, vtk_log):
+            plotter.app.exec()
     except Exception:
         try:
-            plotter.show()
+            with suppress_native_output(True, vtk_log):
+                plotter.show()
         except Exception:
             pass
     return True
@@ -4031,6 +4256,7 @@ def show_continuous_transfer_robot_demo(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Continuous-transfer planner with 3DOF robot execution.")
     mode = parser.add_mutually_exclusive_group()
+    # Default mode is thesis-facing joint-space realization; task-space IK is legacy/debug.
     mode.add_argument(
         "--legacy-taskspace-ik-demo",
         "--taskspace-planning",
@@ -4055,6 +4281,8 @@ def main() -> None:
     parser.add_argument("--stop-after-first-solution", action="store_true")
     parser.add_argument("--top-k", type=int, default=3)
     parser.add_argument("--top-k-paths", type=int, default=1)
+    parser.add_argument("--route-rank", type=int, default=0, help="Certified route candidate rank to execute/visualize; 0 is best.")
+    parser.add_argument("--list-route-candidates", action="store_true", help="Print ranked certified route candidates before visualization.")
     parser.add_argument("--obstacle-profile", type=str, default="none")
     parser.add_argument("--max-cartesian-step", type=float, default=0.025)
     parser.add_argument("--joint-max-step", type=float, default=0.12)
@@ -4077,9 +4305,91 @@ def main() -> None:
     parser.add_argument("--num-family-leaf-surfaces", type=int, default=9)
     parser.add_argument("--save-cspace-debug", action="store_true", help="Save Example 65 dense theta/lambda audit artifacts.")
     parser.add_argument("--show-cspace", action="store_true", help="Show/save the theta-space constraint surface view for full joint-space mode.")
-    parser.add_argument("--cspace-grid-res", type=int, default=55, help="Grid resolution for C-space implicit surfaces.")
+    parser.add_argument("--cspace-grid-res", type=int, default=65, help="Grid resolution for C-space implicit surfaces.")
+    parser.add_argument("--cspace-no-surfaces", action="store_true", help="Show the C-space theta route without implicit surfaces.")
+    parser.add_argument("--cspace-route-only", action="store_true", help="Show only dense theta route, stage segments, and exact transition markers.")
+    parser.add_argument("--cspace-marker-scale", type=float, default=0.35, help="Scale C-space start/goal/transition marker sizes.")
+    parser.add_argument("--cspace-opacity", type=float, default=0.28, help="Opacity for full C-space isosurface meshes.")
+    parser.add_argument("--cspace-left-opacity", type=float, default=None, help="Opacity for the left C-space surface.")
+    parser.add_argument("--cspace-middle-opacity", type=float, default=None, help="Opacity for the middle family/plane C-space surface.")
+    parser.add_argument("--cspace-right-opacity", type=float, default=None, help="Opacity for the right C-space surface.")
+    parser.add_argument("--cspace-middle-color", type=str, default=None, help="Color for the middle family/plane C-space surface.")
+    parser.add_argument("--cspace-force-middle-sheet", action="store_true", help="Always draw a route-local cyan middle sheet for presentation clarity.")
+    cspace_smoothing_group = parser.add_mutually_exclusive_group()
+    cspace_smoothing_group.add_argument("--cspace-smooth-surfaces", dest="cspace_smooth_surfaces", action="store_true", default=True)
+    cspace_smoothing_group.add_argument("--cspace-no-smooth-surfaces", dest="cspace_smooth_surfaces", action="store_false")
+    cspace_render_group = parser.add_mutually_exclusive_group()
+    cspace_render_group.add_argument(
+        "--cspace-safe-render",
+        dest="cspace_safe_render",
+        action="store_true",
+        default=True,
+        help="Use conservative C-space rendering; this is the default.",
+    )
+    cspace_render_group.add_argument(
+        "--cspace-fancy-render",
+        dest="cspace_safe_render",
+        action="store_false",
+        help="Allow prettier C-space rendering options that may trigger GPU/VTK shader warnings.",
+    )
+    vtk_warning_group = parser.add_mutually_exclusive_group()
+    vtk_warning_group.add_argument(
+        "--suppress-vtk-warnings",
+        dest="suppress_vtk_warnings",
+        action="store_true",
+        default=True,
+        help="Suppress VTK/OpenGL warning spam from the C-space renderer; this is the default.",
+    )
+    vtk_warning_group.add_argument(
+        "--show-vtk-warnings",
+        dest="suppress_vtk_warnings",
+        action="store_false",
+        help="Let VTK/OpenGL warnings print to the terminal.",
+    )
+    parser.add_argument(
+        "--vtk-output-log",
+        type=str,
+        default="outputs/vtk_warnings.log",
+        help="File for redirected native VTK/OpenGL stdout/stderr; use 'null' to discard.",
+    )
+    parser.add_argument(
+        "--cspace-surface-mode",
+        choices=("full", "solid-safe", "route-only", "fallback"),
+        default="full",
+        help="C-space surface mode: full transparent surfaces, solid-safe opaque surfaces, route-only, or fallback context.",
+    )
+    cspace_surface_aliases = parser.add_mutually_exclusive_group()
+    cspace_surface_aliases.add_argument(
+        "--cspace-exact-surfaces",
+        dest="cspace_exact_surfaces_alias",
+        action="store_true",
+        default=None,
+        help="Render actual zero-level-set C-space surfaces for left, selected lambda family leaf, and right.",
+    )
+    cspace_surface_aliases.add_argument(
+        "--cspace-approx-surfaces",
+        dest="cspace_exact_surfaces_alias",
+        action="store_false",
+        help="Use the lightweight point/context surface style instead of exact isosurfaces.",
+    )
+    parser.add_argument(
+        "--cspace-surface-style",
+        choices=("points-outline", "points", "wireframe", "contour"),
+        default="points-outline",
+        help="Surface context style for C-space views.",
+    )
+    cspace_view_group = parser.add_mutually_exclusive_group()
+    cspace_view_group.add_argument("--cspace-clean-view", dest="cspace_clean_view", action="store_true", default=True)
+    cspace_view_group.add_argument("--cspace-box-view", dest="cspace_clean_view", action="store_false")
+    cspace_quality = parser.add_mutually_exclusive_group()
+    cspace_quality.add_argument("--cspace-lightweight", dest="cspace_lightweight", action="store_true", default=True)
+    cspace_quality.add_argument("--cspace-full-surfaces", dest="cspace_lightweight", action="store_false")
     parser.add_argument("--no-viz", action="store_true")
     args = parser.parse_args()
+    if args.cspace_exact_surfaces_alias is True:
+        args.cspace_surface_mode = "full"
+    elif args.cspace_exact_surfaces_alias is False:
+        args.cspace_surface_mode = "fallback"
 
     if args.taskspace_planning:
         args.jointspace_planning = False
@@ -4098,6 +4408,7 @@ def main() -> None:
     if args.jointspace_planning:
         scene_description = default_example_65_scene_description(obstacle_profile=args.obstacle_profile)
         if args.full_jointspace_exploration:
+            # Full mode explores supports, fixed lambda leaves, and transitions in theta space.
             scene, result, robot, robot_execution = plan_full_jointspace_continuous_transfer_evidence_scaffold(
                 scene_description=scene_description,
                 seed=int(args.seed),
@@ -4107,11 +4418,14 @@ def main() -> None:
                 max_extra_rounds_after_first_solution=args.extra_rounds_after_first_solution,
                 top_k_assignments=args.top_k,
                 top_k_paths=args.top_k_paths,
+                route_rank=args.route_rank,
+                list_route_candidates=bool(args.list_route_candidates),
                 obstacle_profile=args.obstacle_profile,
                 allow_family_local_continuation_fallback=bool(args.allow_family_local_continuation_fallback),
                 allow_closure_local_continuation_fallback=bool(args.allow_closure_local_continuation_fallback),
             )
         else:
+            # Selected-lambda mode realizes the task-space-selected family leaf in theta space.
             scene, result, robot, robot_execution = plan_continuous_transfer_jointspace_robot(
                 scene_description=scene_description,
                 seed=int(args.seed),
@@ -4189,45 +4503,68 @@ def main() -> None:
                     "robot animation disabled.",
                     flush=True,
                 )
-            cspace_debug_dir: Path | None = None
-            if result is not None and robot is not None and len(getattr(result, "dense_joint_path", [])) > 0:
-                cspace_audit = compute_ex65_jointspace_audit(scene, result, robot, robot_execution)
-                print_ex65_jointspace_audits(cspace_audit)
-                assert_ex65_jointspace_methodology(result, robot_execution, cspace_audit)
-                if args.save_cspace_debug:
-                    cspace_debug_dir = save_ex65_cspace_debug_artifacts(cspace_audit)
-                    _print_key_value_block(
-                        "Example 65 C-space debug artifacts",
-                        {
-                            "debug_dir": str(cspace_debug_dir),
-                            "dense_theta_path_npy": str(cspace_debug_dir / "dense_theta_path.npy"),
-                            "dense_lambda_labels_npy": str(cspace_debug_dir / "dense_lambda_labels.npy"),
-                            "cspace_summary_json": str(cspace_debug_dir / "cspace_summary.json"),
-                        },
-                    )
-                if args.show_cspace:
-                    manifolds, _selected_lambda = _cspace_manifolds_for_result(scene, robot, result)
-                    cspace_manifolds = {
-                        "left": manifolds[LEFT_STAGE],
-                        "plane": manifolds[FAMILY_STAGE],
-                        "right": manifolds[RIGHT_STAGE],
-                    }
-                    cspace_output_dir = cspace_debug_dir if cspace_debug_dir is not None else None
-                    screenshot = show_cspace_robot_planning(
-                        result=result,
-                        manifolds=cspace_manifolds,
-                        cspace_audit=cspace_audit,
-                        grid_res=int(args.cspace_grid_res),
-                        output_dir=cspace_output_dir,
-                        show=not bool(args.no_viz),
-                    )
-                    if screenshot is not None:
-                        print(f"cspace_environment_png = {screenshot}", flush=True)
-            elif args.save_cspace_debug or args.show_cspace:
-                print(
-                    "C-space debug/visualization skipped: no certified dense theta path is available.",
-                    flush=True,
+        cspace_debug_dir: Path | None = None
+        certified_dense_cspace_route = bool(result is not None and robot is not None and _has_certified_dense_joint_path(result))
+        should_audit_cspace = bool(args.full_jointspace_exploration or args.save_cspace_debug or args.show_cspace)
+        if certified_dense_cspace_route and should_audit_cspace:
+            cspace_audit = compute_ex65_jointspace_audit(scene, result, robot, robot_execution)
+            print_ex65_jointspace_audits(cspace_audit)
+            assert_ex65_jointspace_methodology(result, robot_execution, cspace_audit)
+            if args.save_cspace_debug:
+                cspace_debug_dir = save_ex65_cspace_debug_artifacts(cspace_audit)
+                _print_key_value_block(
+                    "Example 65 C-space debug artifacts",
+                    {
+                        "debug_dir": str(cspace_debug_dir),
+                        "dense_theta_path_npy": str(cspace_debug_dir / "dense_theta_path.npy"),
+                        "dense_lambda_labels_npy": str(cspace_debug_dir / "dense_lambda_labels.npy"),
+                        "cspace_summary_json": str(cspace_debug_dir / "cspace_summary.json"),
+                    },
                 )
+            if args.show_cspace:
+                manifolds, _selected_lambda = _cspace_manifolds_for_result(scene, robot, result)
+                cspace_manifolds = {
+                    "left": manifolds[LEFT_STAGE],
+                    "plane": manifolds[FAMILY_STAGE],
+                    "right": manifolds[RIGHT_STAGE],
+                }
+                cspace_output_dir = cspace_debug_dir if cspace_debug_dir is not None else None
+                screenshot = show_cspace_robot_planning(
+                    result=result,
+                    manifolds=cspace_manifolds,
+                    cspace_audit=cspace_audit,
+                    grid_res=int(args.cspace_grid_res),
+                    output_dir=cspace_output_dir,
+                    show=not bool(args.no_viz),
+                    show_surfaces=not bool(args.cspace_no_surfaces),
+                    route_only=bool(args.cspace_route_only),
+                    lightweight=bool(args.cspace_lightweight),
+                    marker_scale=float(args.cspace_marker_scale),
+                    surface_opacity=float(args.cspace_opacity),
+                    left_surface_opacity=args.cspace_left_opacity,
+                    middle_surface_opacity=args.cspace_middle_opacity,
+                    right_surface_opacity=args.cspace_right_opacity,
+                    middle_surface_color=args.cspace_middle_color,
+                    force_middle_sheet=bool(args.cspace_force_middle_sheet),
+                    surface_style=str(args.cspace_surface_style),
+                    surface_mode=str(args.cspace_surface_mode),
+                    smooth_surfaces=bool(args.cspace_smooth_surfaces),
+                    clean_view=bool(args.cspace_clean_view),
+                    safe_render=bool(args.cspace_safe_render),
+                    suppress_vtk_warnings=bool(args.suppress_vtk_warnings),
+                    vtk_warning_log=args.vtk_output_log,
+                    example_name="continuous_transfer_family",
+                    selected_lambda=float(_selected_lambda),
+                )
+                if screenshot is not None:
+                    print(f"cspace_environment_png = {screenshot}", flush=True)
+        elif args.show_cspace:
+            print("No certified dense joint path found; C-space route cannot be shown.", flush=True)
+        elif args.save_cspace_debug:
+            print(
+                "C-space debug/visualization skipped: no certified dense theta path is available.",
+                flush=True,
+            )
         if not args.no_viz and scene is not None and result is not None and robot is not None:
             show_continuous_transfer_robot_demo(
                 scene=scene,

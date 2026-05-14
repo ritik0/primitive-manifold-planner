@@ -9,36 +9,43 @@ from .modes import ConstraintMode
 from .transitions import TransitionConstraint
 
 
-def _wrap_joint_delta(delta: np.ndarray) -> np.ndarray:
+def _wrap_joint_delta(delta: np.ndarray) -> np.ndarray: #measures how big of a step next step is 
     return (np.asarray(delta, dtype=float) + np.pi) % (2.0 * np.pi) - np.pi
 
 
-def _joint_steps(theta_path: np.ndarray) -> np.ndarray:
+def _joint_steps(theta_path: np.ndarray) -> np.ndarray: #joint space distance between two cons theta points
     path = np.asarray(theta_path, dtype=float)
     if len(path) < 2:
         return np.zeros(0, dtype=float)
-    return np.linalg.norm(_wrap_joint_delta(np.diff(path, axis=0)), axis=1)
+    return np.linalg.norm(_wrap_joint_delta(np.diff(path, axis=0)), axis=1) #to check that final path isn't jumping around
 
 
-def _stage_order_valid(labels: list[str], order: tuple[str, ...] | None) -> bool:
+def _stage_order_valid(labels: list[str], order: tuple[str, ...] | None) -> bool: #if seq is given then it should be followed
     if order is None:
         return bool(labels)
-    index = {stage: idx for idx, stage in enumerate(order)}
-    values = [index.get(str(label), -1) for label in labels]
-    return bool(values and all(value >= 0 for value in values) and all(b >= a for a, b in zip(values[:-1], values[1:])))
+    index = {stage: idx for idx, stage in enumerate(order)} #dic mapping 
+    values = [index.get(str(label), -1) for label in labels] #into indexes 
+    return bool(values and all(value >= 0 for value in values) and all(b >= a for a, b in zip(values[:-1], values[1:]))) #only works if order is not backwards
 
 
-def _lambda_fixed(lambda_labels: np.ndarray) -> tuple[bool, float]:
+def _lambda_fixed(lambda_labels: np.ndarray) -> tuple[bool, float]: # checks for fixed lambda in continous mode 
     values = np.asarray(lambda_labels, dtype=float)
     finite = values[np.isfinite(values)]
     if len(finite) == 0:
         return True, 0.0
     variation = float(np.max(finite) - np.min(finite))
-    return bool(variation <= 1.0e-6), variation
+    return bool(variation <= 1.0e-6), variation #allows for lambda to vary by the tol (so small making sure that its same plane)
 
 
 @dataclass(frozen=True)
 class RouteCertification:
+    """Summary of checks for a certified dense joint route.
+
+    The booleans separate active-manifold residuals, joint continuity,
+    transition configurations, stage order, fixed lambda leaf use, and the
+    thesis rule that the final route must not contain task-space edges.
+    """
+
     success: bool
     constraint_certified: bool
     joint_continuity_certified: bool
@@ -81,7 +88,7 @@ def certify_dense_joint_route(
     ``modes_by_stage`` and optional transition constraints.
     """
 
-    theta_path = np.asarray(dense_theta_path, dtype=float)
+    theta_path = np.asarray(dense_theta_path, dtype=float) #invalid path checks, correct shape
     if theta_path.ndim != 2 or theta_path.shape[1] != 3 or len(theta_path) == 0:
         return RouteCertification(
             success=False,
@@ -120,6 +127,7 @@ def certify_dense_joint_route(
 
     residuals: list[float] = []
     collision_free = True
+    # Per-waypoint residuals are evaluated against that waypoint's active manifold.
     for theta, stage in zip(theta_path, labels):
         mode = modes_by_stage.get(stage)
         residual = float("inf") if mode is None else float(np.linalg.norm(mode.residual(theta)))
@@ -130,6 +138,7 @@ def certify_dense_joint_route(
             residual = max(residual, 100.0 * float(tolerance))
         residuals.append(residual)
     residual_arr = np.asarray(residuals, dtype=float)
+    # Joint continuity checks wrapped theta steps, not task-space distance.
     joint_steps = _joint_steps(theta_path)
     max_residual = float(np.max(residual_arr)) if len(residual_arr) else float("inf")
     mean_residual = float(np.mean(residual_arr)) if len(residual_arr) else float("inf")
@@ -143,9 +152,11 @@ def certify_dense_joint_route(
             if theta is None:
                 stack_values.append(float("inf"))
             else:
+                # A transition theta is valid only if the stacked source/target residual is small.
                 stack_values.append(float(constraint.residual_norm(theta)))
     max_transition = float(max(stack_values)) if stack_values else 0.0
 
+    # Family-transfer routes must stay on one fixed lambda leaf during transfer.
     lambda_arr = (
         np.asarray(lambda_labels, dtype=float)
         if lambda_labels is not None
@@ -157,6 +168,7 @@ def certify_dense_joint_route(
     joint_ok = bool(max_step <= float(max_joint_step) + 1e-9)
     transition_ok = bool(max_transition <= float(transition_tolerance))
     order_ok = _stage_order_valid(labels, stage_order)
+    # Joint-space thesis routes should not be reconstructed from task-space edges.
     taskspace_edge_ok = int(final_route_taskspace_edges) == 0
     success = bool(constraint_ok and joint_ok and transition_ok and order_ok and lambda_fixed and taskspace_edge_ok)
     message = "dense joint route certified" if success else (

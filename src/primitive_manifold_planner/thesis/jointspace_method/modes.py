@@ -22,9 +22,11 @@ class ConstraintMode:
     color: str | None = None
 
     def residual(self, theta: np.ndarray) -> np.ndarray:
+        # Delegate to the manifold so it remains the source of truth.
         return np.asarray(self.manifold.residual(np.asarray(theta, dtype=float)), dtype=float)
 
     def project(self, theta: np.ndarray, **kwargs: Any):
+        # Projection semantics are owned by the wrapped active manifold.
         return self.manifold.project(np.asarray(theta, dtype=float), **kwargs)
 
     def within_bounds(self, theta: np.ndarray, tol: float = 1e-6) -> bool:
@@ -55,6 +57,7 @@ class FamilyMode:
     color: str | None = None
 
     def make_leaf(self, lambda_value: float) -> FamilyLeafMode:
+        # Freeze one continuous family value into a fixed lambda leaf mode.
         lam = float(lambda_value)
         return FamilyLeafMode(
             name=f"{self.name}[lambda={lam:.6g}]",

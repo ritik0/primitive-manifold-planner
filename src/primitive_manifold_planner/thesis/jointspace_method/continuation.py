@@ -7,7 +7,11 @@ import numpy as np
 
 @dataclass(frozen=True)
 class ProjectedContinuationSegment:
-    """Dense theta segment produced by a joint-space projected connector."""
+    """Dense theta segment produced by a joint-space projected connector.
+
+    Each segment stays on one active manifold and carries the stage/lambda
+    label needed when the final certified dense joint route is assembled.
+    """
 
     mode_name: str
     stage: str
@@ -37,7 +41,7 @@ def concatenate_segments(
     are ``nan`` on non-family stages unless the segment carries lambda_value.
     """
 
-    paths: list[np.ndarray] = []
+    paths: list[np.ndarray] = []  
     labels: list[str] = []
     lambda_labels: list[float] = []
     for segment in segments:
@@ -46,12 +50,14 @@ def concatenate_segments(
             continue
         if drop_duplicate_boundaries and paths:
             previous = paths[-1][-1]
-            if float(np.linalg.norm(path[0] - previous)) <= 1e-10:
+            if float(np.linalg.norm(path[0] - previous)) <= 1e-10: #removes duplicate [a,,,,b] [b,,,,c] -> [a,,,,b,,,c]
+                # Adjacent local segments share a transition configuration.
                 path = path[1:]
         if len(path) == 0:
             continue
         paths.append(path)
         labels.extend([str(segment.stage)] * len(path))
+        # Non-family stages use nan; family segments carry the fixed lambda leaf.
         lam = float(segment.lambda_value) if segment.lambda_value is not None else float("nan")
         lambda_labels.extend([lam] * len(path))
     if not paths:

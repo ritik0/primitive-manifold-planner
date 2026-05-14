@@ -29,6 +29,14 @@ from primitive_manifold_planner.experiments.continuous_transfer import (  # noqa
 from primitive_manifold_planner.experiments.continuous_transfer.config import DEFAULT_POST_ROUTE_EVIDENCE_ROUNDS
 
 def main() -> None:
+    """Run the high-level Example 65 continuous-transfer family demo.
+
+    This script uses the task-space continuous-transfer planner: it samples
+    family leaves, accumulates evidence, selects entry/exit/lambda routes, and
+    reports strict validation. Robot joint-space execution lives in the
+    robotized Example 65 script.
+    """
+
     parser = argparse.ArgumentParser(description="Run Example 65 staged continuous-transfer planning.")
     parser.add_argument("--seed", type=int, default=41, help="Deterministic seed used for NumPy and OMPL.")
     parser.add_argument("--max-probes", type=int, default=None, help="Optional family-stage ambient probe budget override.")
@@ -74,6 +82,7 @@ def main() -> None:
     scene_description = default_example_65_scene_description(obstacle_profile=args.obstacle_profile)
 
     if args.comparison_row_json:
+        # Batch mode records one strict-validation row for obstacle sweeps.
         result = plan_continuous_transfer_route(
             max_ambient_probes=args.max_probes,
             continue_after_first_solution=not args.stop_after_first_solution,
@@ -88,6 +97,7 @@ def main() -> None:
         return
 
     if args.batch_obstacles:
+        # Sweep profiles exercise route selection under different family obstacles.
         rows = run_obstacle_sweep(
             seed=int(args.seed),
             top_k=int(args.top_k),
@@ -99,6 +109,7 @@ def main() -> None:
         print_obstacle_sweep_table(rows)
         return
 
+    # Main mode: accumulate evidence over the continuous family and select a route.
     result = plan_continuous_transfer_route(
         max_ambient_probes=args.max_probes,
         continue_after_first_solution=not args.stop_after_first_solution,

@@ -26,6 +26,8 @@ except Exception:
 
 @dataclass
 class ExplicitOmplRoute:
+    """High-level route plus exploration artifacts for intrinsic examples."""
+
     success: bool
     message: str
     route_string: str
@@ -156,6 +158,8 @@ def build_route_result(
     transition_points_by_interface: list[np.ndarray],
     segment_results: list[object | None],
 ) -> ExplicitOmplRoute:
+    """Assemble display/raw route data from per-manifold segment solves."""
+
     raw_segments = [
         np.asarray(getattr(result, "path", np.zeros((0, 3), dtype=float)), dtype=float)
         for result in segment_results
@@ -405,6 +409,8 @@ def solve_exact_segment_on_manifold(
     bounds_min: np.ndarray,
     bounds_max: np.ndarray,
 ):
+    """Solve a local segment on one active manifold with the appropriate OMPL helper."""
+
     if is_plane_like(manifold):
         return ompl_projected_interpolate(
             manifold=manifold,
@@ -451,6 +457,8 @@ def explore_on_manifold_from_frontier(
     bounds_min: np.ndarray,
     bounds_max: np.ndarray,
 ):
+    """Expand evidence from a frontier point toward a sampled manifold target."""
+
     if is_plane_like(manifold):
         return ompl_projected_interpolate(
             manifold=manifold,
@@ -515,6 +523,8 @@ def refine_transition_bisection(
     target_tol: float = 1e-4,
     max_iters: int = 32,
 ) -> tuple[np.ndarray, bool]:
+    """Refine a sign-change edge to a transition point on the current manifold."""
+
     a = np.asarray(q_a, dtype=float)
     b = np.asarray(q_b, dtype=float)
     fa = target_residual_scalar(target_manifold, a)
@@ -529,6 +539,7 @@ def refine_transition_bisection(
 
     for _ in range(max_iters):
         mid_guess = 0.5 * (a + b)
+        # Keep each bisection candidate on the current manifold before testing the target residual.
         projection = project_newton(current_manifold, mid_guess, tol=1e-10, max_iters=80, damping=1.0)
         if not projection.success:
             break
@@ -558,6 +569,8 @@ def refine_intersection_on_both_manifolds(
     tol: float = 1e-8,
     max_iters: int = 25,
 ) -> tuple[np.ndarray, bool]:
+    """Newton-refine a transition configuration on both adjacent manifolds."""
+
     x = np.asarray(x0, dtype=float).reshape(-1).copy()
     best_x = x.copy()
     best_norm = float("inf")
@@ -565,6 +578,7 @@ def refine_intersection_on_both_manifolds(
     for _ in range(max_iters):
         ra = np.asarray(manifold_a.residual(x), dtype=float).reshape(-1)
         rb = np.asarray(manifold_b.residual(x), dtype=float).reshape(-1)
+        # Stacked residual means the candidate must satisfy both active manifolds.
         residual = np.concatenate([ra, rb], axis=0)
         residual_norm = float(np.linalg.norm(residual))
 
@@ -576,6 +590,7 @@ def refine_intersection_on_both_manifolds(
 
         ja = np.asarray(manifold_a.jacobian(x), dtype=float)
         jb = np.asarray(manifold_b.jacobian(x), dtype=float)
+        # Stacked Jacobian gives the least-squares correction for the intersection.
         jacobian = np.vstack([ja, jb])
 
         try:
@@ -595,6 +610,8 @@ def refine_intersection_on_both_manifolds(
 
 
 def scan_path_for_transition(current_manifold, target_manifold, path: np.ndarray, target_tol: float = 1e-4) -> np.ndarray:
+    """Scan a manifold path for target-residual zeros and refine crossings."""
+
     pts = np.asarray(path, dtype=float)
     if len(pts) == 0:
         return np.zeros((0, 3), dtype=float)
@@ -610,6 +627,7 @@ def scan_path_for_transition(current_manifold, target_manifold, path: np.ndarray
         fb = float(residuals[idx + 1])
         if np.sign(fa) == np.sign(fb):
             continue
+        # A sign change suggests the path crossed the neighboring manifold.
         refined, ok = refine_transition_bisection(
             current_manifold=current_manifold,
             target_manifold=target_manifold,
@@ -636,6 +654,8 @@ def scan_tree_edges_for_transition(
     explored_edges: list[tuple[np.ndarray, np.ndarray]],
     target_tol: float = 1e-4,
 ) -> np.ndarray:
+    """Scan explored tree edges for transition configurations."""
+
     hits: list[np.ndarray] = []
     for q_a, q_b in explored_edges:
         edge_path = sample_edge_on_manifold(current_manifold, q_a, q_b, num=29)
@@ -663,6 +683,8 @@ def find_online_switch(
     bounds_max: np.ndarray,
     max_targets: int = 12,
 ) -> tuple[np.ndarray | None, np.ndarray, object | None]:
+    """Explore from a frontier until a useful transition switch is found."""
+
     frontier: list[np.ndarray] = [np.asarray(q_start, dtype=float).copy()]
     discovered: list[np.ndarray] = []
     all_explored_edges: list[tuple[np.ndarray, np.ndarray]] = []
@@ -714,6 +736,7 @@ def find_online_switch(
             )
 
         if len(hits) == 0:
+            # No transition yet: expand the frontier toward newly explored points.
             frontier = update_frontier_points(
                 frontier=frontier,
                 new_points=frontier_points_from_result(exploration_result),
@@ -724,6 +747,7 @@ def find_online_switch(
 
         discovered.extend(np.asarray(hits, dtype=float))
         for hit in np.asarray(hits, dtype=float):
+            # Prefer transitions that are reachable, guide-directed, and admissible for the family.
             score = float(np.linalg.norm(np.asarray(q_start, dtype=float) - np.asarray(hit, dtype=float)))
             score += float(np.linalg.norm(np.asarray(hit, dtype=float) - guide))
             score += 0.25 * float(
@@ -789,6 +813,8 @@ def find_online_switch(
 
 
 def plan_explicit_ompl_route(families, start_q: np.ndarray, goal_q: np.ndarray) -> ExplicitOmplRoute:
+    """Plan an explicit fixed-lambda route through the provided manifold families."""
+
     lambdas = [float(family.sample_lambdas()[0]) for family in families]
     manifolds = [family.manifold(lam) for family, lam in zip(families, lambdas)]
     if len(families) <= 3:

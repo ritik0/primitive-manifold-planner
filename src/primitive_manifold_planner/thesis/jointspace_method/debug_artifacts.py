@@ -27,6 +27,12 @@ def _json_safe(value):
 
 @dataclass(frozen=True)
 class CspaceDebugArtifact:
+    """Serializable debug snapshot for one certified C-space route.
+
+    ``dense_theta_path`` is the source of truth. ``dense_fk_trace`` should be
+    FK(dense_theta_path), used only for visualization/debugging.
+    """
+
     output_dir: Path
     dense_theta_path: np.ndarray
     dense_fk_trace: np.ndarray
@@ -51,6 +57,7 @@ def _write_plots(base: Path, artifact: CspaceDebugArtifact) -> None:
     residuals = np.asarray(artifact.constraint_residuals, dtype=float)
     labels = list(artifact.stage_labels)
     if len(theta_path) > 0:
+        # Plot theta components directly to inspect the certified dense joint route.
         fig, ax = plt.subplots(figsize=(8, 4.5))
         ax.plot(theta_path[:, 0], label="theta0")
         ax.plot(theta_path[:, 1], label="theta1")
@@ -71,6 +78,7 @@ def _write_plots(base: Path, artifact: CspaceDebugArtifact) -> None:
             indices = [idx for idx, label in enumerate(labels) if str(label) == str(stage)]
             if len(indices) >= 2:
                 segment = theta_path[np.asarray(indices, dtype=int)]
+                # Stage-colored segments show which active manifold labels the route uses.
                 ax3.plot(segment[:, 0], segment[:, 1], segment[:, 2], color=colors.get(str(stage), "#dc2626"), linewidth=2.5, label=f"{stage} segment")
         ax3.scatter(theta_path[0, 0], theta_path[0, 1], theta_path[0, 2], color="black", s=42, label="start")
         ax3.scatter(theta_path[-1, 0], theta_path[-1, 1], theta_path[-1, 2], color="gold", s=52, label="goal")
@@ -82,6 +90,7 @@ def _write_plots(base: Path, artifact: CspaceDebugArtifact) -> None:
         ):
             idx = int(artifact.summary.get(key, -1))
             if 0 <= idx < len(theta_path):
+                # Transition markers identify shared configurations between stages.
                 ax3.scatter(theta_path[idx, 0], theta_path[idx, 1], theta_path[idx, 2], color=color, s=60, label=label)
         ax3.set_xlabel("theta0")
         ax3.set_ylabel("theta1")
@@ -93,6 +102,7 @@ def _write_plots(base: Path, artifact: CspaceDebugArtifact) -> None:
         plt.close(fig)
 
     if len(residuals) > 0:
+        # Residual plot checks active-manifold error along the whole route.
         fig, ax = plt.subplots(figsize=(8, 4.2))
         ax.plot(residuals, color="#455a64")
         ax.set_xlabel("waypoint index")
@@ -104,7 +114,11 @@ def _write_plots(base: Path, artifact: CspaceDebugArtifact) -> None:
 
 
 def save_cspace_debug_artifacts(artifact: CspaceDebugArtifact) -> Path:
-    """Save generic C-space debug artifacts for a certified theta route."""
+    """Save generic C-space debug artifacts for a certified theta route.
+
+    The saved arrays preserve the dense theta path, its FK trace, per-waypoint
+    residuals, joint steps, stage labels, optional lambda labels, and plots.
+    """
 
     base = Path(artifact.output_dir)
     base.mkdir(parents=True, exist_ok=True)
@@ -114,8 +128,10 @@ def save_cspace_debug_artifacts(artifact: CspaceDebugArtifact) -> Path:
     joint_steps = np.asarray(artifact.joint_steps, dtype=float)
     labels = list(artifact.stage_labels)
 
+    # Dense theta route is the executable source; FK trace is derived from it.
     np.save(base / "dense_theta_path.npy", theta_path)
     np.save(base / "dense_fk_trace.npy", fk_trace)
+    # Residuals and joint steps are the lightweight certification audit trail.
     np.save(base / "constraint_residuals.npy", residuals)
     np.save(base / "joint_steps.npy", joint_steps)
     (base / "dense_stage_labels.txt").write_text("\n".join(labels), encoding="utf-8")
