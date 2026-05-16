@@ -216,14 +216,18 @@ def show_pyvista_robot_demo(
     plotter = pv.Plotter(window_size=(1440, 920))
     if hasattr(plotter, "set_background"):
         plotter.set_background("#edf3f8", top="#fdfdfd")
-    if hasattr(plotter, "enable_anti_aliasing"):
+    # Use a conservative render path; framebuffer attachment warnings are
+    # VTK/OpenGL display issues and do not indicate planner/certification bugs.
+    for attr in ("disable_anti_aliasing", "disable_depth_peeling", "disable_eye_dome_lighting", "disable_shadows"):
         try:
-            plotter.enable_anti_aliasing()
+            getattr(plotter, attr)()
         except Exception:
             pass
-    if hasattr(plotter, "enable_lightkit"):
+    try:
+        plotter.ren_win.SetMultiSamples(0)
+    except Exception:
         try:
-            plotter.enable_lightkit()
+            plotter.render_window.SetMultiSamples(0)
         except Exception:
             pass
 

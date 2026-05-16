@@ -3986,9 +3986,18 @@ def show_continuous_transfer_robot_demo(
     plotter = pv.Plotter(window_size=(1440, 920))
     if hasattr(plotter, "set_background"):
         plotter.set_background("#edf3f8", top="#ffffff")
-    if hasattr(plotter, "enable_anti_aliasing"):
+    # Framebuffer/color-attachment warnings are VTK/OpenGL render warnings
+    # caused by features like multisampling/depth buffers, not planner failures.
+    for attr in ("disable_anti_aliasing", "disable_depth_peeling", "disable_eye_dome_lighting", "disable_shadows"):
         try:
-            plotter.enable_anti_aliasing()
+            getattr(plotter, attr)()
+        except Exception:
+            pass
+    try:
+        plotter.ren_win.SetMultiSamples(0)
+    except Exception:
+        try:
+            plotter.render_window.SetMultiSamples(0)
         except Exception:
             pass
     plotter.add_text(
@@ -4305,16 +4314,20 @@ def main() -> None:
     parser.add_argument("--num-family-leaf-surfaces", type=int, default=9)
     parser.add_argument("--save-cspace-debug", action="store_true", help="Save Example 65 dense theta/lambda audit artifacts.")
     parser.add_argument("--show-cspace", action="store_true", help="Show/save the theta-space constraint surface view for full joint-space mode.")
+    parser.add_argument("--cspace-presentation-style", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--cspace-grid-res", type=int, default=65, help="Grid resolution for C-space implicit surfaces.")
-    parser.add_argument("--cspace-no-surfaces", action="store_true", help="Show the C-space theta route without implicit surfaces.")
-    parser.add_argument("--cspace-route-only", action="store_true", help="Show only dense theta route, stage segments, and exact transition markers.")
+    parser.add_argument("--cspace-no-surfaces", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--cspace-route-only", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--cspace-marker-scale", type=float, default=0.35, help="Scale C-space start/goal/transition marker sizes.")
     parser.add_argument("--cspace-opacity", type=float, default=0.28, help="Opacity for full C-space isosurface meshes.")
     parser.add_argument("--cspace-left-opacity", type=float, default=None, help="Opacity for the left C-space surface.")
     parser.add_argument("--cspace-middle-opacity", type=float, default=None, help="Opacity for the middle family/plane C-space surface.")
     parser.add_argument("--cspace-right-opacity", type=float, default=None, help="Opacity for the right C-space surface.")
     parser.add_argument("--cspace-middle-color", type=str, default=None, help="Color for the middle family/plane C-space surface.")
-    parser.add_argument("--cspace-force-middle-sheet", action="store_true", help="Always draw a route-local cyan middle sheet for presentation clarity.")
+    parser.add_argument("--cspace-middle-only", action="store_true", help="Draw only the exact middle C-space isosurface plus the dense route and transition markers.")
+    parser.add_argument("--save-cspace-surfaces", action="store_true", help="Save exact C-space isosurface meshes as .vtp files.")
+    parser.add_argument("--cspace-allow-visual-proxy", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--cspace-force-middle-sheet", action="store_true", help=argparse.SUPPRESS)
     cspace_smoothing_group = parser.add_mutually_exclusive_group()
     cspace_smoothing_group.add_argument("--cspace-smooth-surfaces", dest="cspace_smooth_surfaces", action="store_true", default=True)
     cspace_smoothing_group.add_argument("--cspace-no-smooth-surfaces", dest="cspace_smooth_surfaces", action="store_false")
@@ -4354,9 +4367,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--cspace-surface-mode",
-        choices=("full", "solid-safe", "route-only", "fallback"),
-        default="full",
-        help="C-space surface mode: full transparent surfaces, solid-safe opaque surfaces, route-only, or fallback context.",
+        choices=("exact", "none"),
+        default="exact",
+        help="C-space surface mode: exact residual(theta)=0 isosurfaces, or none for route-only diagnostics.",
     )
     cspace_surface_aliases = parser.add_mutually_exclusive_group()
     cspace_surface_aliases.add_argument(
@@ -4364,32 +4377,40 @@ def main() -> None:
         dest="cspace_exact_surfaces_alias",
         action="store_true",
         default=None,
-        help="Render actual zero-level-set C-space surfaces for left, selected lambda family leaf, and right.",
+        help=argparse.SUPPRESS,
     )
     cspace_surface_aliases.add_argument(
         "--cspace-approx-surfaces",
         dest="cspace_exact_surfaces_alias",
         action="store_false",
-        help="Use the lightweight point/context surface style instead of exact isosurfaces.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--cspace-surface-style",
-        choices=("points-outline", "points", "wireframe", "contour"),
-        default="points-outline",
-        help="Surface context style for C-space views.",
+        choices=("points-outline", "points", "wireframe", "contour", "mesh"),
+        default="mesh",
+        help="Render style for exact extracted C-space isosurfaces.",
     )
     cspace_view_group = parser.add_mutually_exclusive_group()
     cspace_view_group.add_argument("--cspace-clean-view", dest="cspace_clean_view", action="store_true", default=True)
     cspace_view_group.add_argument("--cspace-box-view", dest="cspace_clean_view", action="store_false")
     cspace_quality = parser.add_mutually_exclusive_group()
     cspace_quality.add_argument("--cspace-lightweight", dest="cspace_lightweight", action="store_true", default=True)
-    cspace_quality.add_argument("--cspace-full-surfaces", dest="cspace_lightweight", action="store_false")
+    cspace_quality.add_argument("--cspace-full-surfaces", dest="cspace_lightweight", action="store_false", help=argparse.SUPPRESS)
     parser.add_argument("--no-viz", action="store_true")
     args = parser.parse_args()
     if args.cspace_exact_surfaces_alias is True:
-        args.cspace_surface_mode = "full"
+        args.cspace_surface_mode = "exact"
     elif args.cspace_exact_surfaces_alias is False:
-        args.cspace_surface_mode = "fallback"
+        print("Deprecated approximate C-space surface flag ignored; exact truth-only mode is active.", flush=True)
+        args.cspace_surface_mode = "exact"
+    if bool(args.cspace_no_surfaces) or bool(args.cspace_route_only):
+        args.cspace_surface_mode = "none"
+    if bool(args.cspace_presentation_style) or bool(args.cspace_force_middle_sheet) or bool(args.cspace_allow_visual_proxy):
+        print(
+            "Deprecated C-space presentation/proxy flags are ignored; visualization uses exact residual(theta)=0 surfaces only.",
+            flush=True,
+        )
 
     if args.taskspace_planning:
         args.jointspace_planning = False
@@ -4546,6 +4567,8 @@ def main() -> None:
                     right_surface_opacity=args.cspace_right_opacity,
                     middle_surface_color=args.cspace_middle_color,
                     force_middle_sheet=bool(args.cspace_force_middle_sheet),
+                    allow_visual_proxy=bool(args.cspace_allow_visual_proxy),
+                    presentation_style=bool(args.cspace_presentation_style),
                     surface_style=str(args.cspace_surface_style),
                     surface_mode=str(args.cspace_surface_mode),
                     smooth_surfaces=bool(args.cspace_smooth_surfaces),
@@ -4555,6 +4578,8 @@ def main() -> None:
                     vtk_warning_log=args.vtk_output_log,
                     example_name="continuous_transfer_family",
                     selected_lambda=float(_selected_lambda),
+                    middle_only=bool(args.cspace_middle_only),
+                    save_surfaces=bool(args.save_cspace_surfaces),
                 )
                 if screenshot is not None:
                     print(f"cspace_environment_png = {screenshot}", flush=True)

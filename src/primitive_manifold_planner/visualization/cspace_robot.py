@@ -184,174 +184,242 @@ def _add_implicit_surface(
     surface_mode: str,
     surface_opacity: float,
     smooth_surfaces: bool,
-) -> int:
-    """Draw the zero residual sheet for one FK-pulled-back constraint."""
+    emphasize: bool = False,
+) -> dict[str, object]:
+    """Draw the exact residual(theta)=0 sheet for one FK-pulled-back constraint."""
 
+    info: dict[str, object] = {
+        "mesh": None,
+        "extracted": False,
+        "points": 0,
+        "cells": 0,
+        "actor_added": False,
+        "actor_visible": False,
+        "actor_name": label,
+        "actor_opacity": float(surface_opacity),
+        "actor_color": color,
+        "render_style": str(surface_style),
+        "bounds": None,
+        "center": None,
+        "failure_reason": "none",
+    }
     a0, a1, a2 = axes
     x, y, z = np.meshgrid(a0, a1, a2, indexing="ij")
     grid = pv.StructuredGrid(x, y, z)
     grid["residual"] = _residual_grid(manifold, axes).ravel(order="F")
     surface = grid.contour(isosurfaces=[0.0], scalars="residual")
     if surface.n_points == 0:
-        return 0
-    style = str(surface_style).lower()
-    if bool(exact_isosurface):
-        if bool(smooth_surfaces):
-            try:
-                surface = surface.smooth(
-                    n_iter=15,
-                    relaxation_factor=0.025,
-                    feature_smoothing=False,
-                    boundary_smoothing=True,
-                )
-            except Exception:
-                pass
-        solid_safe = str(surface_mode).lower() == "solid-safe"
-        mesh_kwargs = {
-            "color": color,
-            "opacity": 1.0 if solid_safe else float(surface_opacity),
-            "smooth_shading": False,
-            "show_edges": False,
-            "render_lines_as_tubes": False,
-            "label": label,
-        }
-        plotter.add_mesh(surface, **mesh_kwargs)
-        return int(surface.n_points)
-    if style in {"points", "points-outline"}:
-        points = np.asarray(surface.points, dtype=float)
-        max_points = 450 if bool(lightweight) else 1400
-        stride = max(1, int(np.ceil(len(points) / max(max_points, 1))))
-        cloud_points = points[::stride]
-        cloud = pv.PolyData(cloud_points)
-        plotter.add_mesh(
-            cloud,
-            color=color,
-            opacity=1.0 if bool(safe_render) or style == "points-outline" else float(opacity),
-            point_size=2.7 if bool(lightweight) else 3.6,
-            render_points_as_spheres=False,
-            label=label,
-        )
-        count = int(len(cloud.points))
-        label_lower = label.lower()
-        if style == "points-outline" and ("left" in label_lower or "right" in label_lower):
-            count += _add_pca_envelope_loops(
-                plotter,
-                pv,
-                cloud_points,
-                color=color,
-                lightweight=bool(lightweight),
+        info["failure_reason"] = "no contour"
+        return info
+    # This view is intentionally truth-only: surfaces are finite-resolution
+    # contours of the same residual(theta) functions used by the planner.
+    if bool(smooth_surfaces):
+        try:
+            surface = surface.smooth(
+                n_iter=15,
+                relaxation_factor=0.025,
+                feature_smoothing=False,
+                boundary_smoothing=True,
             )
-        elif style == "points-outline" and ("plane" in label_lower or "family" in label_lower):
-            count += _add_point_cloud_box_outline(plotter, pv, cloud_points, color=color, lightweight=bool(lightweight))
-        return count
-    if style == "contour":
-        count = 0
-        labeled = False
-        normals = [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)]
-        center = np.asarray([(axis[0] + axis[-1]) * 0.5 for axis in axes], dtype=float)
-        for axis_idx, normal in enumerate(normals):
-            values = np.linspace(axes[axis_idx][1], axes[axis_idx][-2], 4 if bool(lightweight) else 6)
-            for value in values:
-                origin = center.copy()
-                origin[axis_idx] = float(value)
-                try:
-                    section = grid.slice(normal=normal, origin=origin)
-                    curve = section.contour(isosurfaces=[0.0], scalars="residual")
-                except Exception:
-                    continue
-                if curve.n_points == 0:
-                    continue
-                plotter.add_mesh(
-                    curve,
-                    color=color,
-                    opacity=1.0 if bool(safe_render) else float(opacity),
-                    line_width=1.4 if bool(lightweight) else 1.8,
-                    render_lines_as_tubes=False,
-                    label=label if not labeled else None,
-                )
-                labeled = True
-                count += int(curve.n_points)
-        return count
-    mesh_kwargs = {
+        except Exception:
+            pass
+    bounds = tuple(float(value) for value in surface.bounds)
+    center = (
+        0.5 * (bounds[0] + bounds[1]),
+        0.5 * (bounds[2] + bounds[3]),
+        0.5 * (bounds[4] + bounds[5]),
+    )
+    info.update(
+        {
+            "mesh": surface,
+            "extracted": True,
+            "points": int(surface.n_points),
+            "cells": int(surface.n_cells),
+            "bounds": bounds,
+            "center": center,
+        }
+    )
+    style = str(surface_style).lower()
+    if style not in {"mesh", "wireframe", "points", "points-outline", "contour"}:
+        style = "mesh"
+    actor = None
+    common_kwargs = {
         "color": color,
-        "opacity": 1.0 if bool(safe_render) else float(opacity),
+        "opacity": float(surface_opacity),
         "smooth_shading": False,
         "label": label,
         "render_lines_as_tubes": False,
+        "lighting": False,
+        "pickable": True,
+        "culling": False,
     }
-    if bool(lightweight):
-        mesh_kwargs.update({"style": "wireframe", "line_width": 0.55})
-    plotter.add_mesh(surface, **mesh_kwargs)
-    return int(surface.n_points)
-
-
-def _middle_stage_points(theta_path: np.ndarray, labels: list[str], middle_name: str) -> np.ndarray:
-    """Return dense theta points that belong to the active middle stage."""
-
-    theta = np.asarray(theta_path, dtype=float)
-    if theta.ndim != 2 or theta.shape[1] != 3 or len(theta) == 0:
-        return np.zeros((0, 3), dtype=float)
-    if len(labels) == len(theta):
-        mask = np.asarray([str(label) == str(middle_name) for label in labels], dtype=bool)
-        points = theta[mask]
-        if len(points) >= 2:
-            return np.asarray(points, dtype=float)
-    return theta
-
-
-def _add_middle_visual_sheet(
-    plotter,
-    pv,
-    points: np.ndarray,
-    *,
-    color: str,
-    opacity: float,
-    label: str,
-    surface_mode: str,
-) -> int:
-    """Draw a route-local rectangular middle sheet for presentation clarity only."""
-
-    pts = np.asarray(points, dtype=float)
-    if pts.ndim != 2 or pts.shape[1] != 3 or len(pts) < 2:
-        return 0
-    finite = pts[np.all(np.isfinite(pts), axis=1)]
-    if len(finite) < 2:
-        return 0
-    center = np.mean(finite, axis=0)
-    centered = finite - center
     try:
-        _values, vectors = np.linalg.eigh(np.cov(centered, rowvar=False))
-        basis = np.asarray(vectors[:, ::-1], dtype=float)
+        if style == "wireframe":
+            actor = plotter.add_mesh(
+                surface,
+                style="wireframe",
+                line_width=2.4 if bool(emphasize) else 1.1,
+                **common_kwargs,
+            )
+        elif style in {"points", "points-outline"}:
+            points = np.asarray(surface.points, dtype=float)
+            cloud = pv.PolyData(points)
+            actor = plotter.add_mesh(
+                cloud,
+                point_size=6.0 if bool(emphasize) else 3.2,
+                render_points_as_spheres=False,
+                **common_kwargs,
+            )
+            if style == "points-outline":
+                plotter.add_mesh(
+                    surface,
+                    style="wireframe",
+                    line_width=1.2 if bool(emphasize) else 0.6,
+                    color=color,
+                    opacity=float(surface_opacity),
+                    smooth_shading=False,
+                    label=None,
+                    render_lines_as_tubes=False,
+                    lighting=False,
+                    pickable=True,
+                    culling=False,
+                )
+        elif style == "contour":
+            actor = plotter.add_mesh(
+                surface,
+                style="wireframe",
+                line_width=1.8 if bool(emphasize) else 0.9,
+                **common_kwargs,
+            )
+        else:
+            actor = plotter.add_mesh(
+                surface,
+                show_edges=bool(emphasize),
+                edge_color="#374151" if bool(emphasize) else None,
+                line_width=1.0 if bool(emphasize) else 0.5,
+                **common_kwargs,
+            )
+    except Exception as exc:
+        info["failure_reason"] = f"add_mesh_exception: {exc}"
+        return info
+    visible = True
+    try:
+        visible = bool(actor.GetVisibility())
     except Exception:
-        basis = np.eye(3, dtype=float)
-    projected = centered @ basis
-    extents = np.percentile(np.abs(projected[:, :2]), 95.0, axis=0) if len(finite) > 2 else np.asarray([0.3, 0.18])
-    extents = np.maximum(extents * 1.35, np.asarray([0.35, 0.22], dtype=float))
-    corners_2d = np.asarray(
-        [
-            [-1.0, -1.0],
-            [1.0, -1.0],
-            [1.0, 1.0],
-            [-1.0, 1.0],
-        ],
-        dtype=float,
+        pass
+    info.update(
+        {
+            "actor_added": True,
+            "actor_visible": bool(visible),
+            "render_style": style,
+        }
     )
-    corners = (
-        center[None, :]
-        + corners_2d[:, 0:1] * float(extents[0]) * basis[:, 0][None, :]
-        + corners_2d[:, 1:2] * float(extents[1]) * basis[:, 1][None, :]
-    )
-    patch = pv.PolyData(corners, faces=np.hstack([[4, 0, 1, 2, 3]]))
-    plotter.add_mesh(
-        patch,
-        color=color,
-        opacity=1.0 if str(surface_mode).lower() == "solid-safe" else float(opacity),
-        smooth_shading=False,
-        show_edges=False,
-        render_lines_as_tubes=False,
-        label=label,
-    )
-    return int(patch.n_points)
+    return info
+
+
+def _safe_add_implicit_surface(*args, stage_name: str, **kwargs) -> dict[str, object]:
+    """Keep visualization failures from interrupting a certified planner run."""
+
+    try:
+        return _add_implicit_surface(*args, **kwargs)
+    except Exception as exc:
+        print(f"Warning: exact C-space surface extraction failed for {stage_name}: {exc}", flush=True)
+        return {
+            "mesh": None,
+            "extracted": False,
+            "points": 0,
+            "cells": 0,
+            "actor_added": False,
+            "actor_visible": False,
+            "actor_name": stage_name,
+            "actor_opacity": 0.0,
+            "actor_color": "",
+            "render_style": "",
+            "bounds": None,
+            "center": None,
+            "failure_reason": f"extraction error: {exc}",
+        }
+
+
+def _residual_grid_stats(manifold, axes: tuple[np.ndarray, np.ndarray, np.ndarray]) -> dict[str, object]:
+    """Report finite-grid residual diagnostics for an exact C-space surface."""
+
+    try:
+        values = np.asarray(_residual_grid(manifold, axes), dtype=float)
+    except Exception as exc:
+        return {
+            "min": float("nan"),
+            "max": float("nan"),
+            "abs_min": float("nan"),
+            "abs_max": float("nan"),
+            "has_sign_change": False,
+            "near_zero_count": 0,
+            "failure_reason": f"extraction error: {exc}",
+        }
+    finite = values[np.isfinite(values)]
+    if len(finite) == 0:
+        return {
+            "min": float("nan"),
+            "max": float("nan"),
+            "abs_min": float("nan"),
+            "abs_max": float("nan"),
+            "has_sign_change": False,
+            "near_zero_count": 0,
+            "failure_reason": "no finite residual samples",
+        }
+    min_value = float(np.min(finite))
+    max_value = float(np.max(finite))
+    abs_values = np.abs(finite)
+    has_sign_change = bool(min_value <= 0.0 <= max_value)
+    near_zero_count = int(np.count_nonzero(abs_values <= 2.0e-3))
+    failure_reason = "none" if has_sign_change else "no sign change"
+    return {
+        "min": min_value,
+        "max": max_value,
+        "abs_min": float(np.min(abs_values)),
+        "abs_max": float(np.max(abs_values)),
+        "has_sign_change": has_sign_change,
+        "near_zero_count": near_zero_count,
+        "failure_reason": failure_reason,
+    }
+
+
+def _surface_points(info: Mapping[str, object]) -> int:
+    return int(info.get("points", 0) or 0)
+
+
+def _surface_cells(info: Mapping[str, object]) -> int:
+    return int(info.get("cells", 0) or 0)
+
+
+def _surface_actor_added(info: Mapping[str, object]) -> bool:
+    return bool(info.get("actor_added", False))
+
+
+def _surface_bounds(info: Mapping[str, object]) -> tuple[float, float, float, float, float, float] | None:
+    bounds = info.get("bounds")
+    if bounds is None:
+        return None
+    values = tuple(float(value) for value in bounds)
+    if len(values) != 6 or not all(np.isfinite(values)):
+        return None
+    return values
+
+
+def _save_exact_surface_meshes(surface_infos: Mapping[str, Mapping[str, object]], output_dir: str | Path | None) -> Path:
+    base = Path(output_dir) if output_dir is not None else Path("outputs") / "cspace_surfaces"
+    if base.name != "cspace_surfaces":
+        base = base / "cspace_surfaces"
+    base.mkdir(parents=True, exist_ok=True)
+    for name, info in surface_infos.items():
+        mesh = info.get("mesh")
+        if mesh is None:
+            continue
+        try:
+            mesh.save(str(base / f"{name}_surface.vtp"))
+        except Exception as exc:
+            print(f"Warning: could not save {name} C-space surface mesh: {exc}", flush=True)
+    return base
 
 
 def _polydata_from_polylines(pv, polylines: list[np.ndarray]):
@@ -370,99 +438,6 @@ def _polydata_from_polylines(pv, polylines: list[np.ndarray]):
     poly = pv.PolyData(points)
     poly.lines = np.asarray(lines, dtype=np.int64)
     return poly
-
-
-def _pca_frame(points: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
-    """Return a simple PCA envelope frame for sampled C-space surface points."""
-
-    pts = np.asarray(points, dtype=float)
-    if pts.ndim != 2 or pts.shape[1] != 3 or len(pts) < 6:
-        return None
-    center = np.mean(pts, axis=0)
-    centered = pts - center
-    try:
-        _values, vectors = np.linalg.eigh(np.cov(centered, rowvar=False))
-    except Exception:
-        return None
-    basis = np.asarray(vectors[:, ::-1], dtype=float)
-    projected = centered @ basis
-    extents = np.percentile(np.abs(projected), 94.0, axis=0)
-    extents = np.maximum(extents, 0.035)
-    return center, basis, extents
-
-
-def _add_pca_envelope_loops(plotter, pv, points: np.ndarray, *, color: str, lightweight: bool) -> int:
-    """Draw three clean ellipsoid loops around a sphere-like C-space cloud."""
-
-    frame = _pca_frame(points)
-    if frame is None:
-        return 0
-    center, basis, extents = frame
-    angles = np.linspace(0.0, 2.0 * np.pi, 80 if bool(lightweight) else 120, endpoint=True)
-    loops: list[np.ndarray] = []
-    for i, j in ((0, 1), (0, 2), (1, 2)):
-        loop = (
-            center[None, :]
-            + np.cos(angles)[:, None] * float(extents[i]) * basis[:, i][None, :]
-            + np.sin(angles)[:, None] * float(extents[j]) * basis[:, j][None, :]
-        )
-        loops.append(np.asarray(loop, dtype=float))
-    poly = _polydata_from_polylines(pv, loops)
-    if poly.n_points == 0:
-        return 0
-    plotter.add_mesh(
-        poly,
-        color=color,
-        line_width=1.5 if bool(lightweight) else 1.9,
-        render_lines_as_tubes=False,
-    )
-    return int(poly.n_points)
-
-
-def _add_point_cloud_box_outline(plotter, pv, points: np.ndarray, *, color: str, lightweight: bool) -> int:
-    """Draw a sparse rectangular/slab outline around the middle C-space cloud."""
-
-    frame = _pca_frame(points)
-    if frame is None:
-        return 0
-    center, basis, extents = frame
-    extents = np.asarray(extents, dtype=float)
-    thin_axis = int(np.argmin(extents))
-    plane_axes = [axis for axis in range(3) if axis != thin_axis]
-    half_thickness = max(0.02, 0.25 * float(extents[thin_axis]))
-    loops: list[np.ndarray] = []
-    corners_2d = np.asarray(
-        [
-            [-1.0, -1.0],
-            [1.0, -1.0],
-            [1.0, 1.0],
-            [-1.0, 1.0],
-            [-1.0, -1.0],
-        ],
-        dtype=float,
-    )
-    for sign in (-1.0, 1.0):
-        loop = np.repeat(center[None, :], len(corners_2d), axis=0)
-        loop += sign * half_thickness * basis[:, thin_axis][None, :]
-        for idx, axis in enumerate(plane_axes):
-            loop += corners_2d[:, idx : idx + 1] * float(extents[axis]) * basis[:, axis][None, :]
-        loops.append(loop)
-    for sx, sy in ((-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)):
-        edge = np.repeat(center[None, :], 2, axis=0)
-        for axis, sign in zip(plane_axes, (sx, sy)):
-            edge += sign * float(extents[axis]) * basis[:, axis][None, :]
-        edge += np.asarray([-half_thickness, half_thickness], dtype=float)[:, None] * basis[:, thin_axis][None, :]
-        loops.append(edge)
-    poly = _polydata_from_polylines(pv, loops)
-    if poly.n_points == 0:
-        return 0
-    plotter.add_mesh(
-        poly,
-        color=color,
-        line_width=1.25 if bool(lightweight) else 1.6,
-        render_lines_as_tubes=False,
-    )
-    return int(poly.n_points)
 
 
 def _polyline_from_points(pv, points: np.ndarray):
@@ -503,6 +478,7 @@ def _add_marker(plotter, pv, point: np.ndarray, *, color: str, radius: float, la
         color=color,
         point_size=max(3.0, 320.0 * float(radius)),
         render_points_as_spheres=False,
+        lighting=False,
         label=label,
     )
 
@@ -815,22 +791,28 @@ def show_cspace_robot_planning(
     right_surface_opacity: float | None = None,
     middle_surface_color: str | None = None,
     force_middle_sheet: bool = False,
-    surface_style: str = "points-outline",
-    surface_mode: str = "full",
+    allow_visual_proxy: bool = False,
+    presentation_style: bool = False,
+    surface_style: str = "exact",
+    surface_mode: str = "exact",
     smooth_surfaces: bool = True,
     clean_view: bool = True,
     safe_render: bool = True,
     suppress_vtk_warnings: bool = True,
     vtk_warning_log: str | Path | None = None,
     exact_surfaces: bool | None = None,
+    middle_only: bool = False,
+    save_surfaces: bool = False,
     example_name: str = "generic",
     selected_lambda: float | None = None,
 ) -> Path | None:
-    """Show the FK-pulled-back constraint surfaces in theta-space.
+    """Show exact FK-pulled-back constraint surfaces in theta-space.
 
     Axes are theta0, theta1, theta2. The red/dark route is the dense theta path
     itself; FK is used only by the constraints that define the implicit
-    surfaces, not as the plotted route coordinates.
+    surfaces, not as the plotted route coordinates. No presentation proxy
+    sheets are drawn: each C-space surface is residual(theta)=0 on a finite
+    grid, so route certification remains independent of the rendered mesh.
     """
     effective_vtk_log = Path("outputs") / "vtk_warnings.log" if vtk_warning_log is None else vtk_warning_log
     vtk_warning_state, vtk_warning_log_path = _configure_vtk_warning_display(
@@ -857,25 +839,37 @@ def show_cspace_robot_planning(
         raise RuntimeError("C-space view requires one stage label per dense theta waypoint.")
 
     surface_mode = str(surface_mode).lower()
-    if bool(route_only):
-        surface_mode = "route-only"
-    if surface_mode not in {"full", "solid-safe", "route-only", "fallback"}:
-        surface_mode = "full"
-    if exact_surfaces is None:
-        exact_surfaces = bool(surface_mode in {"full", "solid-safe"})
-    else:
-        exact_surfaces = bool(exact_surfaces)
-        surface_mode = "full" if exact_surfaces else "fallback"
-    route_only = bool(surface_mode == "route-only")
-    if surface_mode == "solid-safe":
-        safe_render = True
+    deprecated_exact_aliases = {"default", "transparent", "full", "solid-safe", "fallback"}
+    if bool(route_only) or surface_mode == "route-only":
+        surface_mode = "none"
+    elif surface_mode in deprecated_exact_aliases:
+        print(f"Deprecated C-space surface mode '{surface_mode}' requested; using exact truth-only mode.", flush=True)
+        surface_mode = "exact"
+    elif surface_mode not in {"exact", "none"}:
+        print(f"Unsupported C-space surface mode '{surface_mode}' requested; using exact truth-only mode.", flush=True)
+        surface_mode = "exact"
+    if force_middle_sheet or allow_visual_proxy or presentation_style:
+        print(
+            "Ignoring presentation/proxy C-space options: truth-only visualization draws residual(theta)=0 surfaces only.",
+            flush=True,
+        )
+    if exact_surfaces is not None and not bool(exact_surfaces):
+        print("Ignoring approximate C-space surface request: exact truth-only mode is active.", flush=True)
+    exact_surfaces = bool(surface_mode == "exact")
+    route_only = bool(surface_mode == "none")
     surface_opacity = float(np.clip(float(surface_opacity), 0.05, 1.0))
-    left_opacity = float(np.clip(float(left_surface_opacity) if left_surface_opacity is not None else min(surface_opacity, 0.30), 0.05, 1.0))
-    middle_opacity = float(np.clip(float(middle_surface_opacity) if middle_surface_opacity is not None else max(surface_opacity, 0.46), 0.05, 1.0))
-    right_opacity = float(np.clip(float(right_surface_opacity) if right_surface_opacity is not None else min(surface_opacity, 0.30), 0.05, 1.0))
+    default_left_opacity = min(surface_opacity, 0.30)
+    default_middle_opacity = max(surface_opacity, 0.55)
+    default_right_opacity = min(surface_opacity, 0.30)
+    left_opacity = float(np.clip(float(left_surface_opacity) if left_surface_opacity is not None else default_left_opacity, 0.05, 1.0))
+    middle_opacity = float(np.clip(float(middle_surface_opacity) if middle_surface_opacity is not None else default_middle_opacity, 0.05, 1.0))
+    right_opacity = float(np.clip(float(right_surface_opacity) if right_surface_opacity is not None else default_right_opacity, 0.05, 1.0))
     surface_style = str(surface_style).lower()
-    if surface_style not in {"points-outline", "points", "wireframe", "contour"}:
-        surface_style = "points-outline"
+    if surface_style == "exact":
+        surface_style = "mesh"
+    if surface_style not in {"mesh", "wireframe", "points", "points-outline", "contour"}:
+        print(f"Unsupported C-space surface style '{surface_style}' requested; using mesh.", flush=True)
+        surface_style = "mesh"
     audit = cspace_audit or {}
     transition_points = _transition_theta_points(result, audit)
     lower, upper = _finite_theta_bounds(theta_path, extra_points=transition_points)
@@ -898,7 +892,7 @@ def show_cspace_robot_planning(
         if bool(exact_surfaces):
             grid_res = int(max(36, min(int(grid_res), 75)))
         else:
-            grid_res = int(max(8, min(int(grid_res), 16 if surface_style == "wireframe" else 22)))
+            grid_res = int(max(8, min(int(grid_res), 22)))
     else:
         grid_res = int(max(12, min(int(grid_res), 85)))
     axes = tuple(np.linspace(lower[i], upper[i], grid_res) for i in range(3))
@@ -928,50 +922,110 @@ def show_cspace_robot_planning(
             pass
 
     draw_surfaces = bool(show_surfaces) and not bool(route_only)
+    surface_infos: dict[str, dict[str, object]] = {
+        "left": {
+            "mesh": None,
+            "extracted": False,
+            "points": 0,
+            "cells": 0,
+            "actor_added": False,
+            "actor_visible": False,
+            "actor_name": "left",
+            "actor_opacity": 0.0,
+            "actor_color": "#f97316",
+            "render_style": surface_style,
+            "bounds": None,
+            "center": None,
+            "failure_reason": "not requested",
+        },
+        "middle": {
+            "mesh": None,
+            "extracted": False,
+            "points": 0,
+            "cells": 0,
+            "actor_added": False,
+            "actor_visible": False,
+            "actor_name": "middle",
+            "actor_opacity": 0.0,
+            "actor_color": "",
+            "render_style": surface_style,
+            "bounds": None,
+            "center": None,
+            "failure_reason": "not requested",
+        },
+        "right": {
+            "mesh": None,
+            "extracted": False,
+            "points": 0,
+            "cells": 0,
+            "actor_added": False,
+            "actor_visible": False,
+            "actor_name": "right",
+            "actor_opacity": 0.0,
+            "actor_color": "#16a34a",
+            "render_style": surface_style,
+            "bounds": None,
+            "center": None,
+            "failure_reason": "not requested",
+        },
+    }
     surface_counts = {"left": 0, "plane": 0, "right": 0}
+    surface_faces = {"left": 0, "plane": 0, "right": 0}
     middle_color = str(middle_surface_color or ("#22d3ee" if middle_name == "family" else "#7dd3fc"))
     middle_surface_label = (
         f"M_family(lambda={float(selected_lambda):.6g})"
         if middle_name == "family" and selected_lambda is not None and np.isfinite(float(selected_lambda))
         else "M_plane"
     )
-    middle_proxy_points = 0
     middle_exact_points = 0
+    middle_exact_faces = 0
     middle_surface_source = "none"
+    middle_grid_stats = _residual_grid_stats(manifolds["plane"], axes) if draw_surfaces else {
+        "min": float("nan"),
+        "max": float("nan"),
+        "abs_min": float("nan"),
+        "abs_max": float("nan"),
+        "has_sign_change": False,
+        "near_zero_count": 0,
+        "failure_reason": "surfaces disabled",
+    }
     if draw_surfaces:
-        surface_counts["left"] = _add_implicit_surface(
-            plotter,
-            pv,
-            manifolds["left"],
-            axes,
-            color="#f97316",
-            opacity=0.26 if surface_style in {"points", "points-outline"} else (0.48 if lightweight else 0.18),
-            label="left manifold surface",
-            lightweight=bool(lightweight),
-            surface_style=surface_style,
-            safe_render=bool(safe_render),
-            exact_isosurface=bool(exact_surfaces),
-            surface_mode=str(surface_mode),
-            surface_opacity=left_opacity,
-            smooth_surfaces=bool(smooth_surfaces),
-        )
-        surface_counts["right"] = _add_implicit_surface(
-            plotter,
-            pv,
-            manifolds["right"],
-            axes,
-            color="#16a34a",
-            opacity=0.26 if surface_style in {"points", "points-outline"} else (0.48 if lightweight else 0.18),
-            label="right manifold surface",
-            lightweight=bool(lightweight),
-            surface_style=surface_style,
-            safe_render=bool(safe_render),
-            exact_isosurface=bool(exact_surfaces),
-            surface_mode=str(surface_mode),
-            surface_opacity=right_opacity,
-            smooth_surfaces=bool(smooth_surfaces),
-        )
-        middle_exact_points = _add_implicit_surface(
+        if not bool(middle_only):
+            surface_infos["left"] = _safe_add_implicit_surface(
+                plotter,
+                pv,
+                manifolds["left"],
+                axes,
+                color="#f97316",
+                opacity=left_opacity,
+                label="left manifold surface",
+                lightweight=bool(lightweight),
+                surface_style=surface_style,
+                safe_render=bool(safe_render),
+                exact_isosurface=bool(exact_surfaces),
+                surface_mode=str(surface_mode),
+                surface_opacity=left_opacity,
+                smooth_surfaces=bool(smooth_surfaces),
+                stage_name="left",
+            )
+            surface_infos["right"] = _safe_add_implicit_surface(
+                plotter,
+                pv,
+                manifolds["right"],
+                axes,
+                color="#16a34a",
+                opacity=right_opacity,
+                label="right manifold surface",
+                lightweight=bool(lightweight),
+                surface_style=surface_style,
+                safe_render=bool(safe_render),
+                exact_isosurface=bool(exact_surfaces),
+                surface_mode=str(surface_mode),
+                surface_opacity=right_opacity,
+                smooth_surfaces=bool(smooth_surfaces),
+                stage_name="right",
+            )
+        surface_infos["middle"] = _safe_add_implicit_surface(
             plotter,
             pv,
             manifolds["plane"],
@@ -986,40 +1040,45 @@ def show_cspace_robot_planning(
             surface_mode=str(surface_mode),
             surface_opacity=middle_opacity,
             smooth_surfaces=bool(smooth_surfaces),
+            emphasize=bool(middle_only),
+            stage_name=middle_name,
         )
+        surface_counts["left"] = _surface_points(surface_infos["left"])
+        surface_faces["left"] = _surface_cells(surface_infos["left"])
+        surface_counts["right"] = _surface_points(surface_infos["right"])
+        surface_faces["right"] = _surface_cells(surface_infos["right"])
+        middle_exact_points = _surface_points(surface_infos["middle"])
+        middle_exact_faces = _surface_cells(surface_infos["middle"])
         surface_counts["plane"] = int(middle_exact_points)
-        middle_surface_source = (
-            "selected_lambda_exact_isosurface"
-            if middle_name == "family" and int(middle_exact_points) > 0
-            else ("exact_isosurface" if int(middle_exact_points) > 0 else "none")
-        )
-        should_draw_middle_proxy = bool(force_middle_sheet or int(middle_exact_points) < 300 or bool(safe_render))
-        if should_draw_middle_proxy:
-            middle_proxy_points = _add_middle_visual_sheet(
-                plotter,
-                pv,
-                _middle_stage_points(theta_path, labels, middle_name),
-                color=middle_color,
-                opacity=middle_opacity,
-                label=f"{middle_surface_label} visual sheet",
-                surface_mode=str(surface_mode),
+        surface_faces["plane"] = int(middle_exact_faces)
+        middle_surface_source = "exact_isosurface" if bool(surface_infos["middle"].get("extracted", False)) else "none"
+        if int(middle_exact_points) <= 0:
+            reason = str(middle_grid_stats.get("failure_reason", "no contour"))
+            if reason == "none":
+                reason = "no contour"
+            print(
+                "Warning: exact middle isosurface extraction failed; no proxy drawn because truth-only visualization is active.",
+                flush=True,
             )
-            if int(middle_proxy_points) > 0:
-                middle_surface_source = "route_local_visual_proxy" if int(middle_exact_points) <= 0 else "exact_plus_proxy"
-        for stage_name, count in (
+            print("middle_surface_failure_reason = " + reason, flush=True)
+            print("suggestion = increase --cspace-grid-res or inspect theta_grid_bounds", flush=True)
+        for stage_name, count in ([(middle_name, surface_counts["plane"])] if bool(middle_only) else [
             ("left", surface_counts["left"]),
-            (middle_name, surface_counts["plane"] + middle_proxy_points),
+            (middle_name, surface_counts["plane"]),
             ("right", surface_counts["right"]),
-        ):
+        ]):
             if int(count) <= 0:
                 print(
                     f"Warning: C-space surface extraction did not cover certified route region for stage {stage_name}.",
                     flush=True,
                 )
+    if bool(save_surfaces):
+        surface_dir = _save_exact_surface_meshes(surface_infos, output_dir)
+        print("cspace_surface_mesh_dir = " + str(surface_dir), flush=True)
 
     full_line = _polyline_from_points(pv, theta_path)
     # The plotted route is configuration points/path in C-space, not robot geometry.
-    plotter.add_mesh(full_line, color="#111827", line_width=4, render_lines_as_tubes=False, label="dense theta path")
+    plotter.add_mesh(full_line, color="#111827", line_width=4, render_lines_as_tubes=False, lighting=False, label="dense theta path")
     for stage, segment in _stage_segments(theta_path, labels):
         if len(segment) < 2:
             continue
@@ -1028,6 +1087,7 @@ def show_cspace_robot_planning(
             color=STAGE_COLORS.get(stage, "#dc2626"),
             line_width=7 if bool(clean_view) else 8,
             render_lines_as_tubes=False,
+            lighting=False,
             label=f"{stage} segment",
         )
 
@@ -1062,25 +1122,105 @@ def show_cspace_robot_planning(
             line_width=2,
             labels_off=False,
         )
-    if not bool(safe_render):
-        plotter.add_text(
-            "C-space view: axes are theta0, theta1, theta2\n"
-            + (
-                "Route-only view: dense theta path and exact transition theta."
-                if not draw_surfaces
-                else (
-                    "exact zero-level-set surfaces; route is dense theta path."
-                    if bool(exact_surfaces)
-                    else f"{surface_style} surfaces are visual guides; route is dense theta path."
-                )
-        ),
-            position="upper_left",
-            font_size=10,
-            color="black",
-        )
-        plotter.add_legend(size=(0.22, 0.22), bcolor="white", border=True)
-    plotter.camera_position = "iso"
+    plotter.add_text(
+        "C-space view: residual(theta)=0 surfaces; route is dense theta path."
+        if draw_surfaces
+        else "C-space view: dense theta path; surfaces disabled.",
+        position="upper_left",
+        font_size=10,
+        color="black",
+    )
+    plotter.add_legend(size=(0.22, 0.22), bcolor="white", border=True)
+    middle_bounds = _surface_bounds(surface_infos["middle"])
+    reset_bounds = middle_bounds if bool(middle_only) and middle_bounds is not None else (
+        float(lower[0]),
+        float(upper[0]),
+        float(lower[1]),
+        float(upper[1]),
+        float(lower[2]),
+        float(upper[2]),
+    )
+    try:
+        plotter.camera_position = "iso"
+        plotter.reset_camera(bounds=reset_bounds)
+    except Exception:
+        try:
+            plotter.reset_camera()
+        except Exception:
+            pass
+    try:
+        plot_bounds = tuple(float(value) for value in plotter.bounds)
+    except Exception:
+        plot_bounds = reset_bounds
+    try:
+        camera_position = tuple(float(value) for value in plotter.camera.position)
+        camera_focal_point = tuple(float(value) for value in plotter.camera.focal_point)
+        camera_view_up = tuple(float(value) for value in plotter.camera.up)
+    except Exception:
+        camera_position = ()
+        camera_focal_point = ()
+        camera_view_up = ()
 
+    example_type = "continuous_transfer_family" if middle_name == "family" else "fixed_transfer_plane"
+    task_middle = "selected family leaf" if middle_name == "family" else "plane h(x)=n dot (x-p0)=0"
+    cspace_middle = (
+        f"F_family(theta, lambda={float(selected_lambda):.6g})=0"
+        if middle_name == "family" and selected_lambda is not None and np.isfinite(float(selected_lambda))
+        else ("F_family(theta, selected_lambda)=0" if middle_name == "family" else "F(theta)=n dot (FK(theta)-p0)=0")
+    )
+
+    print("\n=== FK pullback manifold explanation ===")
+    print("example_type                    : " + str(example_type))
+    print("theta_coordinates               : theta0, theta1, theta2")
+    print("robot_fk_used                   : True")
+    print("surface_definition              : residual(theta)=0")
+    print("surface_extraction              : grid contour / marching cubes")
+    print("surfaces_are_exact_constraints  : True")
+    print("note                            : task-space constraints are pulled back through FK; no proxy sheets are drawn")
+    print("task_space_middle_constraint    : " + str(task_middle))
+    print("cspace_middle_constraint        : " + str(cspace_middle))
+
+    print("\n=== Exact C-space surface audit ===")
+    print("left_surface_source             : " + ("exact_isosurface" if bool(surface_infos["left"].get("extracted", False)) else "none"))
+    print("left_surface_extracted          : " + str(bool(surface_infos["left"].get("extracted", False))))
+    print("left_surface_actor_added        : " + str(_surface_actor_added(surface_infos["left"])))
+    print("left_surface_drawn              : " + str(_surface_actor_added(surface_infos["left"])))
+    print("left_surface_points             : " + str(surface_counts["left"]))
+    print("left_surface_cells              : " + str(surface_faces["left"]))
+    print("middle_surface_label            : " + str(middle_surface_label))
+    print("middle_surface_source           : " + str(middle_surface_source))
+    print("middle_surface_extracted        : " + str(bool(surface_infos["middle"].get("extracted", False))))
+    print("middle_surface_actor_added      : " + str(_surface_actor_added(surface_infos["middle"])))
+    print("middle_surface_actor_visible    : " + str(bool(surface_infos["middle"].get("actor_visible", False))))
+    print("middle_surface_drawn            : " + str(_surface_actor_added(surface_infos["middle"])))
+    print("middle_surface_points           : " + str(surface_counts["plane"]))
+    print("middle_surface_cells            : " + str(surface_faces["plane"]))
+    print("middle_surface_is_proxy         : False")
+    print("middle_surface_has_proxy_layer  : False")
+    print("middle_surface_proxy_points     : 0")
+    print("right_surface_source            : " + ("exact_isosurface" if bool(surface_infos["right"].get("extracted", False)) else "none"))
+    print("right_surface_extracted         : " + str(bool(surface_infos["right"].get("extracted", False))))
+    print("right_surface_actor_added       : " + str(_surface_actor_added(surface_infos["right"])))
+    print("right_surface_drawn             : " + str(_surface_actor_added(surface_infos["right"])))
+    print("right_surface_points            : " + str(surface_counts["right"]))
+    print("right_surface_cells             : " + str(surface_faces["right"]))
+    print(
+        "theta_grid_bounds               : "
+        + np.array2string(np.vstack([lower, upper]), precision=6)
+    )
+    print("middle_residual_min             : " + str(middle_grid_stats["min"]))
+    print("middle_residual_max             : " + str(middle_grid_stats["max"]))
+    print("middle_residual_abs_min         : " + str(middle_grid_stats["abs_min"]))
+    print("middle_residual_abs_max         : " + str(middle_grid_stats["abs_max"]))
+    print("middle_residual_has_sign_change : " + str(bool(middle_grid_stats["has_sign_change"])))
+    print("middle_residual_near_zero_count : " + str(int(middle_grid_stats["near_zero_count"])))
+    if (str(middle_surface_source) == "none" or not _surface_actor_added(surface_infos["middle"])) and draw_surfaces:
+        reason = str(surface_infos["middle"].get("failure_reason", middle_grid_stats["failure_reason"]))
+        print("middle_surface_failure_reason   : " + reason)
+        print("suggestion                      : increase --cspace-grid-res or inspect theta_grid_bounds")
+    print("cspace_surfaces_are_exact_constraints : " + str(bool(surface_mode == "exact")))
+
+    print("\n=== C-space render diagnostics ===")
     print("cspace_visualization_requested = True")
     print("cspace_surface_mode = " + str(surface_mode))
     print("cspace_example = " + str(example_name))
@@ -1093,30 +1233,45 @@ def show_cspace_robot_planning(
     print("cspace_middle_opacity = " + str(float(middle_opacity)))
     print("cspace_right_opacity = " + str(float(right_opacity)))
     print("cspace_surface_points_left = " + str(surface_counts["left"]))
-    print("cspace_surface_points_middle = " + str(surface_counts["plane"] + middle_proxy_points))
-    print(f"cspace_surface_points_{middle_name} = " + str(surface_counts["plane"] + middle_proxy_points))
+    print("cspace_surface_points_middle = " + str(surface_counts["plane"]))
+    print(f"cspace_surface_points_{middle_name} = " + str(surface_counts["plane"]))
     print("cspace_surface_points_right = " + str(surface_counts["right"]))
     print("middle_surface_label = " + str(middle_surface_label))
     print("middle_surface_source = " + str(middle_surface_source))
+    print("middle_surface_extracted = " + str(bool(surface_infos["middle"].get("extracted", False))))
+    print("middle_surface_actor_name = " + str(surface_infos["middle"].get("actor_name", "")))
+    print("middle_surface_actor_added = " + str(_surface_actor_added(surface_infos["middle"])))
+    print("middle_surface_actor_visibility = " + str(bool(surface_infos["middle"].get("actor_visible", False))))
+    print("middle_surface_actor_opacity = " + str(surface_infos["middle"].get("actor_opacity", "")))
+    print("middle_surface_actor_color = " + str(surface_infos["middle"].get("actor_color", "")))
+    print("middle_surface_render_style = " + str(surface_infos["middle"].get("render_style", "")))
+    print("middle_surface_bounds = " + str(surface_infos["middle"].get("bounds", None)))
+    print("middle_surface_center = " + str(surface_infos["middle"].get("center", None)))
+    print("middle_surface_is_proxy = False")
+    print("middle_surface_has_proxy_layer = False")
     print("middle_surface_exact_points = " + str(middle_exact_points))
-    print("middle_surface_proxy_points = " + str(middle_proxy_points))
-    print("middle_surface_points = " + str(surface_counts["plane"] + middle_proxy_points))
+    print("middle_surface_proxy_points = 0")
+    print("middle_surface_points = " + str(surface_counts["plane"]))
+    print("middle_surface_faces = " + str(int(surface_faces["plane"])))
     print("middle_surface_opacity = " + str(float(middle_opacity)))
     print("middle_surface_color = " + str(middle_color))
-    print("middle_surface_drawn = " + str(bool(draw_surfaces and int(surface_counts["plane"] + middle_proxy_points) > 0)))
-    print("cspace_force_middle_sheet = " + str(bool(force_middle_sheet)))
+    print("middle_surface_drawn = " + str(_surface_actor_added(surface_infos["middle"])))
+    print("left_surface_source = " + ("exact_isosurface" if bool(surface_infos["left"].get("extracted", False)) else "none"))
+    print("right_surface_source = " + ("exact_isosurface" if bool(surface_infos["right"].get("extracted", False)) else "none"))
+    print(
+        "cspace_surfaces_are_exact_constraints = "
+        + str(bool(surface_mode == "exact"))
+    )
     print("cspace_lightweight = " + str(bool(lightweight)))
     print("cspace_route_only = " + str(bool(route_only)))
     print("cspace_surfaces_drawn = " + str(bool(draw_surfaces)))
     print("cspace_surface_style = " + str(surface_style))
-    print(
-        "cspace_boundary_style = "
-        + (
-            "exact_isosurface_mesh"
-            if bool(draw_surfaces) and bool(exact_surfaces)
-            else ("none" if not draw_surfaces or surface_style != "points-outline" else "pca_envelope_loops")
-        )
-    )
+    print("cspace_boundary_style = none")
+    print("cspace_middle_only = " + str(bool(middle_only)))
+    print("plot_bounds = " + str(plot_bounds))
+    print("camera_position = " + str(camera_position))
+    print("camera_focal_point = " + str(camera_focal_point))
+    print("camera_view_up = " + str(camera_view_up))
     print("cspace_marker_scale = " + str(float(marker_scale)))
     print("cspace_safe_render = " + str(bool(safe_render)))
     print("cspace_fancy_render = " + str(not bool(safe_render)))
